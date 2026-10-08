@@ -389,16 +389,110 @@ def reset_database_ui():
         except Exception as exc:st.error(f'El restablecimiento falló: {exc}')
 
 
+def consulta_records(module, frame):
+    """Vista de lectura con filtros, fichas adaptables y tabla opcional."""
+    st.caption('Consulta de registros · Acceso de solo lectura')
+    if frame.empty:
+        st.info('No hay registros disponibles en este módulo.')
+        return
+    fields=SPECS[module][1]
+    names={key:label for key,label,*_ in fields}
+    names.update({'% Avance':'Avance (%)','Días restantes':'Días restantes',
+                  'Días atraso':'Días de atraso','Riesgo calculado':'Riesgo',
+                  'Semáforo':'Situación','Alerta':'Alerta','Situación':'Situación',
+                  'Tareas activas':'Tareas activas','Proyectos asignados':'Proyectos asignados',
+                  'Carga de trabajo':'Carga de trabajo'})
+    names['code']='Nombre' if module=='Personal' else names.get('code','Código')
+    visible=[k for k,_,_,_,_ in fields if k in frame.columns]
+    extra=[c for c in ['% Avance','Días restantes','Días atraso','Semáforo','Riesgo calculado',
+                      'Situación','Alerta','Tareas activas','Proyectos asignados','Carga de trabajo'] if c in frame.columns]
+    visible+=extra
+    view=frame.copy()
+    a,b=st.columns([2,1])
+    with a: query=st.text_input('Buscar',placeholder='Nombre, código, cliente, responsable...',key='consulta_search_'+module)
+    with b: layout=st.selectbox('Visualización',['Fichas','Tabla'],key='consulta_layout_'+module)
+    f1,f2=st.columns(2)
+    with f1:
+        if 'project_code' in view.columns:
+            opts=['Todos los proyectos']+sorted(str(x) for x in view.project_code.dropna().unique() if str(x).strip())
+            proj=st.selectbox('Proyecto',opts,key='consulta_project_'+module)
+            if proj!='Todos los proyectos':view=view[view.project_code.astype(str)==proj]
+        elif module=='Proyectos':
+            opts=['Todos los clientes']+sorted(str(x) for x in view.client.dropna().unique() if str(x).strip())
+            client=st.selectbox('Cliente',opts,key='consulta_client_'+module)
+            if client!='Todos los clientes':view=view[view.client.astype(str)==client]
+    with f2:
+        if 'status' in view.columns:
+            statuses=['Todos los estados']+sorted(str(x) for x in view.status.dropna().unique() if str(x).strip())
+            status=st.selectbox('Estado',statuses,key='consulta_status_'+module)
+            if status!='Todos los estados':view=view[view.status.astype(str)==status]
+    if query.strip():
+        mask=view[visible].fillna('').astype(str).apply(lambda col:col.str.contains(query.strip(),case=False,regex=False)).any(axis=1)
+        view=view.loc[mask]
+    st.caption(f'**{len(view)}** registros encontrados')
+    if view.empty:
+        st.info('No hay resultados para estos filtros.')
+        return
+    if layout=='Tabla':
+        table=view[visible].rename(columns=names).copy()
+        st.dataframe(table,hide_index=True,use_container_width=True,height=min(630,95+len(table)*39))
+        return
+    count=12
+    pages=max(1,(len(view)+count-1)//count)
+    if pages>1:
+        page=st.number_input('Página',min_value=1,max_value=pages,value=1,step=1,key='consulta_page_'+module)
+    else:page=1
+    records=view.iloc[(page-1)*count:page*count]
+    def clean(value):
+        if value is None or (not isinstance(value,(list,dict)) and pd.isna(value)):return '—'
+        value=str(value).strip()
+        if not value:return '—'
+        if len(value)>=10 and value[4:5]=='-' and value[7:8]=='-':
+            try:return datetime.strptime(value[:10],'%Y-%m-%d').strftime('%d/%m/%Y')
+            except ValueError:pass
+        return value
+    def color(text):
+        text=str(text).lower()
+        if any(v in text for v in ['atrasad','alto','crítico','observad']):return 'danger'
+        if any(v in text for v in ['revisión','revision','corrección']):return 'info'
+        if any(v in text for v in ['terminado','aprobado','entregado','en plazo']):return 'ok'
+        if any(v in text for v in ['pendiente','próximo','medio','solicitado']):return 'warn'
+        return 'neutral'
+    main_field={'Proyectos':'name','Plan de trabajo':'activity','Entregables':'name',
+                'Control de cambios':'description','Personal':'name'}.get(module,'code')
+    primary=['project_code','client','owner','reviewer','manager','due_date','progress','% Avance',
+             'Días restantes','Días atraso','Riesgo calculado','Alerta','Carga de trabajo']
+    cards=[]
+    for _,rec in records.iterrows():
+        title=clean(rec.get(main_field))
+        if module=='Personal':title=clean(rec.get('name') or rec.get('code'))
+        code=clean(rec.get('code')) if module!='Personal' else 'EQUIPO ALTIVIA'
+        status=clean(rec.get('status')) if 'status' in rec else ''
+        badge=f'<span class="av-status av-{color(status)}">{escape(status)}</span>' if status and status!='—' else ''
+        rows=[]
+        highlight=[x for x in primary if x in visible and x not in (main_field,'code','status')]
+        detail=[x for x in visible if x not in highlight and x not in (main_field,'code','status','notes','file_path')]
+        for key in highlight+detail:
+            val=clean(rec.get(key))
+            if val=='—':continue
+            if len(val)>180:val=val[:177]+'…'
+            rows.append(f'<div class="av-pair"><span>{escape(names.get(key,key))}</span><strong>{escape(val)}</strong></div>')
+        note=clean(rec.get('notes')) if 'notes' in visible else '—'
+        foot=f'<div class="av-note"><b>Observaciones:</b> {escape(note[:320])}</div>' if note!='—' else ''
+        cards.append(f'<article class="av-record"><div class="av-head"><div class="av-code">{escape(code)}</div>{badge}</div>'
+                     f'<h4>{escape(title)}</h4><div class="av-details">{"".join(rows)}</div>{foot}</article>')
+    st.markdown('<div class="av-record-grid">'+''.join(cards)+'</div>',unsafe_allow_html=True)
+    if pages>1:st.caption(f'Página {page} de {pages}')
+
 def edit_module(module,data):
     table,fields=SPECS[module]
     st.subheader(module)
     if module=='Proyectos': st.caption('El avance y el riesgo se calculan automáticamente a partir del cronograma y las tareas.')
+    if not can_edit():
+        consulta_records(module,data[module])
+        return
     left,right=st.columns([1,2])
     with left:
-        if not can_edit():
-            st.info("Modo consulta: puede visualizar los registros, pero no editarlos.")
-            st.dataframe(data[module],hide_index=True,use_container_width=True)
-            return
         existing=data[module]
         items=['➕ Nuevo registro']+[f'{r["code"]} — {r.get("name",r.get("activity",r.get("topic","")))}' for _,r in existing.iterrows()]
         choice=st.selectbox('Registro a editar',items,key='pick_'+table)
@@ -598,6 +692,25 @@ def setup_style():
       border-radius:11px;padding:12px 13px;min-width:0;min-height:97px;box-sizing:border-box}
     .altivia-kpi-label{font-size:0.84rem;line-height:1.3;font-weight:600;color:#334d67!important;overflow-wrap:anywhere}
     .altivia-kpi-value{font-size:1.75rem;line-height:1.2;font-weight:700;margin-top:9px;color:#102b48!important}
+    /* Fichas compactas para usuarios de Consulta; legibles en claro y oscuro. */
+    .av-record-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:12px 0 20px}
+    .av-record{box-sizing:border-box;min-width:0;padding:16px;border:1px solid #d9e3ee;border-radius:13px;
+      background:#f6f9fd;color:#152c45!important;box-shadow:0 2px 6px rgba(12,37,66,.035)}
+    .av-record *{color:#152c45;box-sizing:border-box}
+    .av-head{display:flex;justify-content:space-between;align-items:center;gap:7px;flex-wrap:wrap}
+    .av-code{color:#51708f!important;font-size:.76rem;font-weight:700;overflow-wrap:anywhere}
+    .av-record h4{font-size:1.09rem;line-height:1.35;margin:10px 0 11px;color:#102b48!important;overflow-wrap:anywhere}
+    .av-status{border-radius:99px;padding:4px 9px;font-size:.73rem;font-weight:700;white-space:normal}
+    .av-ok{background:#d9f5e5;color:#17613b!important}.av-info{background:#dbeafe;color:#1d4ed8!important}
+    .av-danger{background:#ffe1e1;color:#a21b26!important}.av-warn{background:#fff2c5;color:#8b5500!important}
+    .av-neutral{background:#e8edf3;color:#46566b!important}
+    .av-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 16px}
+    .av-pair{display:flex;flex-direction:column;gap:3px;min-width:0;border-top:1px solid #e4eaf1;padding-top:7px}
+    .av-pair span{font-size:.74rem;color:#61778e!important}
+    .av-pair strong{font-size:.87rem;color:#142c49!important;font-weight:600;overflow-wrap:anywhere}
+    .av-note{font-size:.82rem;margin-top:13px;padding-top:10px;border-top:1px solid #dbe4ee;overflow-wrap:anywhere}
+    @media(max-width:900px){.av-record-grid{grid-template-columns:1fr;gap:10px}.av-record{padding:13px}}
+    @media(max-width:390px){.av-details{grid-template-columns:1fr}.av-record h4{font-size:1rem}}
     .block-container{padding-top:1.5rem}
     @media(max-width:900px){
       .altivia-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
