@@ -7,6 +7,11 @@ import hashlib
 import hmac
 import secrets
 import tempfile
+import re
+import base64
+import requests
+import msal
+from urllib.parse import quote
 from contextlib import contextmanager
 from datetime import date, timedelta, datetime
 import pandas as pd
@@ -36,7 +41,7 @@ SPECS={
  'Plan de trabajo':('tasks',[
  ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('specialty','Especialidad','select',False,'specialties'),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
  'Entregables':('deliverables',[
- ('code','ID Entregable','text',True,None),('project_code','ID Proyecto','project',True,None),('drawing_code','Código del plano','text',False,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha prevista','date',True,None),('actual_date','Fecha real','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Ruta del archivo / URL','text',False,None)]),
+ ('code','ID Entregable','text',True,None),('project_code','ID Proyecto','project',True,None),('drawing_code','Código del plano','text',False,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha prevista','date',True,None),('actual_date','Fecha real','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Enlace del documento (Google Drive / OneDrive / SharePoint)','text',False,None)]),
  'Control de cambios':('changes',[
  ('code','ID Cambio','text',True,None),('project_code','ID Proyecto','project',True,None),('request_date','Fecha solicitud','date',True,None),('requester','Solicitante','text',True,None),('description','Descripción cambio','long',True,None),('reason','Motivo','long',False,None),('specialty','Especialidad afectada','select',False,'specialties'),('affected_drawings','Planos afectados','text',False,None),('owner','Responsable','person',True,None),('schedule_impact','Impacto en plazo','select',False,'risks'),('new_due_date','Nueva fecha entrega','date',False,None),('approved_by','Aprobado por','text',False,None),('approval_date','Fecha aprobación','date',False,None),('status','Estado','select',True,'change_states'),('notes','Observaciones','long',False,None)]),
  'Personal':('people',[
@@ -88,12 +93,21 @@ def verify_password(password,stored):
     except (ValueError,TypeError):return False
 
 def initialize_auth():
+    # Preserva usuarios existentes y elimina la restriccion antigua de roles.
+    with sqlite3.connect(DB, timeout=20) as migration:
+        row = migration.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+        if row and 'CHECK(role IN' in (row[0] or ''):
+            migration.execute('CREATE TABLE users_migration (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, full_name TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+            migration.execute('INSERT INTO users_migration (id,username,full_name,password_hash,role,active,created_at) SELECT id,username,full_name,password_hash,role,active,created_at FROM users')
+            migration.execute('DROP TABLE users')
+            migration.execute('ALTER TABLE users_migration RENAME TO users')
     with connection() as con:
         con.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
             full_name TEXT NOT NULL, password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK(role IN ('Administrador','Consulta')),
+            role TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        con.execute('''CREATE TABLE IF NOT EXISTS client_access (user_id INTEGER NOT NULL, delivery_id INTEGER NOT NULL, granted_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,delivery_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
         users=con.execute('SELECT COUNT(*) FROM users').fetchone()[0]
         if users==0:
             password=os.getenv('ALTIVIA_ADMIN_PASSWORD','')
@@ -144,7 +158,7 @@ def user_management():
     with st.form('new_user'):
         username=st.text_input('Usuario nuevo').strip().lower()
         name=st.text_input('Nombre completo').strip()
-        role=st.selectbox('Rol',['Consulta','Administrador'])
+        role=st.selectbox('Rol',['Consulta','Cliente','Administrador'])
         password=st.text_input('Contraseña inicial (mínimo 6 caracteres)',type='password')
         if st.form_submit_button('Crear usuario',type='primary'):
             if not username or not name or len(password)<6:st.error('Complete los datos y use una contraseña de al menos 6 caracteres.')
@@ -158,7 +172,7 @@ def user_management():
     selected=st.selectbox('Seleccionar usuario',users.id.tolist(),format_func=lambda i: str(users.loc[users.id==i,'username'].iloc[0]))
     r=users.loc[users.id==selected].iloc[0]
     with st.form('update_user'):
-        new_role=st.selectbox('Rol',['Administrador','Consulta'],index=['Administrador','Consulta'].index(r['role']))
+        new_role=st.selectbox('Rol',['Administrador','Consulta','Cliente'],index=['Administrador','Consulta','Cliente'].index(r['role']))
         active=st.checkbox('Cuenta activa',value=bool(r['active']))
         reset=st.text_input('Contraseña nueva (dejar vacío para conservar)',type='password')
         if st.form_submit_button('Guardar acceso'):
@@ -173,6 +187,134 @@ def user_management():
                     con.execute('UPDATE users SET role=?, active=? WHERE id=?',(new_role,int(active),selected))
                     if reset:con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(reset),selected))
                 st.success('Acceso actualizado');st.rerun()
+    client_permissions_ui()
+
+def client_permissions_ui():
+    require_admin()
+    st.subheader('📂 Permisos de clientes por entregable')
+    st.caption('Selecciona exactamente los entregables que cada cliente podrá consultar. Solo serán visibles cuando su estado sea Aprobado o Entregado.')
+    with connection() as con:
+        clients=con.execute("SELECT id,username,full_name FROM users WHERE role='Cliente' AND active=1 ORDER BY full_name").fetchall()
+        deliveries=con.execute("SELECT id,code,name,project_code,status,file_path FROM deliverables ORDER BY project_code,name").fetchall()
+    if not clients:
+        st.info('Primero crea un usuario con el rol Cliente.');return
+    cid=st.selectbox('Cliente', [r['id'] for r in clients],format_func=lambda i:next(r['full_name']+' · '+r['username'] for r in clients if r['id']==i),key='client_acl_user')
+    with connection() as con:
+        current={r[0] for r in con.execute('SELECT delivery_id FROM client_access WHERE user_id=?',(cid,)).fetchall()}
+    eligible=[r for r in deliveries if r['status'] in ('Aprobado','Entregado')]
+    if not eligible:
+        st.info('No existen entregables aprobados o entregados.');return
+    options={r['id']:f"{r['project_code']} · {r['code']} · {r['name']} ({r['status']})" for r in eligible}
+    selected=st.multiselect('Entregables autorizados',options.keys(),default=[i for i in options if i in current],format_func=lambda i:options[i],key='client_acl_docs')
+    if st.button('Guardar permisos del cliente',type='primary'):
+        with connection() as con:
+            con.execute('DELETE FROM client_access WHERE user_id=?',(cid,))
+            con.executemany('INSERT INTO client_access(user_id,delivery_id) VALUES(?,?)',[(cid,i) for i in selected])
+        st.success('Permisos actualizados.');st.rerun()
+
+
+def graph_settings():
+    """Secrets only: never store credentials in the database or repository."""
+    try:
+        conf=st.secrets.get('microsoft_graph',{})
+        return {k:str(conf.get(k,'')).strip() for k in ('tenant_id','client_id','client_secret')}
+    except Exception:
+        return {}
+
+
+def graph_pdf(reference):
+    """Fetch a private PDF server-side; never disclose the Graph app token or signed URL."""
+    match=re.fullmatch(r'graph://([A-Za-z0-9_.!~-]+)/([A-Za-z0-9_.!~-]+)',reference or '')
+    if not match:
+        raise ValueError('Referencia no válida. Use graph://ID_UNIDAD/ID_ARCHIVO (no un enlace público).')
+    cfg=graph_settings()
+    if not all(cfg.get(k) for k in ('tenant_id','client_id','client_secret')):
+        raise ValueError('Falta configurar [microsoft_graph] en los Secrets privados de Streamlit.')
+    app=msal.ConfidentialClientApplication(cfg['client_id'],authority='https://login.microsoftonline.com/'+cfg['tenant_id'],client_credential=cfg['client_secret'])
+    token=app.acquire_token_for_client(scopes=['https://graph.microsoft.com/.default'])
+    if 'access_token' not in token:
+        raise ValueError('Microsoft Graph rechazó la autenticación. Revise credenciales y consentimiento.')
+    drive,item=match.groups()
+    base=f'https://graph.microsoft.com/v1.0/drives/{quote(drive,safe="")}/items/{quote(item,safe="")}'
+    headers={'Authorization':'Bearer '+token['access_token']}
+    meta=requests.get(base,headers=headers,timeout=20)
+    if meta.status_code != 200:
+        raise ValueError(f'No se pudo consultar el archivo en Microsoft Graph (HTTP {meta.status_code}).')
+    info=meta.json()
+    if not str(info.get('name','')).lower().endswith('.pdf') or 'file' not in info:
+        raise ValueError('La vista integrada admite únicamente documentos PDF.')
+    limit=25*1024*1024
+    if int(info.get('size') or 0)>limit:
+        raise ValueError('El PDF supera el límite de 25 MB para visualización/descarga integrada.')
+    with requests.get(base+'/content',headers=headers,timeout=60,stream=True) as res:
+        if res.status_code!=200:
+            raise ValueError(f'No se pudo descargar el PDF desde Graph (HTTP {res.status_code}).')
+        chunks=[];size=0
+        for chunk in res.iter_content(256*1024):
+            if not chunk:continue
+            size+=len(chunk)
+            if size>limit:
+                raise ValueError('El PDF supera el límite de 25 MB.')
+            chunks.append(chunk)
+    data=b''.join(chunks)
+    if not data.startswith(b'%PDF-'):
+        raise ValueError('El archivo descargado no es un PDF válido.')
+    return data,info['name']
+
+
+def internal_pdf_preview(data):
+    if hasattr(st,'pdf'):
+        st.pdf(data,height=680)
+    else:
+        import streamlit.components.v1 as components
+        payload=base64.b64encode(data).decode('ascii')
+        components.html('<iframe title="Plano PDF" src="data:application/pdf;base64,'+payload+'" style="width:100%;height:680px;border:0" loading="lazy"></iframe>',height=700,scrolling=False)
+        st.caption('Si tu navegador bloquea el visor integrado, utiliza Descargar PDF.')
+
+
+def client_portal():
+    if st.session_state.get('role')!='Cliente':st.error('Acceso restringido.');st.stop()
+    st.title('📁 Mis planos y documentos')
+    st.caption('Documentos aprobados y autorizados por ALTIVIA · Acceso de solo lectura')
+    with connection() as con:
+        rows=[dict(x) for x in con.execute('''SELECT d.id,d.code,d.project_code,d.drawing_code,d.name,d.version,d.specialty,d.status,d.file_path
+            FROM deliverables d JOIN client_access a ON a.delivery_id=d.id
+            WHERE a.user_id=? AND d.status IN ('Aprobado','Entregado') ORDER BY d.project_code,d.name''',(st.session_state['user_id'],)).fetchall()]
+    if not rows:st.info('Todavía no tienes documentos aprobados asignados.');return
+    projects=sorted(set(x['project_code'] for x in rows if x['project_code']))
+    a,b=st.columns([2,1])
+    with a:query=st.text_input('🔎 Buscar plano o documento',key='client_search').strip().casefold()
+    with b:chosen=st.selectbox('Proyecto',['Todos']+projects,key='client_proj')
+    rows=[r for r in rows if (chosen=='Todos' or r['project_code']==chosen) and (not query or query in (' '.join(str(v or '') for v in r.values())).casefold())]
+    st.caption(f'{len(rows)} documentos disponibles')
+    st.markdown('''<style>
+      .altivia-client-card{background:#101318;border:1px solid #343b47;border-radius:13px;padding:18px 19px;margin:8px 0 18px;color:#f8fafc;box-shadow:0 4px 18px #00000016}
+      .altivia-client-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+      .altivia-client-title{font-weight:750;font-size:1.06rem;color:white}
+      .altivia-client-badge{background:#104a2f;color:#55e697;font-size:.78rem;font-weight:650;padding:4px 10px;border-radius:18px}
+      .altivia-client-sub{font-size:.84rem;color:#aab7cf;margin-top:9px;line-height:1.5}
+      @media(max-width:640px){.altivia-client-card{padding:15px;margin-bottom:9px}}
+    </style>''',unsafe_allow_html=True)
+    for r in rows:
+        title=escape(str(r['drawing_code'] or r['code']))+' – '+escape(str(r['name'] or 'Documento'))
+        sub=escape(str(r['project_code'] or ''))+' · Versión '+escape(str(r['version'] or '—'))+' · '+escape(str(r['specialty'] or ''))
+        st.markdown(f'<div class="altivia-client-card"><div class="altivia-client-head"><span class="altivia-client-title">{title}</span><span class="altivia-client-badge">{escape(r["status"])}</span></div><div class="altivia-client-sub">{sub}</div></div>',unsafe_allow_html=True)
+        reference=str(r['file_path'] or '').strip()
+        if reference.startswith('https://'):
+            # Los enlaces externos conservan los permisos del proveedor de almacenamiento.
+            # El cliente solo ve documentos aprobados que ALTIVIA le ha asignado.
+            left,right=st.columns(2)
+            with left:
+                st.link_button('👁 Visualizar documento',reference,use_container_width=True)
+            with right:
+                st.link_button('⬇ Descargar / abrir archivo',reference,use_container_width=True)
+            st.caption('La visualización y descarga dependen de los permisos y opciones de Google Drive, OneDrive o SharePoint.')
+        elif reference:
+            st.warning('Enlace no válido. El administrador debe registrar una URL que comience con https://.')
+        else:
+            st.caption('Archivo pendiente de vincular. Contacta a ALTIVIA.')
+        st.divider()
+
 
 def my_account():
     st.title('Mi cuenta')
@@ -389,110 +531,16 @@ def reset_database_ui():
         except Exception as exc:st.error(f'El restablecimiento falló: {exc}')
 
 
-def consulta_records(module, frame):
-    """Vista de lectura con filtros, fichas adaptables y tabla opcional."""
-    st.caption('Consulta de registros · Acceso de solo lectura')
-    if frame.empty:
-        st.info('No hay registros disponibles en este módulo.')
-        return
-    fields=SPECS[module][1]
-    names={key:label for key,label,*_ in fields}
-    names.update({'% Avance':'Avance (%)','Días restantes':'Días restantes',
-                  'Días atraso':'Días de atraso','Riesgo calculado':'Riesgo',
-                  'Semáforo':'Situación','Alerta':'Alerta','Situación':'Situación',
-                  'Tareas activas':'Tareas activas','Proyectos asignados':'Proyectos asignados',
-                  'Carga de trabajo':'Carga de trabajo'})
-    names['code']='Nombre' if module=='Personal' else names.get('code','Código')
-    visible=[k for k,_,_,_,_ in fields if k in frame.columns]
-    extra=[c for c in ['% Avance','Días restantes','Días atraso','Semáforo','Riesgo calculado',
-                      'Situación','Alerta','Tareas activas','Proyectos asignados','Carga de trabajo'] if c in frame.columns]
-    visible+=extra
-    view=frame.copy()
-    a,b=st.columns([2,1])
-    with a: query=st.text_input('Buscar',placeholder='Nombre, código, cliente, responsable...',key='consulta_search_'+module)
-    with b: layout=st.selectbox('Visualización',['Fichas','Tabla'],key='consulta_layout_'+module)
-    f1,f2=st.columns(2)
-    with f1:
-        if 'project_code' in view.columns:
-            opts=['Todos los proyectos']+sorted(str(x) for x in view.project_code.dropna().unique() if str(x).strip())
-            proj=st.selectbox('Proyecto',opts,key='consulta_project_'+module)
-            if proj!='Todos los proyectos':view=view[view.project_code.astype(str)==proj]
-        elif module=='Proyectos':
-            opts=['Todos los clientes']+sorted(str(x) for x in view.client.dropna().unique() if str(x).strip())
-            client=st.selectbox('Cliente',opts,key='consulta_client_'+module)
-            if client!='Todos los clientes':view=view[view.client.astype(str)==client]
-    with f2:
-        if 'status' in view.columns:
-            statuses=['Todos los estados']+sorted(str(x) for x in view.status.dropna().unique() if str(x).strip())
-            status=st.selectbox('Estado',statuses,key='consulta_status_'+module)
-            if status!='Todos los estados':view=view[view.status.astype(str)==status]
-    if query.strip():
-        mask=view[visible].fillna('').astype(str).apply(lambda col:col.str.contains(query.strip(),case=False,regex=False)).any(axis=1)
-        view=view.loc[mask]
-    st.caption(f'**{len(view)}** registros encontrados')
-    if view.empty:
-        st.info('No hay resultados para estos filtros.')
-        return
-    if layout=='Tabla':
-        table=view[visible].rename(columns=names).copy()
-        st.dataframe(table,hide_index=True,use_container_width=True,height=min(630,95+len(table)*39))
-        return
-    count=12
-    pages=max(1,(len(view)+count-1)//count)
-    if pages>1:
-        page=st.number_input('Página',min_value=1,max_value=pages,value=1,step=1,key='consulta_page_'+module)
-    else:page=1
-    records=view.iloc[(page-1)*count:page*count]
-    def clean(value):
-        if value is None or (not isinstance(value,(list,dict)) and pd.isna(value)):return '—'
-        value=str(value).strip()
-        if not value:return '—'
-        if len(value)>=10 and value[4:5]=='-' and value[7:8]=='-':
-            try:return datetime.strptime(value[:10],'%Y-%m-%d').strftime('%d/%m/%Y')
-            except ValueError:pass
-        return value
-    def color(text):
-        text=str(text).lower()
-        if any(v in text for v in ['atrasad','alto','crítico','observad']):return 'danger'
-        if any(v in text for v in ['revisión','revision','corrección']):return 'info'
-        if any(v in text for v in ['terminado','aprobado','entregado','en plazo']):return 'ok'
-        if any(v in text for v in ['pendiente','próximo','medio','solicitado']):return 'warn'
-        return 'neutral'
-    main_field={'Proyectos':'name','Plan de trabajo':'activity','Entregables':'name',
-                'Control de cambios':'description','Personal':'name'}.get(module,'code')
-    primary=['project_code','client','owner','reviewer','manager','due_date','progress','% Avance',
-             'Días restantes','Días atraso','Riesgo calculado','Alerta','Carga de trabajo']
-    cards=[]
-    for _,rec in records.iterrows():
-        title=clean(rec.get(main_field))
-        if module=='Personal':title=clean(rec.get('name') or rec.get('code'))
-        code=clean(rec.get('code')) if module!='Personal' else 'EQUIPO ALTIVIA'
-        status=clean(rec.get('status')) if 'status' in rec else ''
-        badge=f'<span class="av-status av-{color(status)}">{escape(status)}</span>' if status and status!='—' else ''
-        rows=[]
-        highlight=[x for x in primary if x in visible and x not in (main_field,'code','status')]
-        detail=[x for x in visible if x not in highlight and x not in (main_field,'code','status','notes','file_path')]
-        for key in highlight+detail:
-            val=clean(rec.get(key))
-            if val=='—':continue
-            if len(val)>180:val=val[:177]+'…'
-            rows.append(f'<div class="av-pair"><span>{escape(names.get(key,key))}</span><strong>{escape(val)}</strong></div>')
-        note=clean(rec.get('notes')) if 'notes' in visible else '—'
-        foot=f'<div class="av-note"><b>Observaciones:</b> {escape(note[:320])}</div>' if note!='—' else ''
-        cards.append(f'<article class="av-record"><div class="av-head"><div class="av-code">{escape(code)}</div>{badge}</div>'
-                     f'<h4>{escape(title)}</h4><div class="av-details">{"".join(rows)}</div>{foot}</article>')
-    st.markdown('<div class="av-record-grid">'+''.join(cards)+'</div>',unsafe_allow_html=True)
-    if pages>1:st.caption(f'Página {page} de {pages}')
-
 def edit_module(module,data):
     table,fields=SPECS[module]
     st.subheader(module)
     if module=='Proyectos': st.caption('El avance y el riesgo se calculan automáticamente a partir del cronograma y las tareas.')
-    if not can_edit():
-        consulta_records(module,data[module])
-        return
     left,right=st.columns([1,2])
     with left:
+        if not can_edit():
+            st.info("Modo consulta: puede visualizar los registros, pero no editarlos.")
+            st.dataframe(data[module],hide_index=True,use_container_width=True)
+            return
         existing=data[module]
         items=['➕ Nuevo registro']+[f'{r["code"]} — {r.get("name",r.get("activity",r.get("topic","")))}' for _,r in existing.iterrows()]
         choice=st.selectbox('Registro a editar',items,key='pick_'+table)
@@ -511,7 +559,10 @@ def edit_module(module,data):
                 vals={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v) for k,v in vals.items()}
                 try:
                     save_record(module,vals,rid);st.success('Registro guardado correctamente.');st.rerun()
-                except (ValueError,sqlite3.IntegrityError) as ex:st.error(str(ex))
+                except (ValueError,sqlite3.IntegrityError) as ex:
+                    if isinstance(ex,sqlite3.IntegrityError) and 'deliverables.code' in str(ex):
+                        st.error('Ya existe un entregable con ese ID. Selecciona el registro existente en «Registro a editar» para actualizar su enlace, o utiliza otro ID para uno nuevo.')
+                    else:st.error(str(ex))
         bulk_delete_ui(module,data)
     with right:
         st.markdown('**Registros y seguimiento**')
@@ -692,25 +743,6 @@ def setup_style():
       border-radius:11px;padding:12px 13px;min-width:0;min-height:97px;box-sizing:border-box}
     .altivia-kpi-label{font-size:0.84rem;line-height:1.3;font-weight:600;color:#334d67!important;overflow-wrap:anywhere}
     .altivia-kpi-value{font-size:1.75rem;line-height:1.2;font-weight:700;margin-top:9px;color:#102b48!important}
-    /* Fichas compactas para usuarios de Consulta; legibles en claro y oscuro. */
-    .av-record-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:12px 0 20px}
-    .av-record{box-sizing:border-box;min-width:0;padding:16px;border:1px solid #d9e3ee;border-radius:13px;
-      background:#f6f9fd;color:#152c45!important;box-shadow:0 2px 6px rgba(12,37,66,.035)}
-    .av-record *{color:#152c45;box-sizing:border-box}
-    .av-head{display:flex;justify-content:space-between;align-items:center;gap:7px;flex-wrap:wrap}
-    .av-code{color:#51708f!important;font-size:.76rem;font-weight:700;overflow-wrap:anywhere}
-    .av-record h4{font-size:1.09rem;line-height:1.35;margin:10px 0 11px;color:#102b48!important;overflow-wrap:anywhere}
-    .av-status{border-radius:99px;padding:4px 9px;font-size:.73rem;font-weight:700;white-space:normal}
-    .av-ok{background:#d9f5e5;color:#17613b!important}.av-info{background:#dbeafe;color:#1d4ed8!important}
-    .av-danger{background:#ffe1e1;color:#a21b26!important}.av-warn{background:#fff2c5;color:#8b5500!important}
-    .av-neutral{background:#e8edf3;color:#46566b!important}
-    .av-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 16px}
-    .av-pair{display:flex;flex-direction:column;gap:3px;min-width:0;border-top:1px solid #e4eaf1;padding-top:7px}
-    .av-pair span{font-size:.74rem;color:#61778e!important}
-    .av-pair strong{font-size:.87rem;color:#142c49!important;font-weight:600;overflow-wrap:anywhere}
-    .av-note{font-size:.82rem;margin-top:13px;padding-top:10px;border-top:1px solid #dbe4ee;overflow-wrap:anywhere}
-    @media(max-width:900px){.av-record-grid{grid-template-columns:1fr;gap:10px}.av-record{padding:13px}}
-    @media(max-width:390px){.av-details{grid-template-columns:1fr}.av-record h4{font-size:1rem}}
     .block-container{padding-top:1.5rem}
     @media(max-width:900px){
       .altivia-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
@@ -732,7 +764,7 @@ def main():
         with connection() as con:
             current=con.execute('SELECT username,full_name,role,active FROM users WHERE id=?',(st.session_state['user_id'],)).fetchone()
         if not current or not current['active']:
-            for key in ('user_id','role','username','full_name'):st.session_state.pop(key,None)
+            for key in ('user_id','role','username','full_name','client_preview'):st.session_state.pop(key,None)
         else:
             st.session_state['role']=current['role'];st.session_state['username']=current['username'];st.session_state['full_name']=current['full_name']
     if not st.session_state.get('user_id'):
@@ -743,17 +775,18 @@ def main():
         st.caption('Ingeniería · Consultoría · Planos')
         st.caption(f"{st.session_state['full_name']} · {st.session_state['role']}")
         if st.button('Cerrar sesión'):
-            for key in ('user_id','role','username','full_name'):st.session_state.pop(key,None)
+            for key in ('user_id','role','username','full_name','client_preview'):st.session_state.pop(key,None)
             st.rerun()
-        pages=['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta']
+        pages=['Mis documentos','Mi cuenta'] if st.session_state.get('role')=='Cliente' else ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta']
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
         page=st.radio('Navegación',pages)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
     data=decorate()
-    if page=='Dashboard':dashboard(data)
-    elif page in SPECS:edit_module(page,data)
-    elif page=='Checklist planos':checklist_page()
-    elif page=='Versiones':versions_page()
+    if page=='Mis documentos':client_portal()
+    elif page=='Dashboard':dashboard(data)
+    elif page in SPECS and st.session_state.get('role')!='Cliente':edit_module(page,data)
+    elif page=='Checklist planos' and st.session_state.get('role')!='Cliente':checklist_page()
+    elif page=='Versiones' and st.session_state.get('role')!='Cliente':versions_page()
     elif page=='Mi cuenta':my_account()
     elif page=='Administrar usuarios':user_management()
     else:
