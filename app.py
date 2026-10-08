@@ -806,3 +806,4 @@ def main():
         st.caption('Esta instalación usa SQLite local: no la publique en Streamlit Community Cloud para datos reales. Para varios usuarios, migre a PostgreSQL y alojamiento privado.')
 
 if __name__=='__main__':main()
+msal>=1.30.0
