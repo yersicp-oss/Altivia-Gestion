@@ -7,6 +7,7 @@ import hmac
 import secrets
 import tempfile
 from contextlib import contextmanager
+from html import escape
 from datetime import date, timedelta, datetime
 import pandas as pd
 import streamlit as st
