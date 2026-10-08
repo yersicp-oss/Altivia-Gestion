@@ -1,5 +1,6 @@
 """ALTIVIA | Gestor integral de proyectos. Ejecutar: streamlit run app.py"""
 import os
+from html import escape
 import io
 import sqlite3
 import hashlib
@@ -7,7 +8,6 @@ import hmac
 import secrets
 import tempfile
 from contextlib import contextmanager
-from html import escape
 from datetime import date, timedelta, datetime
 import pandas as pd
 import streamlit as st
@@ -18,13 +18,13 @@ ROOT=os.path.dirname(os.path.abspath(__file__))
 DB=os.environ.get('ALTIVIA_DB',os.path.join(ROOT,'altivia.db'))
 TODAY=date.today()
 
-PROJECT_STATES=['No iniciado','En planificación','En desarrollo','En revisión','En corrección','En espera del cliente','Terminado','Cancelado']
-TASK_STATES=['No iniciado','En desarrollo','En revisión','Con observaciones','Corregido','Aprobado','Terminado','Bloqueado']
+PROJECT_STATES=['No iniciado','En desarrollo','En revisión','En corrección','Terminado']
+TASK_STATES=['No iniciado','En desarrollo','En revisión','Con observaciones','Corregido','Aprobado']
 DELIVERY_STATES=['Pendiente','En desarrollo','En revisión interna','Con observaciones','En corrección','Aprobado internamente','Enviado al cliente','Observado por cliente','Corregido','Aprobado','Entregado']
-CHANGE_STATES=['Solicitado','En evaluación','Pendiente de aprobación','Aprobado','En ejecución','Ejecutado','Rechazado']
+CHANGE_STATES=['Solicitado','Aprobado','Ejecutado']
 MEETING_STATES=['Pendiente','En proceso','Completado','Atrasado','Cancelado']
 SPECIALTIES=['Arquitectura','Estructuras','Eléctricas','Sanitarias','HVAC','Seguridad','BIM','Coordinación','Geotecnia','Relaves','Hidráulica','Mecánica','Topografía','Otra']
-PROJECT_TYPES=['Arquitectura','Estructuras','Instalaciones eléctricas','Instalaciones sanitarias','HVAC','Seguridad','BIM','Coordinación multidisciplinaria','Expediente técnico','Consultoría minera','Ingeniería conceptual','Ingeniería básica','Ingeniería de detalle','Otro']
+PROJECT_TYPES=['Arquitectura','Estructuras','Instalaciones eléctricas','Instalaciones sanitarias','HVAC','BIM','Expediente técnico','Otro']
 PRIORITIES=['Alta','Media','Baja']; RISKS=['Bajo','Medio','Alto','Crítico']
 ROLES=['Gerente','Jefe de Proyecto','Coordinador','Arquitecto','Ingeniero','Dibujante','Modelador BIM','Revisor','Asistente','Otro']
 CHECKS=['Información general correcta','Nombre del proyecto','Código del plano','Número de versión','Escala','Norte','Ejes','Niveles','Cotas','Nomenclatura','Simbología','Referencias','Detalles','Cuadro de áreas','Capas','Lineweights','Textos','Compatibilidad con otras especialidades','Formato de impresión','Revisión técnica','Revisión gráfica']
@@ -32,22 +32,20 @@ CHECKS=['Información general correcta','Nombre del proyecto','Código del plano
 # key: (titulo, sql table, [ (column, visible label, type, required?, choices key) ])
 SPECS={
  'Proyectos':('projects',[
- ('code','ID Proyecto','text',True,None),('name','Proyecto','text',True,None),('client','Cliente','text',False,None),('type','Tipo','select',False,'types'),('location','Ubicación','text',False,None),('manager','Jefe / Coordinador','person',False,None),('start_date','Fecha inicio','date',False,None),('due_date','Fecha entrega','date',False,None),('status','Estado','select',True,'project_states'),('risk','Riesgo (manual)','select',False,'risks'),('priority','Prioridad','select',False,'priorities'),('notes','Observaciones','long',False,None)]),
+ ('code','ID Proyecto','text',True,None),('name','Proyecto','text',True,None),('client','Cliente','text',False,None),('type','Tipo','select',False,'types'),('location','Ubicación','text',False,None),('manager','Jefe / Coordinador','person',False,None),('start_date','Fecha inicio','date',False,None),('due_date','Fecha entrega','date',False,None),('status','Estado','select',True,'project_states'),('priority','Prioridad','select',False,'priorities'),('notes','Observaciones','long',False,None)]),
  'Plan de trabajo':('tasks',[
- ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('specialty','Especialidad','select',False,'specialties'),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('blocked','Bloqueo','bool',False,None),('block_reason','Descripción del bloqueo','long',False,None),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
+ ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('specialty','Especialidad','select',False,'specialties'),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
  'Entregables':('deliverables',[
- ('code','ID Entregable','text',True,None),('project_code','ID Proyecto','project',True,None),('drawing_code','Código del plano','text',False,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha prevista','date',True,None),('actual_date','Fecha real','date',False,None),('status','Estado','select',True,'delivery_states'),('observations_count','N.º observaciones','int',False,None),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Ruta del archivo / URL','text',False,None)]),
+ ('code','ID Entregable','text',True,None),('project_code','ID Proyecto','project',True,None),('drawing_code','Código del plano','text',False,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha prevista','date',True,None),('actual_date','Fecha real','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Ruta del archivo / URL','text',False,None)]),
  'Control de cambios':('changes',[
- ('code','ID Cambio','text',True,None),('project_code','ID Proyecto','project',True,None),('request_date','Fecha solicitud','date',True,None),('requester','Solicitante','text',True,None),('description','Descripción cambio','long',True,None),('reason','Motivo','long',False,None),('specialty','Especialidad afectada','select',False,'specialties'),('affected_drawings','Planos afectados','text',False,None),('owner','Responsable','person',True,None),('estimated_hours','Horas estimadas','float',False,None),('technical_impact','Impacto técnico','select',False,'risks'),('schedule_impact','Impacto en plazo','select',False,'risks'),('economic_impact','Impacto económico','select',False,'risks'),('new_due_date','Nueva fecha entrega','date',False,None),('approved_by','Aprobado por','text',False,None),('approval_date','Fecha aprobación','date',False,None),('status','Estado','select',True,'change_states'),('notes','Observaciones','long',False,None)]),
- 'Reuniones y pendientes':('meetings',[
- ('code','ID Reunión / Acuerdo','text',True,None),('meeting_date','Fecha reunión','date',True,None),('project_code','Proyecto','project',True,None),('meeting_type','Tipo de reunión','text',False,None),('participants','Participantes','long',False,None),('topic','Tema','text',True,None),('problem','Problema identificado','long',False,None),('agreement','Acuerdo / decisión','long',True,None),('owner','Responsable','person',True,None),('due_date','Fecha límite','date',True,None),('status','Estado','select',True,'meeting_states'),('notes','Observaciones','long',False,None)]),
+ ('code','ID Cambio','text',True,None),('project_code','ID Proyecto','project',True,None),('request_date','Fecha solicitud','date',True,None),('requester','Solicitante','text',True,None),('description','Descripción cambio','long',True,None),('reason','Motivo','long',False,None),('specialty','Especialidad afectada','select',False,'specialties'),('affected_drawings','Planos afectados','text',False,None),('owner','Responsable','person',True,None),('schedule_impact','Impacto en plazo','select',False,'risks'),('new_due_date','Nueva fecha entrega','date',False,None),('approved_by','Aprobado por','text',False,None),('approval_date','Fecha aprobación','date',False,None),('status','Estado','select',True,'change_states'),('notes','Observaciones','long',False,None)]),
  'Personal':('people',[
- ('code','ID Personal','text',True,None),('name','Nombre','text',True,None),('role','Cargo','select',False,'roles'),('specialty','Especialidad','select',False,'specialties'),('email','Correo','text',False,None),('phone','Teléfono','text',False,None),('capacity','Capacidad tareas activas','int',True,None),('status','Disponibilidad','select',True,'people_states'),('notes','Observaciones','long',False,None)])
+ ('code','Nombre','text',True,None),('role','Cargo','select',False,'roles'),('specialty','Especialidad','select',False,'specialties'),('email','Correo','text',False,None),('phone','Teléfono','text',False,None),('status','Disponibilidad','select',True,'people_states'),('notes','Observaciones','long',False,None)])
 }
 OPTIONS={'types':PROJECT_TYPES,'project_states':PROJECT_STATES,'task_states':TASK_STATES,'delivery_states':DELIVERY_STATES,'change_states':CHANGE_STATES,'meeting_states':MEETING_STATES,'specialties':SPECIALTIES,'priorities':PRIORITIES,'risks':RISKS,'roles':ROLES,'people_states':['Disponible','Ocupado','No disponible']}
 FINISHED_TASK={'Terminado','Aprobado'}
 FINISHED_DELIVERY={'Aprobado','Entregado'}
-CLOSED_CHANGE={'Ejecutado','Rechazado'}
+CLOSED_CHANGE={'Ejecutado'}
 
 @contextmanager
 def connection():
@@ -66,10 +64,13 @@ def initialize():
             for key,_,kind,_,_ in fields:
                 sql_type='REAL' if kind=='float' else 'INTEGER' if kind in ('int','bool') else 'TEXT'
                 cols.append(f'"{key}" {sql_type}'+(' UNIQUE' if key=='code' else ''))
+            if table=='people':cols.append('name TEXT')  # columna interna para compatibilidad con datos antiguos
             con.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(cols)})')
+        con.execute('''CREATE TABLE IF NOT EXISTS meetings (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, project_code TEXT, owner TEXT, due_date TEXT, status TEXT)''')
         con.execute('CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, version TEXT NOT NULL, registered_at TEXT NOT NULL, notes TEXT, UNIQUE(delivery_code,version))')
         con.execute('CREATE TABLE IF NOT EXISTS checklist (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, criterion TEXT NOT NULL, result TEXT NOT NULL DEFAULT "PENDIENTE", notes TEXT, UNIQUE(delivery_code,criterion))')
         con.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT DEFAULT CURRENT_TIMESTAMP, module TEXT, record_code TEXT, action TEXT)')
+        # Compatibilidad: conservar datos de instalaciones anteriores.
         con.execute('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_code)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_deliveries_project ON deliverables(project_code)')
 
@@ -198,11 +199,11 @@ def datespan(value):
 
 def decorate():
     data={x:df(t) for x,(t,_) in SPECS.items()}
-    p,t,e,c,m,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Reuniones y pendientes','Personal']]
+    p,t,e,c,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal']]
     if not t.empty:
         t['Días restantes']=t.due_date.map(datespan)
         t['Días atraso']=t.apply(lambda r:max(0,-r['Días restantes']) if pd.notna(r['Días restantes']) and r.status not in FINISHED_TASK and int(r.progress or 0)<100 else 0,axis=1)
-        t['Semáforo']=t.apply(lambda r:'🟠 Bloqueada' if r.blocked or r.status=='Bloqueado' else '🟢 Terminada' if r.status in FINISHED_TASK or r.progress==100 else '🔴 ATRASADA' if r['Días atraso']>0 else '🟡 Vence pronto' if pd.notna(r['Días restantes']) and r['Días restantes']<=2 else '🔵 Revisión' if r.status=='En revisión' else '⚪ No iniciada' if r.status=='No iniciado' else '🟢 En plazo',axis=1)
+        t['Semáforo']=t.apply(lambda r:'🟢 Terminada' if r.status in FINISHED_TASK or r.progress==100 else '🔴 ATRASADA' if r['Días atraso']>0 else '🟡 Vence pronto' if pd.notna(r['Días restantes']) and r['Días restantes']<=2 else '🔵 Revisión' if r.status=='En revisión' else '⚪ No iniciada' if r.status=='No iniciado' else '🟢 En plazo',axis=1)
     if not e.empty:
         e['Días restantes']=e.due_date.map(datespan)
         e['Alerta']=e.apply(lambda r:'🔴 ATRASADO' if pd.notna(r['Días restantes']) and r['Días restantes']<0 and r.status not in FINISHED_DELIVERY else '🟡 Próximo' if pd.notna(r['Días restantes']) and 0<=r['Días restantes']<=3 and r.status not in FINISHED_DELIVERY else '🔵 En revisión' if 'revisión' in r.status.lower() else '🟢 Cerrado' if r.status in FINISHED_DELIVERY else '',axis=1)
@@ -213,9 +214,9 @@ def decorate():
             pt=t[t.project_code==r.code] if not t.empty else pd.DataFrame()
             progress=round(float(pt.progress.fillna(0).mean()),1) if len(pt) else 0
             progresses.append(progress)
-            blocked=(not pt.empty and bool((pt.blocked.fillna(0)==1).any()))
-            late=(not pt.empty and bool((pt['Días atraso']>0).any())) or (datespan(r.due_date) is not None and datespan(r.due_date)<0 and r.status not in ('Terminado','Cancelado'))
-            risk='Alto' if late or blocked else 'Medio' if (datespan(r.due_date) is not None and datespan(r.due_date)<=7 and progress<100 and r.status not in ('Terminado','Cancelado')) else r.risk or 'Bajo'
+            blocked=False
+            late=(not pt.empty and bool((pt['Días atraso']>0).any())) or (datespan(r.due_date) is not None and datespan(r.due_date)<0 and r.status not in ('Terminado',))
+            risk='Alto' if late or blocked else 'Medio' if (datespan(r.due_date) is not None and datespan(r.due_date)<=7 and progress<100 and r.status!='Terminado') else 'Bajo'
             risks.append(risk)
             sem.append('🔴 Atrasado' if late else '🟠 Bloqueado' if blocked else '🟡 En riesgo' if risk in ('Medio','Alto','Crítico') else '🟢 En plazo')
         p['% Avance']=progresses;p['Riesgo calculado']=risks;p['Situación']=sem
@@ -223,14 +224,11 @@ def decorate():
         work=[];projects=[];load=[]
         for _,r in pe.iterrows():
             assigned=t[(t.owner==r.name)&(~t.status.isin(FINISHED_TASK))] if not t.empty else pd.DataFrame()
-            n=len(assigned);capacity=int(r.capacity or 1)
+            n=len(assigned)
             work.append(n)
             projects.append(assigned.project_code.nunique() if not assigned.empty else 0)
-            load.append('🔴 SOBRECARGA' if n>capacity else '🟡 Ocupado' if n==capacity else '🟢 Disponible')
+            load.append('🟡 Con tareas' if n else '🟢 Sin tareas')
         pe['Tareas activas']=work;pe['Proyectos asignados']=projects;pe['Carga de trabajo']=load
-    if not m.empty:
-        m['Días restantes']=m.due_date.map(datespan)
-        m['Alerta']=m.apply(lambda r:'🔴 ATRASADO' if pd.notna(r['Días restantes']) and r['Días restantes']<0 and r.status not in ('Completado','Cancelado') else '',axis=1)
     return data
 
 def selectors(kind,current=None):
@@ -243,10 +241,12 @@ def form_input(key,label,kind,required,choice,value,form_key):
     tag=form_key+'_'+key
     if kind in ('select','person','project','delivery'):
         vals=selectors(choice if kind=='select' else kind)
+        if kind=='select' and key=='specialty' and 'form_people_' in form_key:
+            vals=[v for v in vals if v not in ('Seguridad','Relaves')]
         if not required and kind!='delivery': vals=['']+vals
-        if value and value not in vals:vals=[value]+vals
+        if value and value not in vals and kind!='select':vals=[value]+vals
         if not vals: st.warning(f'Primero registre {"personal" if kind=="person" else "proyectos" if kind=="project" else "entregables"}.') ;vals=['']
-        return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,key=tag)
+        return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,key=tag+'_'+str(value))
     if kind=='version': return st.text_input(label,value=value or 'V01',key=tag,help='Formato recomendado: V01, V02, V03…')
     if kind=='date':
         val=date.fromisoformat(str(value)[:10]) if value and str(value)!='nan' else None
@@ -266,8 +266,19 @@ def save_record(module,values,record_id=None):
     if module=='Entregables' and not str(values['version']).upper().startswith('V'):raise ValueError('Use versiones V01, V02, etc.')
     if module=='Entregables' and values['status'] in ('Enviado al cliente','Aprobado','Entregado') and not values.get('review_date'):
         raise ValueError('Debe registrar fecha de revisión antes de enviar/aprobar/entregar.')
-    if module=='Reuniones y pendientes' and not values.get('agreement'):raise ValueError('Cada reunión necesita un acuerdo.')
+    if module=='Personal':
+        values['code']=str(values.get('code') or '').strip()
+        if not values['code']:raise ValueError('El nombre es obligatorio.')
+        values['name']=values['code']
     with connection() as con:
+        if module=='Personal':
+            other=con.execute('SELECT id FROM people WHERE lower(name)=lower(?) AND id!=?',(values['name'],record_id or -1)).fetchone()
+            if other:raise ValueError('Ya existe una persona con ese nombre.')
+            if record_id:
+                old=con.execute('SELECT name FROM people WHERE id=?',(record_id,)).fetchone()
+                if old and old['name']!=values['name']:
+                    for linked_table,column in [('projects','manager'),('tasks','owner'),('tasks','reviewer'),('deliverables','owner'),('deliverables','reviewer'),('changes','owner'),('meetings','owner')]:
+                        con.execute(f'UPDATE {linked_table} SET {column}=? WHERE {column}=?',(values['name'],old['name']))
         if record_id:
             sets=', '.join(f'{k}=?' for k in values)
             con.execute(f'UPDATE {table} SET {sets} WHERE id=?',list(values.values())+[record_id])
@@ -381,7 +392,7 @@ def reset_database_ui():
 def edit_module(module,data):
     table,fields=SPECS[module]
     st.subheader(module)
-    if module=='Proyectos': st.caption('El avance y riesgo calculado se muestran automáticamente en la tabla; el riesgo manual es referencial.')
+    if module=='Proyectos': st.caption('El avance y el riesgo se calculan automáticamente a partir del cronograma y las tareas.')
     left,right=st.columns([1,2])
     with left:
         if not can_edit():
@@ -398,7 +409,7 @@ def edit_module(module,data):
         with st.form('form_'+table,clear_on_submit=False):
             vals={}
             for key,label,kind,required,opt in fields:
-                raw=row.get(key)
+                raw=row.get('name') if module=='Personal' and key=='code' and row else row.get(key)
                 if pd.isna(raw) if raw is not None and not isinstance(raw,(list,dict)) else False:raw=None
                 vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
             submitted=st.form_submit_button('💾 Guardar cambios',use_container_width=True,type='primary')
@@ -413,6 +424,7 @@ def edit_module(module,data):
         view=data[module].copy()
         if not view.empty:
             show=[k for k,_,_,_,_ in fields]
+            if module=='Personal':view=view.rename(columns={'code':'Nombre'});show=['Nombre' if k=='code' else k for k in show]
             show+= [c for c in ['% Avance','Días restantes','Días atraso','Semáforo','Riesgo calculado','Situación','Alerta','Tareas activas','Proyectos asignados','Carga de trabajo'] if c in view.columns]
             q=st.text_input('🔎 Buscar en registros',key='search_'+table)
             if q:view=view[view.astype(str).apply(lambda x:x.str.contains(q,case=False,regex=False)).any(axis=1)]
@@ -425,26 +437,25 @@ def add_examples():
     with connection() as con:
         if con.execute('SELECT COUNT(*) FROM projects').fetchone()[0]:raise ValueError('Solo se pueden cargar los ejemplos si aún no existen proyectos.')
     d=lambda n:(date.today()+timedelta(days=n)).isoformat()
-    for item in [dict(code='PER-EX-01',name='Andrea Torres (EJEMPLO)',role='Jefe de Proyecto',specialty='Coordinación',capacity=4,status='Disponible'),dict(code='PER-EX-02',name='Luis Vega (EJEMPLO)',role='Ingeniero',specialty='Estructuras',capacity=3,status='Disponible'),dict(code='PER-EX-03',name='María Rojas (EJEMPLO)',role='Modelador BIM',specialty='BIM',capacity=2,status='Disponible')]:
+    for item in [dict(code='Andrea Torres (EJEMPLO)',name='Andrea Torres (EJEMPLO)',role='Jefe de Proyecto',specialty='Coordinación',capacity=4,status='Disponible'),dict(code='Luis Vega (EJEMPLO)',name='Luis Vega (EJEMPLO)',role='Ingeniero',specialty='Estructuras',capacity=3,status='Disponible'),dict(code='María Rojas (EJEMPLO)',name='María Rojas (EJEMPLO)',role='Modelador BIM',specialty='BIM',capacity=2,status='Disponible')]:
         save_record('Personal',{k:item.get(k) for k,_,_,_,_ in SPECS['Personal'][1]})
-    save_record('Proyectos',dict(code='PR-EX-001',name='Proyecto Ejemplo - Edificio Multifamiliar (EJEMPLO)',client='Cliente ficticio',type='Coordinación multidisciplinaria',location='Lima - Perú',manager='Andrea Torres (EJEMPLO)',start_date=d(-20),due_date=d(12),status='En desarrollo',risk='Medio',priority='Alta',notes='REGISTRO FICTICIO - reemplazar para producción'))
-    tasks=[('T-EX-001','Arquitectura','Plantas y elevaciones', 'Andrea Torres (EJEMPLO)',-4,65,'En desarrollo',0),('T-EX-002','Estructuras','Planos de cimentación','Luis Vega (EJEMPLO)',3,80,'En revisión',0),('T-EX-003','BIM','Compatibilización de interferencias','María Rojas (EJEMPLO)',6,25,'Bloqueado',1),('T-EX-004','Eléctricas','Circuitos y tableros','Andrea Torres (EJEMPLO)',10,0,'No iniciado',0),('T-EX-005','Sanitarias','Redes de agua y desagüe','Luis Vega (EJEMPLO)',-2,100,'Terminado',0)]
+    save_record('Proyectos',dict(code='PR-EX-001',name='Proyecto Ejemplo - Edificio Multifamiliar (EJEMPLO)',client='Cliente ficticio',type='Expediente técnico',location='Lima - Perú',manager='Andrea Torres (EJEMPLO)',start_date=d(-20),due_date=d(12),status='En desarrollo',priority='Alta',notes='REGISTRO FICTICIO - reemplazar para producción'))
+    tasks=[('T-EX-001','Arquitectura','Plantas y elevaciones', 'Andrea Torres (EJEMPLO)',-4,65,'En desarrollo',0),('T-EX-002','Estructuras','Planos de cimentación','Luis Vega (EJEMPLO)',3,80,'En revisión',0),('T-EX-003','BIM','Compatibilización de interferencias','María Rojas (EJEMPLO)',6,25,'En desarrollo',0),('T-EX-004','Eléctricas','Circuitos y tableros','Andrea Torres (EJEMPLO)',10,0,'No iniciado',0),('T-EX-005','Sanitarias','Redes de agua y desagüe','Luis Vega (EJEMPLO)',-2,100,'Aprobado',0)]
     for code,sp,activity,owner,due,progress,status,blocked in tasks:
-        save_record('Plan de trabajo',dict(code=code,project_code='PR-EX-001',specialty=sp,activity=activity,delivery_code='',owner=owner,reviewer='Andrea Torres (EJEMPLO)',start_date=d(-18),due_date=d(due),progress=progress,status=status,priority='Alta' if due<0 else 'Media',blocked=blocked,block_reason='Información del cliente pendiente (EJEMPLO)' if blocked else '',updated_at=d(0),notes='EJEMPLO'))
+        save_record('Plan de trabajo',dict(code=code,project_code='PR-EX-001',specialty=sp,activity=activity,delivery_code='',owner=owner,reviewer='Andrea Torres (EJEMPLO)',start_date=d(-18),due_date=d(due),progress=progress,status=status,priority='Alta' if due<0 else 'Media',updated_at=d(0),notes='EJEMPLO'))
     for code,sp,name,owner,due,status,obs in [('E-EX-001','Arquitectura','Planta arquitectónica','Andrea Torres (EJEMPLO)',-2,'Con observaciones',3),('E-EX-002','Estructuras','Cimentaciones','Luis Vega (EJEMPLO)',4,'En revisión interna',1),('E-EX-003','BIM','Modelo federado','María Rojas (EJEMPLO)',8,'En desarrollo',0)]:
-        save_record('Entregables',dict(code=code,project_code='PR-EX-001',drawing_code=code.replace('E-EX','PL-EX'),name=name,specialty=sp,owner=owner,reviewer='Andrea Torres (EJEMPLO)',version='V01',due_date=d(due),actual_date=None,status=status,observations_count=obs,review_date=d(-1) if obs else None,correction_date=None,approval_date=None,notes='EJEMPLO',file_path=''))
-    save_record('Control de cambios',dict(code='C-EX-001',project_code='PR-EX-001',request_date=d(-2),requester='Cliente ficticio',description='Cambio de distribución de ambientes',reason='Nueva necesidad del cliente',specialty='Arquitectura',affected_drawings='PL-EX-001',owner='Andrea Torres (EJEMPLO)',estimated_hours=12.,technical_impact='Medio',schedule_impact='Alto',economic_impact='Medio',new_due_date=d(16),approved_by='',approval_date=None,status='Pendiente de aprobación',notes='EJEMPLO'))
-    save_record('Reuniones y pendientes',dict(code='R-EX-001',meeting_date=d(-4),project_code='PR-EX-001',meeting_type='Coordinación',participants='Equipo técnico',topic='Interferencias BIM',problem='Cruce de instalaciones',agreement='Validar y corregir interferencias detectadas',owner='María Rojas (EJEMPLO)',due_date=d(-1),status='Pendiente',notes='EJEMPLO'))
+        save_record('Entregables',dict(code=code,project_code='PR-EX-001',drawing_code=code.replace('E-EX','PL-EX'),name=name,specialty=sp,owner=owner,reviewer='Andrea Torres (EJEMPLO)',version='V01',due_date=d(due),actual_date=None,status=status,review_date=d(-1) if obs else None,correction_date=None,approval_date=None,notes='EJEMPLO',file_path=''))
+    save_record('Control de cambios',dict(code='C-EX-001',project_code='PR-EX-001',request_date=d(-2),requester='Cliente ficticio',description='Cambio de distribución de ambientes',reason='Nueva necesidad del cliente',specialty='Arquitectura',affected_drawings='PL-EX-001',owner='Andrea Torres (EJEMPLO)',schedule_impact='Alto',new_due_date=d(16),approved_by='',approval_date=None,status='Solicitado',notes='EJEMPLO'))
+    save_record(dict(code='R-EX-001',meeting_date=d(-4),project_code='PR-EX-001',meeting_type='Coordinación',participants='Equipo técnico',topic='Interferencias BIM',problem='Cruce de instalaciones',agreement='Validar y corregir interferencias detectadas',owner='María Rojas (EJEMPLO)',due_date=d(-1),status='Pendiente',notes='EJEMPLO'))
 
 def priorities(data):
-    t=data['Plan de trabajo'];e=data['Entregables'];p=data['Proyectos'];c=data['Control de cambios'];m=data['Reuniones y pendientes']
+    t=data['Plan de trabajo'];e=data['Entregables'];p=data['Proyectos'];c=data['Control de cambios']
     out=[]
     def add(priority,kind,project,desc,owner,due,code):out.append(dict(Prioridad=priority,Tipo=kind,Proyecto=project,Detalle=desc,Responsable=owner,Vencimiento=str(due or ''),ID=code))
     for _,r in t.iterrows():
         if r.status in FINISHED_TASK or int(r.progress or 0)>=100:continue
         days=r['Días restantes']
-        if r.blocked or r.status=='Bloqueado':add('🔴 Alta','Tarea bloqueada',r.project_code,r.activity,r.owner,r.due_date,r.code)
-        elif pd.notna(days) and days<0:add('🔴 Alta','Tarea atrasada',r.project_code,r.activity,r.owner,r.due_date,r.code)
+        if pd.notna(days) and days<0:add('🔴 Alta','Tarea atrasada',r.project_code,r.activity,r.owner,r.due_date,r.code)
         elif pd.notna(days) and days==0:add('🔴 Alta','Vence hoy',r.project_code,r.activity,r.owner,r.due_date,r.code)
         elif pd.notna(days) and days==1:add('🟡 Media','Vence mañana',r.project_code,r.activity,r.owner,r.due_date,r.code)
     for _,r in e.iterrows():
@@ -454,17 +465,15 @@ def priorities(data):
         elif pd.notna(days) and days<=3:add('🟡 Media','Entregable próximo',r.project_code,r.name,r.owner,r.due_date,r.code)
         if r.status in ('Con observaciones','Observado por cliente'):add('🟡 Media','Entregable observado',r.project_code,r.name,r.owner,r.due_date,r.code)
     for _,r in p.iterrows():
-        if r.status not in ('Terminado','Cancelado') and r['Riesgo calculado'] in ('Alto','Crítico'):add('🔴 Alta','Proyecto en riesgo',r.code,r['name'],r.manager,r.due_date,r.code)
+        if r.status not in ('Terminado',) and r['Riesgo calculado'] in ('Alto','Crítico'):add('🔴 Alta','Proyecto en riesgo',r.code,r['name'],r.manager,r.due_date,r.code)
     for _,r in c.iterrows():
-        if r.status in ('Solicitado','En evaluación','Pendiente de aprobación'):add('🟡 Media','Cambio por aprobar',r.project_code,r.description,r.owner,r.new_due_date,r.code)
-    for _,r in m.iterrows():
-        if r['Alerta']:add('🔴 Alta','Acuerdo atrasado',r.project_code,r.agreement,r.owner,r.due_date,r.code)
+        if r.status in ('Solicitado',):add('🟡 Media','Cambio por aprobar',r.project_code,r.description,r.owner,r.new_due_date,r.code)
     return pd.DataFrame(out,columns=['Prioridad','Tipo','Proyecto','Detalle','Responsable','Vencimiento','ID'])
 
 def dashboard(data):
-    p,t,e,c,m,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Reuniones y pendientes','Personal']]
-    active=p[~p.status.isin(['Terminado','Cancelado'])] if not p.empty else p
-    metrics=[('Proyectos activos',len(active)),('Proyectos atrasados',int((active.Situación=='🔴 Atrasado').sum()) if not active.empty else 0),('Proyectos en riesgo',int(active['Riesgo calculado'].isin(['Alto','Crítico']).sum()) if not active.empty else 0),('Tareas pendientes',int((~t.status.isin(FINISHED_TASK)&(t.progress.fillna(0)<100)).sum()) if not t.empty else 0),('Tareas atrasadas',int((t['Días atraso']>0).sum()) if not t.empty else 0),('Entregables pendientes',int((~e.status.isin(FINISHED_DELIVERY)).sum()) if not e.empty else 0),('Entregables en revisión',int(e.status.str.contains('revisión',case=False,na=False).sum()) if not e.empty else 0),('Con observaciones',int(e.status.isin(['Con observaciones','Observado por cliente']).sum()) if not e.empty else 0),('Cambios pendientes',int(c.status.isin(['Solicitado','En evaluación','Pendiente de aprobación']).sum()) if not c.empty else 0),('Bloqueos activos',int(((t.blocked==1)|(t.status=='Bloqueado')).sum()) if not t.empty else 0)]
+    p,t,e,c,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal']]
+    active=p[~p.status.isin(['Terminado'])] if not p.empty else p
+    metrics=[('Proyectos activos',len(active)),('Proyectos atrasados',int((active.Situación=='🔴 Atrasado').sum()) if not active.empty else 0),('Proyectos en riesgo',int(active['Riesgo calculado'].isin(['Alto','Crítico']).sum()) if not active.empty else 0),('Tareas pendientes',int((~t.status.isin(FINISHED_TASK)&(t.progress.fillna(0)<100)).sum()) if not t.empty else 0),('Tareas atrasadas',int((t['Días atraso']>0).sum()) if not t.empty else 0),('Entregables pendientes',int((~e.status.isin(FINISHED_DELIVERY)).sum()) if not e.empty else 0),('Entregables en revisión',int(e.status.str.contains('revisión',case=False,na=False).sum()) if not e.empty else 0),('Con observaciones',int(e.status.isin(['Con observaciones','Observado por cliente']).sum()) if not e.empty else 0),('Cambios pendientes',int(c.status.isin(['Solicitado']).sum()) if not c.empty else 0),]
     st.title('ALTIVIA  |  Panel de control')
     st.caption(f'Consultoría e ingeniería • Actualizado al {TODAY.strftime("%d/%m/%Y")} • Datos almacenados localmente')
     # Tarjetas fluidas: 5 columnas en escritorio, 2 en móvil; contraste independiente del tema.
@@ -486,7 +495,7 @@ def dashboard(data):
         st.dataframe(p[['code','name','manager','% Avance','due_date','Días restantes','status','Riesgo calculado','Situación']].rename(columns={'code':'ID','name':'Proyecto','manager':'Responsable','due_date':'Fecha entrega','status':'Estado'}),hide_index=True,use_container_width=True)
     else:st.info('Registra un proyecto para comenzar.')
     st.subheader('Análisis visual')
-    plots=[('Avance por proyecto',p,'name','% Avance','bar'),('Proyectos por estado',p,'status',None,'pie'),('Tareas por estado',t,'status',None,'pie'),('Entregables por estado',e,'status',None,'pie'),('Carga de trabajo por persona',pe,'name','Tareas activas','bar'),('Proyectos por nivel de riesgo',p,'Riesgo calculado',None,'pie')]
+    plots=[('Avance por proyecto',p,'name','% Avance','bar'),('Proyectos por estado',p,'status',None,'pie'),('Tareas por estado',t,'status',None,'pie'),('Entregables por estado',e,'status',None,'pie'),('Tareas por persona',pe,'name','Tareas activas','bar'),('Proyectos por nivel de riesgo',p,'Riesgo calculado',None,'pie')]
     for i in range(0,len(plots),2):
         cols=st.columns(2)
         for col,(title,frame,x,y,kind) in zip(cols,plots[i:i+2]):
@@ -623,7 +632,7 @@ def main():
         if st.button('Cerrar sesión'):
             for key in ('user_id','role','username','full_name'):st.session_state.pop(key,None)
             st.rerun()
-        pages=['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Reuniones y pendientes','Personal','Checklist planos','Versiones','Mi cuenta']
+        pages=['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta']
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
         page=st.radio('Navegación',pages)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
