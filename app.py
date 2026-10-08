@@ -466,9 +466,13 @@ def dashboard(data):
     metrics=[('Proyectos activos',len(active)),('Proyectos atrasados',int((active.Situación=='🔴 Atrasado').sum()) if not active.empty else 0),('Proyectos en riesgo',int(active['Riesgo calculado'].isin(['Alto','Crítico']).sum()) if not active.empty else 0),('Tareas pendientes',int((~t.status.isin(FINISHED_TASK)&(t.progress.fillna(0)<100)).sum()) if not t.empty else 0),('Tareas atrasadas',int((t['Días atraso']>0).sum()) if not t.empty else 0),('Entregables pendientes',int((~e.status.isin(FINISHED_DELIVERY)).sum()) if not e.empty else 0),('Entregables en revisión',int(e.status.str.contains('revisión',case=False,na=False).sum()) if not e.empty else 0),('Con observaciones',int(e.status.isin(['Con observaciones','Observado por cliente']).sum()) if not e.empty else 0),('Cambios pendientes',int(c.status.isin(['Solicitado','En evaluación','Pendiente de aprobación']).sum()) if not c.empty else 0),('Bloqueos activos',int(((t.blocked==1)|(t.status=='Bloqueado')).sum()) if not t.empty else 0)]
     st.title('ALTIVIA  |  Panel de control')
     st.caption(f'Consultoría e ingeniería • Actualizado al {TODAY.strftime("%d/%m/%Y")} • Datos almacenados localmente')
-    for offset in (0,5):
-        cols=st.columns(5)
-        for col,(label,val) in zip(cols,metrics[offset:offset+5]):col.metric(label,val)
+    # Tarjetas fluidas: 5 columnas en escritorio, 2 en móvil; contraste independiente del tema.
+    cards=''.join(
+        '<div class="altivia-kpi-card"><div class="altivia-kpi-label">'
+        +escape(str(label))+'</div><div class="altivia-kpi-value">'
+        +escape(str(val))+'</div></div>' for label,val in metrics
+    )
+    st.markdown('<div class="altivia-kpi-grid">'+cards+'</div>',unsafe_allow_html=True)
     st.divider()
     st.subheader('🚨 PRIORIDADES DE HOY')
     urgent=priorities(data)
@@ -568,9 +572,32 @@ def export_xlsx(data):
 
 def setup_style():
     st.markdown('''<style>
-    [data-testid="stSidebar"]{background:#102b48} [data-testid="stSidebar"] *{color:#f2f6fb!important}
-    [data-testid="stMetric"]{background:#f1f5f9;border:1px solid #e0e7ee;border-radius:10px;padding:12px}
+    [data-testid="stSidebar"]{background:#102b48}
+    [data-testid="stSidebar"] :is(p,span,label,h1,h2,h3){color:#f2f6fb!important}
+    /* Sidebar: botón de salida con contraste alto en todos los temas. */
+    [data-testid="stSidebar"] button[kind="secondary"],
+    [data-testid="stSidebar"] .stButton > button{
+      background:#eaf2fb!important;color:#102b48!important;
+      border:1px solid #acc7e3!important;border-radius:9px!important;
+    }
+    [data-testid="stSidebar"] .stButton > button :is(p,span,div){color:#102b48!important}
+    [data-testid="stSidebar"] .stButton > button:hover{background:#cde3f8!important;color:#102b48!important}
+    /* Los KPI usan colores explícitos, sin depender del tema claro/oscuro del móvil. */
+    .altivia-kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:14px 0 20px}
+    .altivia-kpi-card{background:#eff4fa;color:#142c49!important;border:1px solid #d4e0eb;
+      border-radius:11px;padding:12px 13px;min-width:0;min-height:97px;box-sizing:border-box}
+    .altivia-kpi-label{font-size:0.84rem;line-height:1.3;font-weight:600;color:#334d67!important;overflow-wrap:anywhere}
+    .altivia-kpi-value{font-size:1.75rem;line-height:1.2;font-weight:700;margin-top:9px;color:#102b48!important}
     .block-container{padding-top:1.5rem}
+    @media(max-width:900px){
+      .altivia-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+      .altivia-kpi-card{padding:11px;min-height:84px}
+      .altivia-kpi-label{font-size:0.78rem}
+      .altivia-kpi-value{font-size:1.5rem;margin-top:7px}
+      .block-container{padding-left:0.9rem;padding-right:0.9rem}
+    }
+    @media(max-width:360px){.altivia-kpi-grid{gap:7px}.altivia-kpi-card{padding:9px}.altivia-kpi-value{font-size:1.35rem}}
+    
     </style>''',unsafe_allow_html=True)
 
 def main():
