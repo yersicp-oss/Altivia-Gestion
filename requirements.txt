@@ -2,3 +2,5 @@ streamlit>=1.35,<2
 pandas>=2.0,<3
 plotly>=5.20,<7
 openpyxl>=3.1,<4
+msal>=1.31,<2
+requests>=2.31,<3
