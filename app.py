@@ -1204,10 +1204,12 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
 
 
 def catalog_delete(catalog_id):
-    """Elimina SOLO la programación, siempre que no tenga entregas ni vínculos.
+    """Elimina la programación sin bloquearla por versiones antiguas eliminadas.
 
-    Nunca borra documentos, archivos de Drive, versiones o datos de otros módulos.
-    La comprobación y la eliminación se realizan en una sola transacción SQLite.
+    No borra entregas activas, tareas ni archivos de Drive. Los contadores históricos
+    se conservan para no reutilizar V01/V02 si se vuelve a dar de alta el mismo ID.
+    Se limpian exclusivamente las versiones/checklists huérfanos de un código que
+    ya no tiene una entrega activa, evitando que reaparezcan al reutilizar el código.
     """
     require_admin()
     with connection() as con:
@@ -1217,22 +1219,24 @@ def catalog_delete(catalog_id):
         if item is None:
             raise ValueError('Este entregable programado ya no existe. Actualiza la pantalla.')
         code=item['code']
-        # Bloquear también si quedan referencias históricas después de borrar una entrega.
-        checks=(
-            ('deliverables','code'),
-            ('versions','delivery_code'),
-            ('version_counters','delivery_code'),
-            ('checklist','delivery_code'),
-            ('tasks','delivery_code'),
-        )
-        for table,column in checks:
-            if con.execute(f'SELECT 1 FROM {table} WHERE {column}=? LIMIT 1',(code,)).fetchone():
-                raise ValueError('No se puede eliminar: este entregable ya tiene una entrega, '
-                                 'versiones históricas, checklist o tareas asociadas. '
-                                 'Elimina o desvincula esos registros mediante su módulo correspondiente.')
+        # Este registro puede tener un contador de versiones o notas antiguas, aun
+        # cuando su última versión ya se eliminó. Eso NO impide borrar el catálogo.
+        if con.execute('SELECT 1 FROM deliverables WHERE code=? LIMIT 1',(code,)).fetchone():
+            raise ValueError('Este entregable todavía tiene una entrega registrada. '
+                             'Elimínala primero desde los registros del módulo Entregables.')
+        if con.execute('SELECT 1 FROM tasks WHERE delivery_code=? LIMIT 1',(code,)).fetchone():
+            raise ValueError('Existen tareas vinculadas a este ID. Desvincúlalas en Plan de trabajo '
+                             'antes de borrar la programación; las versiones históricas no bloquean.')
+        # No hay entrega activa: son filas históricas sueltas; se limpia su relación
+        # al catálogo, pero se deja el máximo de versión en version_counters.
+        versions_deleted=con.execute('DELETE FROM versions WHERE delivery_code=?',(code,)).rowcount
+        checks_deleted=con.execute('DELETE FROM checklist WHERE delivery_code=?',(code,)).rowcount
         con.execute('DELETE FROM deliverable_catalog WHERE id=?',(int(catalog_id),))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
-                    ('Catálogo entregables',code,'Eliminación por Administrador del proyecto '+item['project_code']))
+                    ('Catálogo entregables',code,
+                     'Eliminado del proyecto '+item['project_code']+
+                     f'; referencias históricas locales limpiadas: {versions_deleted} versiones, {checks_deleted} checks; '
+                     'contador conservado; sin cambios en Google Drive'))
     return code
 
 
@@ -1303,14 +1307,15 @@ def delivery_catalog_admin_ui():
             # Los documentos/archivos de Google Drive nunca se eliminan desde aquí.
             if item['registered']:
                 st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}',disabled=True)
-                st.caption('No disponible: la entrega ya tiene registros. Protege versiones y archivos existentes.')
+                st.caption('Elimina primero la entrega activa en Registros. Las versiones históricas ya eliminadas no bloquearán el catálogo.')
             else:
                 if st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}'):
                     st.session_state[f'catalog_delete_open_{item["id"]}']=True
                 if st.session_state.get(f'catalog_delete_open_{item["id"]}'):
                     with st.container(border=True):
                         st.warning(f'¿Eliminar la programación {item["code"]} del proyecto {item["project_code"]}? '
-                                   'No se borrarán archivos de Google Drive ni otros entregables.')
+                                   'No se borrarán archivos de Google Drive ni otros entregables. '
+                                   'El historial de numeración permanece reservado.')
                         confirm=st.checkbox(
                             f'Confirmo eliminar el entregable {item["code"]}',
                             key=f'catalog_del_confirm_{item["id"]}')
