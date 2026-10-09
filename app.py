@@ -351,73 +351,155 @@ def login_page():
             st.session_state['failed_logins']=st.session_state.get('failed_logins',0)+1
             st.error('Credenciales incorrectas o usuario desactivado.')
 
+def normalized_username(raw):
+    """Identificador de acceso estable: se normaliza sin cambiar el ID del usuario."""
+    username=str(raw or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{2,39}',username):
+        raise ValueError('El usuario debe tener entre 3 y 40 caracteres: letras, números, punto, guion o guion bajo; empezar con letra o número.')
+    return username
+
+
+def update_user_by_admin(target_id,username,full_name,role,active,new_password=''):
+    """Edita una cuenta por su ID; conserva permisos de cliente y las referencias."""
+    require_admin()
+    target_id=int(target_id)
+    actor=int(st.session_state['user_id'])
+    username=normalized_username(username)
+    full_name=str(full_name or '').strip()
+    if not full_name:raise ValueError('El nombre completo es obligatorio.')
+    if len(full_name)>150:raise ValueError('El nombre completo no debe exceder 150 caracteres.')
+    if role not in ('Administrador','Consulta','Cliente'):
+        raise ValueError('Rol no válido.')
+    if new_password and len(new_password)<6:
+        raise ValueError('La contraseña nueva debe tener al menos 6 caracteres.')
+    if target_id==actor and (role!='Administrador' or not active):
+        raise ValueError('No puedes desactivar tu propia cuenta ni quitarte el rol Administrador.')
+    with connection() as con:
+        previous=con.execute('SELECT username,full_name,role,active FROM users WHERE id=?',(target_id,)).fetchone()
+        if not previous:raise ValueError('El usuario seleccionado ya no existe.')
+        if previous['role']=='Administrador' and previous['active'] and (role!='Administrador' or not active):
+            others=con.execute("SELECT COUNT(*) FROM users WHERE role='Administrador' AND active=1 AND id<>?",(target_id,)).fetchone()[0]
+            if others<1:raise ValueError('Debe quedar al menos un Administrador activo.')
+        conflict=con.execute('SELECT id FROM users WHERE lower(username)=? AND id<>?',(username,target_id)).fetchone()
+        if conflict:raise ValueError('El nombre de usuario ya está registrado. Elige otro.')
+        con.execute('UPDATE users SET username=?,full_name=?,role=?,active=? WHERE id=?',
+                    (username,full_name,role,int(bool(active)),target_id))
+        if new_password:
+            con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(new_password),target_id))
+        # Sólo los cambios de credenciales, acceso o rol revocan sesiones recordadas.
+        # Cambiar el nombre visible o el usuario no invalida la sesión existente.
+        if new_password or role!=previous['role'] or bool(active)!=bool(previous['active']):
+            con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(target_id,))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Usuarios',username,f'Perfil editado por Administrador ID {actor}'))
+    if target_id==actor:
+        st.session_state['username']=username
+        st.session_state['full_name']=full_name
+        if new_password:
+            st.session_state.pop('_remember_token',None)
+            try:delete_remember_cookie()
+            except Exception:pass
+    return username
+
+
+def update_own_profile(username,full_name,current_password):
+    """Cada usuario puede editar solamente su propia cuenta, comprobando su clave."""
+    actor=st.session_state.get('user_id')
+    if actor is None:raise PermissionError('Debes iniciar sesión para modificar tus datos.')
+    username=normalized_username(username)
+    full_name=str(full_name or '').strip()
+    if not full_name:raise ValueError('El nombre completo es obligatorio.')
+    if len(full_name)>150:raise ValueError('El nombre completo no debe exceder 150 caracteres.')
+    if not current_password:raise ValueError('Ingresa tu contraseña actual para confirmar los cambios.')
+    with connection() as con:
+        current=con.execute('SELECT password_hash,active,username,full_name FROM users WHERE id=?',(actor,)).fetchone()
+        if not current or not current['active']:
+            raise PermissionError('La cuenta no está activa.')
+        if not verify_password(current_password,current['password_hash']):
+            raise ValueError('Contraseña actual incorrecta.')
+        conflict=con.execute('SELECT id FROM users WHERE lower(username)=? AND id<>?',(username,actor)).fetchone()
+        if conflict:raise ValueError('El nombre de usuario ya está registrado. Elige otro.')
+        con.execute('UPDATE users SET username=?,full_name=? WHERE id=?',(username,full_name,actor))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Mi cuenta',username,'Datos personales actualizados'))
+    st.session_state['username']=username
+    st.session_state['full_name']=full_name
+    return username
+
+
 def user_management():
     require_admin()
     st.title('🔐 Administración de usuarios')
     with connection() as con:
         users=pd.read_sql_query('SELECT id,username,full_name,role,active,created_at FROM users ORDER BY id',con)
-    st.dataframe(users,hide_index=True,use_container_width=True)
-    st.subheader('Crear usuario')
-    with st.form('new_user'):
-        username=st.text_input('Usuario nuevo').strip().lower()
-        name=st.text_input('Nombre completo').strip()
-        role=st.selectbox('Rol',['Consulta','Cliente','Administrador'])
-        password=st.text_input('Contraseña inicial (mínimo 6 caracteres)',type='password')
-        if st.form_submit_button('Crear usuario',type='primary'):
-            if not username or not name or len(password)<6:st.error('Complete los datos y use una contraseña de al menos 6 caracteres.')
-            else:
+    if not users.empty:
+        display=users.rename(columns={'username':'Usuario','full_name':'Nombre completo',
+            'role':'Rol','active':'Activo','created_at':'Fecha de creación'})
+        st.dataframe(display[['Usuario','Nombre completo','Rol','Activo','Fecha de creación']],
+                     hide_index=True,use_container_width=True)
+    with st.expander('➕ Crear usuario',expanded=users.empty):
+        with st.form('new_user'):
+            username=st.text_input('Usuario nuevo').strip().lower()
+            name=st.text_input('Nombre completo').strip()
+            role=st.selectbox('Rol',['Consulta','Cliente','Administrador'])
+            password=st.text_input('Contraseña inicial (mínimo 6 caracteres)',type='password')
+            if st.form_submit_button('Crear usuario',type='primary'):
                 try:
+                    username=normalized_username(username)
+                    if not name:raise ValueError('El nombre completo es obligatorio.')
+                    if len(password)<6:raise ValueError('La contraseña debe tener al menos 6 caracteres.')
                     with connection() as con:
-                        con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES(?,?,?,?)',(username,name,hash_password(password),role))
-                    st.success('Usuario creado');st.rerun()
+                        con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES(?,?,?,?)',
+                                    (username,name,hash_password(password),role))
+                    st.success('Usuario creado.');st.rerun()
                 except sqlite3.IntegrityError:st.error('El nombre de usuario ya existe.')
-    st.subheader('Editar acceso o restablecer contraseña')
-    selected=st.selectbox('Seleccionar usuario',users.id.tolist(),format_func=lambda i: str(users.loc[users.id==i,'username'].iloc[0]))
-    r=users.loc[users.id==selected].iloc[0]
-    with st.form('update_user'):
-        new_role=st.selectbox('Rol',['Administrador','Consulta','Cliente'],index=['Administrador','Consulta','Cliente'].index(r['role']))
-        active=st.checkbox('Cuenta activa',value=bool(r['active']))
-        reset=st.text_input('Contraseña nueva (dejar vacío para conservar)',type='password')
-        if st.form_submit_button('Guardar acceso'):
-            if reset and len(reset)<6:st.error('La contraseña nueva debe tener al menos 6 caracteres.')
-            elif r['id']==st.session_state['user_id'] and (not active or new_role!='Administrador'):
-                st.error('No puedes desactivar tu propia cuenta ni quitarte el rol Administrador.')
-            else:
-                with connection() as con:
-                    if r['role']=='Administrador' and (not active or new_role!='Administrador'):
-                        count=con.execute("SELECT COUNT(*) FROM users WHERE role='Administrador' AND active=1").fetchone()[0]
-                        if count<=1:st.error('Debe quedar al menos un administrador activo.');return
-                    con.execute('UPDATE users SET role=?, active=? WHERE id=?',(new_role,int(active),selected))
-                    if reset:
-                        con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(reset),selected))
-                    if reset or new_role!=r['role'] or not active:
-                        # Un cambio de privilegios también anula accesos recordados.
-                        con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(selected,))
-                st.success('Acceso actualizado');st.rerun()
-    st.divider()
-    st.subheader('🗑️ Eliminar usuario')
-    with st.expander('Eliminar una cuenta de forma permanente'):
-        st.warning('Se eliminará la cuenta y sus autorizaciones; no se borrarán proyectos, entregables ni documentos en Google Drive.')
-        candidates=[int(i) for i in users.id.tolist() if int(i)!=int(st.session_state['user_id'])]
-        if not candidates:
-            st.info('No hay otros usuarios que se puedan eliminar.')
-        else:
-            target=st.selectbox('Usuario a eliminar',candidates,key='user_delete_select',
-                format_func=lambda i: f"{users.loc[users.id==i,'full_name'].iloc[0]} · {users.loc[users.id==i,'username'].iloc[0]}")
-            target_username=str(users.loc[users.id==target,'username'].iloc[0])
-            with st.form(f'user_delete_confirm_{target}'):
-                typed=st.text_input(f'Escribe el usuario «{target_username}» para confirmar')
-                confirmed=st.checkbox('Comprendo que esta cuenta dejará de tener acceso inmediatamente')
-                clicked=st.form_submit_button('🗑️ Eliminar usuario definitivamente',type='primary')
-            if clicked:
-                if not confirmed or typed.strip()!=target_username:
-                    st.error('Escribe el nombre de usuario exacto y marca la confirmación.')
-                else:
+                except ValueError as exc:st.error(str(exc))
+    if not users.empty:
+        # Edición plegable mediante un único botón. Se vuelve a consultar la cuenta
+        # seleccionada al guardar; nunca se confía en un rol recibido desde el navegador.
+        if st.button('✏️ Editar usuario',use_container_width=True,key='open_user_editor'):
+            st.session_state['show_user_editor']=not st.session_state.get('show_user_editor',False)
+        if st.session_state.get('show_user_editor',False):
+            with st.container(border=True):
+                selected=st.selectbox('Seleccionar usuario',users.id.astype(int).tolist(),
+                    format_func=lambda i: f"{users.loc[users.id==i,'full_name'].iloc[0]} · {users.loc[users.id==i,'username'].iloc[0]}",
+                    key='user_edit_select')
+                r=users.loc[users.id==selected].iloc[0]
+                with st.form(f'edit_user_form_{selected}'):
+                    new_username=st.text_input('Nombre de usuario',value=str(r['username']))
+                    new_full_name=st.text_input('Nombre completo',value=str(r['full_name']))
+                    allowed_roles=['Administrador','Consulta','Cliente']
+                    new_role=st.selectbox('Rol',allowed_roles,index=allowed_roles.index(str(r['role'])))
+                    active=st.checkbox('Cuenta activa',value=bool(r['active']))
+                    reset=st.text_input('Nueva contraseña (opcional; dejar vacío para conservar)',type='password')
+                    save=st.form_submit_button('💾 Guardar cambios',type='primary')
+                if save:
                     try:
-                        removed=delete_user_account(target)
-                        st.success(f'Usuario {removed} eliminado. Sus sesiones se revocaron.')
-                        st.rerun()
-                    except (ValueError, sqlite3.Error) as exc:st.error(str(exc))
+                        updated=update_user_by_admin(selected,new_username,new_full_name,new_role,active,reset)
+                        st.success(f'Usuario {updated} actualizado.');st.rerun()
+                    except (ValueError,PermissionError,sqlite3.Error) as exc:st.error(str(exc))
+        st.divider()
+        with st.expander('🗑️ Eliminar usuario'):
+            st.warning('Se eliminará la cuenta y sus autorizaciones; no se borrarán proyectos, entregables ni documentos en Google Drive.')
+            candidates=[int(i) for i in users.id.tolist() if int(i)!=int(st.session_state['user_id'])]
+            if not candidates:
+                st.info('No hay otros usuarios que se puedan eliminar.')
+            else:
+                target=st.selectbox('Usuario a eliminar',candidates,key='user_delete_select',
+                    format_func=lambda i: f"{users.loc[users.id==i,'full_name'].iloc[0]} · {users.loc[users.id==i,'username'].iloc[0]}")
+                target_username=str(users.loc[users.id==target,'username'].iloc[0])
+                with st.form(f'user_delete_confirm_{target}'):
+                    typed=st.text_input(f'Escribe el usuario «{target_username}» para confirmar')
+                    confirmed=st.checkbox('Comprendo que esta cuenta dejará de tener acceso inmediatamente')
+                    clicked=st.form_submit_button('🗑️ Eliminar usuario definitivamente',type='primary')
+                if clicked:
+                    if not confirmed or typed.strip()!=target_username:
+                        st.error('Escribe el nombre de usuario exacto y marca la confirmación.')
+                    else:
+                        try:
+                            removed=delete_user_account(target)
+                            st.success(f'Usuario {removed} eliminado. Sus sesiones se revocaron.');st.rerun()
+                        except (ValueError,sqlite3.Error) as exc:st.error(str(exc))
     client_permissions_ui()
 
 def client_permissions_ui():
@@ -785,20 +867,43 @@ def client_portal():
 
 
 def my_account():
-    st.title('Mi cuenta')
-    st.write(f"Usuario: **{st.session_state.get('username')}** · Rol: **{st.session_state.get('role')}**")
+    st.title('👤 Mi cuenta')
+    uid=st.session_state.get('user_id')
+    with connection() as con:
+        current=con.execute('SELECT username,full_name,role,active FROM users WHERE id=?',(uid,)).fetchone()
+    if not current or not current['active']:
+        st.error('No se pudo verificar una cuenta activa. Inicia sesión de nuevo.');return
+    st.caption(f"Rol: {current['role']} · Usuario: {current['username']}")
+
+    st.subheader('Editar mis datos')
+    with st.form('edit_own_profile'):
+        new_username=st.text_input('Nombre de usuario',value=current['username'])
+        new_full_name=st.text_input('Nombre completo',value=current['full_name'])
+        st.caption('Para proteger tu cuenta, confirma los cambios con tu contraseña actual. Tu rol y permisos no cambiarán.')
+        profile_password=st.text_input('Contraseña actual para confirmar',type='password')
+        save_profile=st.form_submit_button('💾 Guardar mis datos',type='primary')
+    if save_profile:
+        try:
+            update_own_profile(new_username,new_full_name,profile_password)
+            st.success('Tus datos se actualizaron. Puedes seguir usando GP Altivia sin cerrar sesión.');st.rerun()
+        except (ValueError,PermissionError,sqlite3.Error) as exc:st.error(str(exc))
+
+    st.divider()
+    st.subheader('🔒 Cambiar contraseña')
     with st.form('change_password'):
-        current=st.text_input('Contraseña actual',type='password')
+        current_password=st.text_input('Contraseña actual',type='password')
         new=st.text_input('Nueva contraseña (mínimo 6 caracteres)',type='password')
         confirm=st.text_input('Confirmar contraseña',type='password')
         if st.form_submit_button('Cambiar contraseña'):
             with connection() as con:
-                stored=con.execute('SELECT password_hash FROM users WHERE id=?',(st.session_state['user_id'],)).fetchone()
-                if not stored or not verify_password(current,stored[0]):st.error('Contraseña actual incorrecta.')
-                elif len(new)<6 or new!=confirm:st.error('La nueva contraseña no cumple los requisitos o no coincide.')
+                stored=con.execute('SELECT password_hash FROM users WHERE id=?',(uid,)).fetchone()
+                if not stored or not verify_password(current_password,stored[0]):
+                    st.error('Contraseña actual incorrecta.')
+                elif len(new)<6 or new!=confirm:
+                    st.error('La nueva contraseña no cumple los requisitos o no coincide.')
                 else:
-                    con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(new),st.session_state['user_id']))
-                    con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(st.session_state['user_id'],))
+                    con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(new),uid))
+                    con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(uid,))
                     st.session_state.pop('_remember_token',None)
                     try:delete_remember_cookie()
                     except Exception:pass
