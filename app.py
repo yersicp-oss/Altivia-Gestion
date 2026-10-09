@@ -12,6 +12,7 @@ import base64
 import requests
 import json
 from contextlib import contextmanager
+from urllib.parse import quote
 from datetime import date, timedelta, datetime
 import pandas as pd
 import streamlit as st
@@ -91,6 +92,16 @@ def initialize():
             file_id TEXT NOT NULL, filename TEXT NOT NULL, uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(delivery_id,version,kind),
             FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        # Máximo histórico: aunque se elimine V02, ese número nunca se reutiliza.
+        con.execute('''CREATE TABLE IF NOT EXISTS version_counters (
+            delivery_code TEXT PRIMARY KEY, highest INTEGER NOT NULL DEFAULT 0)''')
+        known=con.execute('SELECT delivery_code,version FROM versions UNION SELECT code,version FROM deliverables').fetchall()
+        for r in known:
+            m=re.fullmatch(r'V(\d+)',str(r['version'] or '').upper())
+            if m:
+                con.execute('''INSERT INTO version_counters(delivery_code,highest) VALUES(?,?)
+                    ON CONFLICT(delivery_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
+                    (r['delivery_code'],int(m.group(1))))
         con.execute('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_code)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_deliveries_project ON deliverables(project_code)')
 
@@ -140,6 +151,11 @@ def can_edit():
 
 def require_admin():
     if not can_edit():raise PermissionError('Acceso denegado: se requiere rol Administrador.')
+
+
+def can_create_deliverable():
+    return st.session_state.get('role') in ('Administrador','Consulta')
+
 
 def login_page():
     st.title('🔐 ALTIVIA | Acceso al sistema')
@@ -205,27 +221,52 @@ def user_management():
     client_permissions_ui()
 
 def client_permissions_ui():
+    """ALTIVIA: Cliente -> Proyecto -> Entregables autorizados, sin borrar otros proyectos."""
     require_admin()
-    st.subheader('📂 Permisos de clientes por entregable')
-    st.caption('Selecciona exactamente los entregables que cada cliente podrá consultar. Solo serán visibles cuando su estado sea Aprobado o Entregado.')
+    st.subheader('📂 Autorización de entregables para clientes')
+    st.caption('El cliente solo verá entregables Aprobados o Entregados que ALTIVIA autorice expresamente.')
     with connection() as con:
-        clients=con.execute("SELECT id,username,full_name FROM users WHERE role='Cliente' AND active=1 ORDER BY full_name").fetchall()
-        deliveries=con.execute("SELECT id,code,name,project_code,status,file_path FROM deliverables ORDER BY project_code,name").fetchall()
+        clients=[dict(r) for r in con.execute("SELECT id,username,full_name FROM users WHERE role='Cliente' AND active=1 ORDER BY full_name")]
+        eligible=[dict(r) for r in con.execute('''SELECT d.id,d.code,d.name,d.project_code,d.status,p.name AS project_name
+           FROM deliverables d LEFT JOIN projects p ON p.code=d.project_code
+           WHERE d.status IN ('Aprobado','Entregado') ORDER BY d.project_code,d.name''')]
     if not clients:
         st.info('Primero crea un usuario con el rol Cliente.');return
-    cid=st.selectbox('Cliente', [r['id'] for r in clients],format_func=lambda i:next(r['full_name']+' · '+r['username'] for r in clients if r['id']==i),key='client_acl_user')
-    with connection() as con:
-        current={r[0] for r in con.execute('SELECT delivery_id FROM client_access WHERE user_id=?',(cid,)).fetchall()}
-    eligible=[r for r in deliveries if r['status'] in ('Aprobado','Entregado')]
-    if not eligible:
-        st.info('No existen entregables aprobados o entregados.');return
-    options={r['id']:f"{r['project_code']} · {r['code']} · {r['name']} ({r['status']})" for r in eligible}
-    selected=st.multiselect('Entregables autorizados',options.keys(),default=[i for i in options if i in current],format_func=lambda i:options[i],key='client_acl_docs')
-    if st.button('Guardar permisos del cliente',type='primary'):
+    # Todos los filtros se vuelven a verificar contra el servidor al guardar.
+    project_names={r['project_code']:(r['project_name'] or r['project_code']) for r in eligible}
+    with st.container(border=True):
+        c1,c2=st.columns(2)
+        with c1:
+            st.markdown('**01 · Cliente**')
+            cid=st.selectbox('Cliente',[r['id'] for r in clients],
+                format_func=lambda i:next(r['full_name']+' · '+r['username'] for r in clients if r['id']==i),key='client_acl_user')
+        if not project_names:
+            st.info('No existen entregables aprobados o entregados para autorizar.');return
+        with c2:
+            st.markdown('**02 · Proyecto**')
+            proj=st.selectbox('Proyecto',sorted(project_names),
+                format_func=lambda c:f'{c} – {project_names[c]}',key='client_acl_project')
         with connection() as con:
-            con.execute('DELETE FROM client_access WHERE user_id=?',(cid,))
-            con.executemany('INSERT INTO client_access(user_id,delivery_id) VALUES(?,?)',[(cid,i) for i in selected])
-        st.success('Permisos actualizados.');st.rerun()
+            current={int(r[0]) for r in con.execute('SELECT delivery_id FROM client_access WHERE user_id=?',(cid,))}
+        options={r['id']:f"{r['code']} · {r['name']} ({r['status']})" for r in eligible if r['project_code']==proj}
+        st.markdown('**03 · Entregables autorizados**')
+        st.caption('Solo se listan los entregables del proyecto seleccionado. Los permisos de otros proyectos no se modificarán.')
+        selected=st.multiselect('Entregables autorizados',list(options),
+            default=[i for i in options if i in current],format_func=lambda i:options[i],key=f'client_acl_docs_{cid}_{proj}')
+        if st.button('💾 Guardar autorizaciones de este proyecto',type='primary',key='save_client_grants'):
+            valid_ids=set(options)
+            if not set(selected).issubset(valid_ids):
+                st.error('La selección contiene entregables no autorizables.');return
+            with connection() as con:
+                active=con.execute("SELECT role,active FROM users WHERE id=?",(cid,)).fetchone()
+                if not active or active['role']!='Cliente' or not active['active']:
+                    st.error('El usuario ya no está habilitado como Cliente.');return
+                con.execute('''DELETE FROM client_access WHERE user_id=? AND delivery_id IN
+                    (SELECT id FROM deliverables WHERE project_code=?)''',(cid,proj))
+                con.executemany('INSERT INTO client_access(user_id,delivery_id) VALUES (?,?)',[(cid,int(i)) for i in selected])
+                con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Clientes',proj,f'Accesos actualizados para usuario {cid}'))
+            st.success('Permisos del proyecto guardados; se conservaron los demás proyectos.');st.rerun()
 
 
 def internal_pdf_preview(data):
@@ -313,6 +354,28 @@ def drive_safe_folder_name(value):
     return name[:135] or 'Sin nombre'
 
 
+def drive_find_folder(token,parent_id,folder_name):
+    """Busca solamente carpetas accesibles a esta credencial, sin crearlas."""
+    name=drive_safe_folder_name(folder_name)
+    escaped=name.replace('\\','\\\\').replace("'", "\\'")
+    q=f"name = '{escaped}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    response=requests.get('https://www.googleapis.com/drive/v3/files',
+        params={'q':q,'fields':'nextPageToken,files(id,name)','pageSize':100},
+        headers={'Authorization':f'Bearer {token}'},timeout=30)
+    if not response.ok:
+        raise ValueError(f'No se pudo localizar la carpeta en Drive (HTTP {response.status_code}).')
+    results=response.json().get('files',[])
+    return results[0]['id'] if results else None
+
+
+def drive_rename_item(token,file_id,new_name):
+    response=requests.patch('https://www.googleapis.com/drive/v3/files/'+quote(file_id,safe=''),
+        headers={'Authorization':f'Bearer {token}'},json={'name':new_name},
+        params={'fields':'id,name'},timeout=45)
+    if not response.ok:
+        raise ValueError(f'Google Drive no permitió cambiar el nombre (HTTP {response.status_code}).')
+
+
 def drive_find_or_create_folder(token,parent_id,folder_name):
     """Reutiliza carpetas por nombre y padre; nunca crea una carpeta por cada guardado."""
     name=drive_safe_folder_name(folder_name)
@@ -350,8 +413,10 @@ def drive_delivery_folder(token,delivery_id,code,version):
     return drive_find_or_create_folder(token,deliverable_id,version)
 
 
-def drive_upload(upload,delivery_id,code,version,kind):
-    require_admin()
+def drive_upload(upload,delivery_id,code,version,kind,allow_new_consulta=False):
+    if not can_edit():
+        if not (allow_new_consulta and st.session_state.get('role')=='Consulta'):
+            raise PermissionError('Solo el administrador puede modificar archivos de versiones existentes.')
     if upload is None:return
     raw=upload.getvalue()
     if not raw or len(raw)>DRIVE_LIMIT:raise ValueError('El archivo está vacío o supera los 25 MB.')
@@ -400,91 +465,115 @@ def drive_bytes(file_id):
     return b''.join(chunks)
 
 def next_version(code,current=None):
-    versions=[]
-    if current:versions.append(str(current))
+    """No reutiliza números de versiones eliminadas; registra el máximo histórico."""
+    versions=[str(current)] if current else []
+    historic=0
     if code:
         with connection() as con:
             versions += [r[0] for r in con.execute('SELECT version FROM versions WHERE delivery_code=?',(code,))]
-    n=max([int(m.group(1)) for v in versions if (m:=re.fullmatch(r'V(\d+)',str(v).upper()))] or [0])
+            saved=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',(code,)).fetchone()
+            historic=int(saved['highest']) if saved else 0
+    n=max([historic]+[int(m.group(1)) for v in versions if (m:=re.fullmatch(r'V(\d+)',str(v).upper()))])
     return f'V{n+1:02d}'
 
+
 def client_portal():
-    if st.session_state.get('role')!='Cliente':st.error('Acceso restringido.');st.stop()
-    st.title('📁 Mis planos y documentos')
-    st.caption('Documentos aprobados y autorizados por ALTIVIA · Acceso de solo lectura')
+    """Un cliente únicamente accede a sus proyectos y entregables autorizados."""
+    if st.session_state.get('role')!='Cliente':
+        st.error('Acceso restringido.');st.stop()
     with connection() as con:
-        rows=[dict(x) for x in con.execute('''SELECT d.id,d.code,d.project_code,d.drawing_code,d.name,d.version,d.specialty,d.status,d.file_path
+        rows=[dict(x) for x in con.execute('''SELECT d.id,d.code,d.project_code,d.drawing_code,d.name,d.version,
+            d.specialty,d.status,d.file_path,p.name AS project_name
             FROM deliverables d JOIN client_access a ON a.delivery_id=d.id
-            WHERE a.user_id=? AND d.status IN ('Aprobado','Entregado') ORDER BY d.project_code,d.name''',(st.session_state['user_id'],)).fetchall()]
-    if not rows:st.info('Todavía no tienes documentos aprobados asignados.');return
-    projects=sorted(set(x['project_code'] for x in rows if x['project_code']))
-    a,b=st.columns([2,1])
-    with a:query=st.text_input('🔎 Buscar plano o documento',key='client_search').strip().casefold()
-    with b:chosen=st.selectbox('Proyecto',['Todos']+projects,key='client_proj')
-    rows=[r for r in rows if (chosen=='Todos' or r['project_code']==chosen) and (not query or query in (' '.join(str(v or '') for v in r.values())).casefold())]
-    st.caption(f'{len(rows)} documentos disponibles')
+            LEFT JOIN projects p ON p.code=d.project_code
+            WHERE a.user_id=? AND d.status IN ('Aprobado','Entregado')
+            ORDER BY d.project_code,d.name''',(st.session_state['user_id'],)).fetchall()]
+    if not rows:
+        st.title('📁 Mis proyectos')
+        st.info('ALTIVIA todavía no ha autorizado documentos aprobados para tu cuenta.');return
+    projects={r['project_code']:r['project_name'] or r['project_code'] for r in rows}
+    project_codes=sorted(projects)
+    # Selector limitado en el servidor al conjunto de proyectos permitidos.
+    clientcol,projectcol,countcol=st.columns([1.2,2,1.2],gap='small')
+    with clientcol:
+        st.caption('01 · CLIENTE')
+        st.markdown('**'+escape(str(st.session_state.get('full_name') or 'Cliente'))+'**')
+    with projectcol:
+        st.caption('02 · PROYECTO')
+        chosen=st.selectbox('Proyecto autorizado',project_codes,
+            format_func=lambda x:f'{x} – {projects[x]}',label_visibility='collapsed',key='client_project_choice')
+    filtered=[r for r in rows if r['project_code']==chosen]
+    with countcol:
+        st.caption('03 · ENTREGABLES AUTORIZADOS')
+        st.metric('Disponibles',len(filtered),label_visibility='collapsed')
+    st.title('📁 '+projects[chosen])
+    st.caption('Documentos aprobados y autorizados por ALTIVIA · Acceso de solo lectura')
+    query=st.text_input('🔎 Buscar en los entregables autorizados',key='client_search').strip().casefold()
+    if query:
+        filtered=[r for r in filtered if query in ' '.join(str(r.get(k) or '') for k in ('code','drawing_code','name','specialty','version')).casefold()]
+    st.caption(f'{len(filtered)} documento(s) disponibles en este proyecto')
     st.markdown('''<style>
-      .altivia-client-card{background:#101318;border:1px solid #343b47;border-radius:13px;padding:18px 19px;margin:8px 0 18px;color:#f8fafc;box-shadow:0 4px 18px #00000016}
+      .altivia-client-card{background:#101318;border:1px solid #343b47;border-radius:13px;
+      padding:18px 19px;margin:8px 0 14px;color:#f8fafc;box-shadow:0 4px 18px #00000016}
       .altivia-client-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
       .altivia-client-title{font-weight:750;font-size:1.06rem;color:white}
       .altivia-client-badge{background:#104a2f;color:#55e697;font-size:.78rem;font-weight:650;padding:4px 10px;border-radius:18px}
       .altivia-client-sub{font-size:.84rem;color:#aab7cf;margin-top:9px;line-height:1.5}
       @media(max-width:640px){.altivia-client-card{padding:15px;margin-bottom:9px}}
     </style>''',unsafe_allow_html=True)
-    for r in rows:
+    for r in filtered:
         title=escape(str(r['drawing_code'] or r['code']))+' – '+escape(str(r['name'] or 'Documento'))
         sub=escape(str(r['project_code'] or ''))+' · Versión '+escape(str(r['version'] or '—'))+' · '+escape(str(r['specialty'] or ''))
         st.markdown(f'<div class="altivia-client-card"><div class="altivia-client-head"><span class="altivia-client-title">{title}</span><span class="altivia-client-badge">{escape(r["status"])}</span></div><div class="altivia-client-sub">{sub}</div></div>',unsafe_allow_html=True)
+        version=str(r['version'] or 'V01')
         reference=str(r['file_path'] or '').strip()
-        attached=file_info(r['id'],str(r['version'] or 'V01'))
-        google_docs=drive_file_info(r['id'],str(r['version'] or 'V01'))
+        google_docs=drive_file_info(r['id'],version)
+        attached=file_info(r['id'],version)
         if google_docs:
-            left,right=st.columns(2)
+            left,right=st.columns(2,gap='small')
             with left:
-                if 'pdf' in google_docs and st.button('👁 Visualizar PDF aquí',key=f'drive_view_{r["id"]}'):
+                if 'pdf' in google_docs and st.button('👁 Visualizar PDF aquí',key=f'drive_view_{r["id"]}',use_container_width=True):
                     st.session_state['drive_preview']=None if st.session_state.get('drive_preview')==r['id'] else r['id']
             with right:
                 if 'editable' in google_docs:
-                    if st.button('⬇ Preparar archivo editable',key=f'drive_prep_{r["id"]}'):
+                    if st.button('⬇ Preparar archivo editable',key=f'drive_prep_{r["id"]}',use_container_width=True):
                         try:st.session_state[f'drive_download_{r["id"]}']=drive_bytes(google_docs['editable']['file_id'])
                         except Exception as exc:st.error(str(exc))
                     content=st.session_state.get(f'drive_download_{r["id"]}')
-                    if content:st.download_button('Descargar editable',content,file_name=google_docs['editable']['filename'],key=f'drive_dl_{r["id"]}')
+                    if content:
+                        st.download_button('⬇ Descargar editable',content,file_name=google_docs['editable']['filename'],
+                            mime='application/octet-stream',key=f'drive_dl_{r["id"]}',use_container_width=True)
             if st.session_state.get('drive_preview')==r['id'] and 'pdf' in google_docs:
                 try:
                     content=drive_bytes(google_docs['pdf']['file_id'])
-                    if content.startswith(b'%PDF-'):
-                        internal_pdf_preview(content)
-                        st.download_button('⬇ Descargar PDF',content,file_name=google_docs['pdf']['filename'],mime='application/pdf',key=f'drive_pdf_dl_{r["id"]}')
-                    else:st.error('El archivo almacenado no es un PDF válido.')
+                    if not content.startswith(b'%PDF-'):raise ValueError('El archivo almacenado no es un PDF válido.')
+                    internal_pdf_preview(content)
+                    st.download_button('⬇ Descargar PDF',content,file_name=google_docs['pdf']['filename'],
+                        mime='application/pdf',key=f'drive_pdf_dl_{r["id"]}',use_container_width=True)
                 except Exception as exc:st.error(str(exc))
         elif attached:
             st.warning('Hay adjuntos antiguos en SQLite. Migra estos archivos a Drive antes de utilizar esta cuenta en producción.')
-            left,right=st.columns(2)
+            left,right=st.columns(2,gap='small')
             with left:
                 if 'pdf' in attached and st.button('👁 Visualizar PDF aquí',key=f'client_pdf_{r["id"]}',use_container_width=True):
                     st.session_state['client_view_pdf']=r['id'] if st.session_state.get('client_view_pdf')!=r['id'] else None
             with right:
                 if 'editable' in attached:
-                    editable_file=file_bytes(r['id'],str(r['version'] or 'V01'),'editable')
+                    editable_file=file_bytes(r['id'],version,'editable')
                     if editable_file:
-                        st.download_button('⬇ Descargar archivo editable',editable_file[1],file_name=editable_file[0],mime='application/octet-stream',key=f'client_edit_{r["id"]}',use_container_width=True)
+                        st.download_button('⬇ Descargar archivo editable',editable_file[1],file_name=editable_file[0],
+                            mime='application/octet-stream',key=f'client_edit_{r["id"]}',use_container_width=True)
             if st.session_state.get('client_view_pdf')==r['id'] and 'pdf' in attached:
-                pdf_file=file_bytes(r['id'],str(r['version'] or 'V01'),'pdf')
+                pdf_file=file_bytes(r['id'],version,'pdf')
                 if pdf_file:
                     internal_pdf_preview(pdf_file[1])
-                    st.download_button('⬇ Descargar PDF',pdf_file[1],file_name=pdf_file[0],mime='application/pdf',key=f'client_download_pdf_{r["id"]}')
+                    st.download_button('⬇ Descargar PDF',pdf_file[1],file_name=pdf_file[0],mime='application/pdf',
+                        key=f'client_download_pdf_{r["id"]}',use_container_width=True)
         elif reference.startswith('https://'):
-            # Los enlaces externos conservan los permisos del proveedor de almacenamiento.
-            # El cliente solo ve documentos aprobados que ALTIVIA le ha asignado.
-            left,right=st.columns(2)
-            with left:
-                st.link_button('👁 Visualizar documento',reference,use_container_width=True)
-            with right:
-                st.link_button('⬇ Descargar / abrir archivo',reference,use_container_width=True)
-            st.caption('La visualización y descarga dependen de los permisos y opciones de Google Drive, OneDrive o SharePoint.')
-        elif reference:
-            st.warning('Enlace no válido. El administrador debe registrar una URL que comience con https://.')
+            left,right=st.columns(2,gap='small')
+            with left:st.link_button('👁 Visualizar documento',reference,use_container_width=True)
+            with right:st.link_button('⬇ Descargar / abrir archivo',reference,use_container_width=True)
+            st.caption('Depende de los permisos de Google Drive, OneDrive o SharePoint.')
         else:
             st.caption('Archivo pendiente de vincular. Contacta a ALTIVIA.')
         st.divider()
@@ -573,8 +662,86 @@ def form_input(key,label,kind,required,choice,value,form_key):
     if kind=='float':return st.number_input(label,min_value=0.0,value=float(value or 0),step=0.5,key=tag)
     return st.text_input(label,value=str(value or ''),key=tag)
 
-def save_record(module,values,record_id=None):
+def update_project_sync(values,record_id):
+    """Actualiza referencias internas y metadatos Drive. Nunca recrea ni borra archivos."""
     require_admin()
+    new_code=str(values.get('code') or '').strip()
+    new_name=str(values.get('name') or '').strip()
+    if not new_code or not new_name:raise ValueError('Código y nombre de proyecto son obligatorios.')
+    with connection() as con:
+        old=con.execute('SELECT code,name FROM projects WHERE id=?',(record_id,)).fetchone()
+        if not old:raise ValueError('No se encontró el proyecto.')
+        old_code,old_name=old['code'],old['name'] or ''
+        clash=con.execute('SELECT id FROM projects WHERE code=? AND id<>?',(new_code,record_id)).fetchone()
+        if clash:raise ValueError('El código nuevo pertenece a otro proyecto.')
+        remote=[dict(x) for x in con.execute('''SELECT f.file_id,f.filename,f.version,f.kind,d.code AS delivery_code
+            FROM drive_files f JOIN deliverables d ON f.delivery_id=d.id
+            WHERE d.project_code=?''',(old_code,)).fetchall()]
+    to_rename=[];token=None
+    project_old_folder=drive_safe_folder_name(old_code + (' - '+old_name.strip() if old_name.strip() else ''))
+    project_new_folder=drive_safe_folder_name(new_code + (' - '+new_name if new_name else ''))
+    if old_code!=new_code or project_old_folder!=project_new_folder:
+        if remote and not drive_ready():
+            raise ValueError('Debes autorizar Google Drive antes de modificar el código o nombre de un proyecto con archivos asociados.')
+        if drive_ready():
+            token=drive_token()
+            old_folder_id=drive_find_folder(token,DRIVE_FOLDER_ID,project_old_folder)
+            if remote and not old_folder_id:
+                raise ValueError('No se localizó la carpeta antigua del proyecto. No se modificó la base de datos; verifica el nombre en Drive.')
+            if old_folder_id and project_old_folder!=project_new_folder:
+                target_id=drive_find_folder(token,DRIVE_FOLDER_ID,project_new_folder)
+                if target_id and target_id!=old_folder_id:
+                    raise ValueError('Ya existe una carpeta con el nuevo nombre. No se modificó el proyecto para evitar mezclar archivos.')
+                to_rename.append((old_folder_id,project_old_folder,project_new_folder))
+            # Los archivos ya estaban identificados por entregable, no por proyecto.
+            # Al cambiar el código asignamos un prefijo consistente, sin alterar el ID de Drive.
+            if old_code!=new_code or old_name!=new_name:
+                for f in remote:
+                    ext=f['filename'].rsplit('.',1)[-1].lower() if '.' in f['filename'] else 'bin'
+                    safe_project=re.sub(r'[^A-Za-z0-9_-]','_',new_code)[:44]
+                    safe_name=re.sub(r'[^A-Za-z0-9_-]','_',new_name)[:40]
+                    safe_delivery=re.sub(r'[^A-Za-z0-9_-]','_',f['delivery_code'])[:45]
+                    target=f'{safe_project}_{safe_name}_{safe_delivery}_{f["version"]}_{f["kind"]}.{ext}'
+                    if target!=f['filename']:
+                        to_rename.append((f['file_id'],f['filename'],target))
+    changes=[]
+    try:
+        for file_id,old_filename,new_filename in to_rename:
+            drive_rename_item(token,file_id,new_filename)
+            changes.append((file_id,old_filename))
+        with connection() as con:
+            vals=dict(values)
+            sets=', '.join(f'"{k}"=?' for k in vals)
+            con.execute(f'UPDATE projects SET {sets} WHERE id=?',list(vals.values())+[record_id])
+            if old_code!=new_code:
+                for table in ('tasks','deliverables','changes','meetings'):
+                    con.execute(f'UPDATE {table} SET project_code=? WHERE project_code=?',(new_code,old_code))
+            for file_id,old_filename,new_filename in to_rename:
+                con.execute('UPDATE drive_files SET filename=? WHERE file_id=?',(new_filename,file_id))
+            con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                ('Proyectos',new_code,'Proyecto modificado (código anterior: '+old_code+')'))
+    except Exception as exc:
+        rollback_errors=[]
+        for file_id,old_filename in reversed(changes):
+            try:drive_rename_item(token,file_id,old_filename)
+            except Exception:rollback_errors.append(file_id)
+        if rollback_errors:
+            raise ValueError('Falló la actualización y parte de Google Drive no pudo restaurarse. Revisa la carpeta antes de intentarlo de nuevo.') from exc
+        raise
+
+
+def save_record(module,values,record_id=None):
+    if module=='Entregables' and record_id is None and st.session_state.get('role')=='Consulta':
+        # Alta única permitida al rol Consulta; nunca edita registros ni autoriza clientes.
+        values=dict(values)
+        values['status']='Pendiente'
+        values['version']='V01'
+        values['approval_date']=None
+        values['actual_date']=None
+    else:
+        require_admin()
+    if module=='Proyectos' and record_id is not None:
+        return update_project_sync(values,record_id)
     table,fields=SPECS[module]
     mandatory=[label for k,label,_,required,_ in fields if required and (values.get(k) in ('',None))]
     if mandatory:raise ValueError('Campos obligatorios: '+', '.join(mandatory))
@@ -603,6 +770,11 @@ def save_record(module,values,record_id=None):
             con.execute(f'INSERT INTO {table} ({keys}) VALUES ({placeholders})',list(values.values()))
         if module=='Entregables':
             con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES (?,?,?,?)',(values['code'],values['version'],date.today().isoformat(),'Versión registrada desde formulario'))
+            m=re.fullmatch(r'V(\d+)',str(values['version']).upper())
+            if m:
+                con.execute('''INSERT INTO version_counters(delivery_code,highest) VALUES(?,?)
+                    ON CONFLICT(delivery_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
+                    (values['code'],int(m.group(1))))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',(module,values['code'],'Actualización' if record_id else 'Alta'))
 
 def backup_database():
@@ -696,7 +868,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('drive_files','delivery_files','checklist','versions','meetings','changes','tasks','deliverables','projects','people','audit'):
+                for table in ('drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','tasks','deliverables','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -751,6 +923,24 @@ def card_browser(module, frame, allow_version_edit=True):
                         st.markdown(f'**{label}:** {escape(str(v))}')
                 if module=='Entregables':
                     versions_for_delivery(code,allow_edit=allow_version_edit and can_edit())
+            if module=='Proyectos' and can_edit():
+                rid=int(r['id'])
+                with st.expander('✏️ Editar información del proyecto',expanded=False):
+                    st.caption('Si cambias el código, ALTIVIA también actualizará las tareas, entregables y cambios vinculados. '
+                               'Los archivos vinculados se renombrarán en Google Drive si la conexión está autorizada.')
+                    with st.form(f'edit_project_form_{rid}'):
+                        values={}
+                        for key,label,kind,required,opt in SPECS['Proyectos'][1]:
+                            raw=r.get(key)
+                            if raw is not None and pd.isna(raw):raw=None
+                            values[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,
+                                raw,f'project_edit_{rid}')
+                        if st.form_submit_button('💾 Guardar información del proyecto',type='primary'):
+                            values={k:(v.isoformat() if isinstance(v,date) else v) for k,v in values.items()}
+                            try:
+                                save_record('Proyectos',values,rid)
+                                st.success('Proyecto y referencias actualizados.');st.rerun()
+                            except Exception as exc:st.error(f'No se completó el cambio: {exc}')
 
 
 def versions_for_delivery(code,allow_edit=False):
@@ -853,60 +1043,104 @@ def drive_delete_document(file_id):
         raise ValueError(f'Google Drive rechazó la eliminación (HTTP {response.status_code}).')
 
 
-def edit_module(module,data):
-    table,fields=SPECS[module]
-    st.subheader(module)
-    if module=='Proyectos':st.caption('Avance y riesgo calculados desde las tareas.')
+def project_editor(data):
+    """Proyecto: creación en la cabecera; edición junto a su tarjeta."""
+    st.title('📁 Proyectos')
+    st.caption('Seguimiento general, avance y riesgo calculado desde el plan de trabajo.')
     if can_edit():
-        with st.expander('✏️ Crear o editar registro',expanded=False):
+        if st.button('➕ Crear proyecto',type='primary',key='project_create_toggle'):
+            st.session_state['show_project_create']=not st.session_state.get('show_project_create',False)
+        if st.session_state.get('show_project_create'):
+            with st.container(border=True):
+                st.subheader('Nuevo proyecto')
+                with st.form('new_project_form',clear_on_submit=False):
+                    values={}
+                    for key,label,kind,required,opt in SPECS['Proyectos'][1]:
+                        values[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,None,'new_project')
+                    if st.form_submit_button('💾 Guardar proyecto',type='primary'):
+                        values={k:(v.isoformat() if isinstance(v,date) else v) for k,v in values.items()}
+                        try:
+                            save_record('Proyectos',values)
+                            st.session_state['show_project_create']=False
+                            st.success('Proyecto creado correctamente.');st.rerun()
+                        except (ValueError,sqlite3.IntegrityError) as exc:st.error(str(exc))
+    card_browser('Proyectos',data['Proyectos'])
+    if can_edit():bulk_delete_ui('Proyectos',data)
+
+
+def edit_module(module,data):
+    if module=='Proyectos':
+        return project_editor(data)
+    table,fields=SPECS[module]
+    st.title(module)
+    admin=can_edit()
+    consulta_creates=(module=='Entregables' and st.session_state.get('role')=='Consulta')
+    if admin or consulta_creates:
+        header='➕ Crear entregable' if consulta_creates else '✏️ Crear o editar registro'
+        with st.expander(header,expanded=consulta_creates):
             existing=data[module]
-            items=['➕ Nuevo registro']+[f'{r["code"]} — {r.get("name",r.get("activity",r.get("description","")))}' for _,r in existing.iterrows()]
-            choice=st.selectbox('Registro a editar',items,key='pick_'+table)
             rid=None;row={}
-            if choice!='➕ Nuevo registro':
-                idx=items.index(choice)-1;row=existing.iloc[idx].to_dict();rid=int(row['id'])
-            with st.form('form_'+table,clear_on_submit=False):
+            if admin:
+                items=['➕ Nuevo registro']+[f'{r["code"]} — {r.get("name",r.get("activity",r.get("description","")))}' for _,r in existing.iterrows()]
+                choice=st.selectbox('Registro a editar',items,key='pick_'+table)
+                if choice!='➕ Nuevo registro':
+                    idx=items.index(choice)-1;row=existing.iloc[idx].to_dict();rid=int(row['id'])
+            else:
+                st.info('Puedes crear un entregable nuevo y adjuntar sus archivos iniciales. Después de guardarlo, solo el administrador podrá modificarlo.')
+            with st.form('form_'+table+'_'+str(rid),clear_on_submit=False):
                 vals={}
                 version_choice=None
-                if module=='Entregables':
-                    st.caption('Una nueva revisión aumenta la versión. Puedes actualizar otros datos sin crear nueva versión.')
-                    version_choice=st.radio('Acción de versión',['Conservar versión actual','Registrar nueva versión'],horizontal=True,index=1,key=f'version_action_{rid}')
+                if module=='Entregables' and admin and rid:
+                    st.caption('Una revisión nueva aumenta la versión. Los datos existentes se pueden modificar conservando la versión actual.')
+                    version_choice=st.radio('Acción de versión',['Conservar versión actual','Registrar nueva versión'],
+                        horizontal=True,index=1,key=f'version_action_{rid}')
                 for key,label,kind,required,opt in fields:
                     if module=='Entregables' and key=='file_path':
-                        vals['file_path']=row.get('file_path') or ''
+                        vals[key]=row.get('file_path') or ''
                         continue
                     raw=row.get('name') if module=='Personal' and key=='code' and row else row.get(key)
                     if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):raw=None
                     if module=='Entregables' and key=='version':
                         code=row.get('code') if row else ''
                         proposed=next_version(code,row.get('version')) if (version_choice=='Registrar nueva versión' or not rid) else (raw or 'V01')
-                        vals['version']=st.text_input('Versión *',value=proposed,disabled=True,key=f'computed_version_{rid}_{version_choice}_{proposed}')
+                        vals['version']=st.text_input('Versión *',value=proposed,disabled=True,
+                            key=f'computed_version_{rid}_{version_choice}_{proposed}')
+                    elif module=='Entregables' and consulta_creates and key=='status':
+                        vals[key]='Pendiente';st.text_input('Estado *',value='Pendiente',disabled=True)
                     else:
-                        vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
-                pdf_file=None; edit_file=None
+                        vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,
+                            'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
+                pdf_file=None;edit_file=None
                 if module=='Entregables':
                     st.markdown('#### 📎 Documentos del entregable')
-                    st.caption('Los archivos se cargarán directamente a tu carpeta de Google Drive. No se guardarán como BLOB en SQLite.')
+                    st.caption('Los archivos se cargarán a Google Drive; no se almacenan como BLOB en SQLite.')
                     pdf_file=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'main_pdf_{rid}_{version_choice}')
-                    edit_file=st.file_uploader('Editable para descargar (DWG, DOC o DOCX)',type=['dwg','doc','docx'],key=f'main_edit_{rid}_{version_choice}')
-                    if not drive_ready():
-                        st.warning('Google Drive aún no está autorizado. Puedes registrar los datos, pero no subir archivos hasta configurar el acceso seguro.')
-                if st.form_submit_button('💾 Guardar cambios',type='primary'):
+                    edit_file=st.file_uploader('Editable para descargar (DWG, DOC o DOCX)',type=['dwg','doc','docx'],
+                        key=f'main_edit_{rid}_{version_choice}')
+                    if not drive_ready():st.warning('Google Drive no está autorizado. Puedes guardar los datos, pero no subir archivos.')
+                if st.form_submit_button('💾 Guardar entregable' if consulta_creates else '💾 Guardar cambios',type='primary'):
                     vals={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v) for k,v in vals.items()}
                     try:
                         if module=='Entregables' and (pdf_file or edit_file) and not drive_ready():
                             raise ValueError('Falta autorizar Google Drive. No se guardó el formulario ni los archivos.')
+                        if consulta_creates:
+                            vals['status']='Pendiente';vals['version']='V01'
+                            if df('deliverables').code.eq(vals['code']).any():
+                                raise ValueError('El código del entregable ya existe. Utiliza otro código.')
                         save_record(module,vals,rid)
                         if module=='Entregables' and (pdf_file or edit_file):
                             with connection() as con:
                                 rowid=con.execute('SELECT id FROM deliverables WHERE code=?',(vals['code'],)).fetchone()['id']
-                            for kind,f in [('pdf',pdf_file),('editable',edit_file)]:
-                                if f:drive_upload(f,rowid,vals['code'],vals['version'],kind)
+                            for kind,upload in [('pdf',pdf_file),('editable',edit_file)]:
+                                if upload:drive_upload(upload,rowid,vals['code'],vals['version'],kind,
+                                    allow_new_consulta=consulta_creates and rid is None)
                         st.success('Registro guardado');st.rerun()
-                    except (ValueError,sqlite3.IntegrityError,requests.RequestException) as ex:st.error(str(ex))
-        bulk_delete_ui(module,data)
-    else:st.info('Modo consulta: puedes buscar y examinar los registros, pero no modificarlos.')
-    card_browser(module,data[module])
+                    except (ValueError,sqlite3.IntegrityError,requests.RequestException,PermissionError) as ex:st.error(str(ex))
+        if admin:bulk_delete_ui(module,data)
+    elif st.session_state.get('role')=='Consulta':
+        st.info('Modo consulta: puedes buscar y visualizar los registros sin modificarlos.')
+    card_browser(module,data[module],allow_version_edit=admin)
+
 
 def add_examples():
     require_admin()
@@ -984,37 +1218,91 @@ def dashboard(data):
                 fig.update_layout(height=315,margin=dict(l=5,r=5,t=10,b=5),showlegend=(kind=='pie'))
                 st.plotly_chart(fig,use_container_width=True)
 
+CHECK_GROUPS={
+    'Datos generales': CHECKS[:4],
+    'Información y geometría': CHECKS[4:14],
+    'Presentación del plano': CHECKS[14:17]+[CHECKS[18]],
+    'Coordinación y revisión': [CHECKS[17]]+CHECKS[19:]
+}
+
+
 def checklist_page():
-    st.title('Checklist de control de calidad')
+    st.title('✅ Control de calidad de planos')
+    st.caption('Lista de verificación multidisciplinaria · Revisión documental por entregable')
     deliveries=df('deliverables')
-    if deliveries.empty:st.info('Primero registre un entregable.');return
-    dc=st.selectbox('Entregable',deliveries.code.tolist(),format_func=lambda code: f'{code} — {deliveries.loc[deliveries.code==code,"name"].iloc[0]}')
+    if deliveries.empty:st.info('Primero registra un entregable.');return
+    find=st.text_input('🔎 Buscar entregable',key='checklist_search').strip().casefold()
+    if find:
+        deliveries=deliveries[deliveries.astype(str).apply(lambda col:col.str.contains(find,case=False,regex=False)).any(axis=1)]
+    if deliveries.empty:st.info('No se encontraron entregables.');return
+    dc=st.selectbox('Entregable',deliveries.code.tolist(),
+        format_func=lambda code:f'{code} — {deliveries.loc[deliveries.code==code,"name"].iloc[0]}',key='checklist_delivery')
     with connection() as con:
         existing={r['criterion']:dict(r) for r in con.execute('SELECT * FROM checklist WHERE delivery_code=?',(dc,))}
-    if not can_edit():
-        st.info('Modo consulta: el checklist es de solo lectura.')
-        st.dataframe(pd.DataFrame([{'Criterio':c,'Resultado':existing.get(c,{}).get('result','PENDIENTE'),'Nota':existing.get(c,{}).get('notes','')} for c in CHECKS]),hide_index=True,use_container_width=True)
-        return
-    with st.form('checklist_form'):
-        vals=[]
-        for criterion in CHECKS:
-            prev=existing.get(criterion,{});curr=prev.get('result','PENDIENTE')
-            a,b=st.columns([3,2])
-            with a:status=st.selectbox(criterion,['PENDIENTE','OK','NO APLICA'],index=['PENDIENTE','OK','NO APLICA'].index(curr),key='chk_'+criterion)
-            with b:note=st.text_input('Observación: '+criterion,value=prev.get('notes') or '',key='nt_'+criterion,label_visibility='collapsed',placeholder='Observación (opcional)')
-            vals.append((criterion,status,note))
-        save=st.form_submit_button('Guardar checklist',type='primary')
-        if save:
-            with connection() as con:
-                for criterion,status,note in vals:
-                    con.execute('INSERT INTO checklist(delivery_code,criterion,result,notes) VALUES(?,?,?,?) ON CONFLICT(delivery_code,criterion) DO UPDATE SET result=excluded.result,notes=excluded.notes',(dc,criterion,status,note))
-            st.success('Checklist guardado');st.rerun()
-    counts={s:sum(1 for v in CHECKS if existing.get(v,{}).get('result','PENDIENTE')==s) for s in ['OK','PENDIENTE','NO APLICA']}
+    results={c:existing.get(c,{}).get('result','PENDIENTE') for c in CHECKS}
+    counts={status:sum(1 for value in results.values() if value==status) for status in ('OK','PENDIENTE','NO APLICA')}
     applicable=counts['OK']+counts['PENDIENTE']
-    pct=round(100*counts['OK']/applicable,1) if applicable else 100
-    st.metric('Cumplimiento (excluye NO APLICA)',f'{pct}%')
-    st.progress(pct/100)
-    st.caption(f'OK: {counts["OK"]} · Pendientes: {counts["PENDIENTE"]} · No aplica: {counts["NO APLICA"]}')
+    pct=100*counts['OK']/applicable if applicable else 100
+    with st.container(border=True):
+        st.markdown(f'### 📋 {escape(dc)}')
+        cols=st.columns(4,gap='small')
+        for col,title,val in zip(cols,['Cumplimiento','Conformes','Pendientes','No aplica'],
+                                 [f'{pct:.0f}%',counts['OK'],counts['PENDIENTE'],counts['NO APLICA']]):
+            with col:st.metric(title,val)
+        st.progress(min(1,max(0,pct/100)))
+        if counts['PENDIENTE']:
+            st.warning(f'{counts["PENDIENTE"]} puntos requieren revisión antes de aprobar el plano.')
+        else:st.success('No hay criterios aplicables pendientes.')
+    filtered=st.segmented_control('Mostrar criterios',options=['Todos','Pendientes','Conformes','No aplica'],
+        default='Todos',key='checklist_filter')
+    matches={'Todos':None,'Pendientes':'PENDIENTE','Conformes':'OK','No aplica':'NO APLICA'}
+    wanted=matches.get(filtered)
+    st.caption('Los cambios de resultado y observación se guardan al pulsar «Guardar checklist».')
+    if can_edit():
+        with st.form(f'checklist_form_{dc}'):
+            entered=[]
+            for group,criteria in CHECK_GROUPS.items():
+                subset=[criterion for criterion in criteria if wanted is None or results[criterion]==wanted]
+                if not subset:continue
+                with st.expander(f'{group} · {sum(results[c]=="OK" for c in criteria)}/{sum(results[c]!="NO APLICA" for c in criteria)} conformes',
+                                 expanded=True):
+                    for pos,criterion in enumerate(subset):
+                        prev=existing.get(criterion,{})
+                        status_now=results[criterion]
+                        with st.container(border=True):
+                            st.markdown('**'+escape(criterion)+'**')
+                            left,right=st.columns([1,2],gap='small')
+                            with left:
+                                status=st.selectbox('Resultado', ['PENDIENTE','OK','NO APLICA'],
+                                    index=['PENDIENTE','OK','NO APLICA'].index(status_now),
+                                    key=f'chk_{dc}_{criterion}')
+                            with right:
+                                note=st.text_input('Observación',value=prev.get('notes') or '',
+                                    placeholder='Anota la observación o corrección',key=f'chk_note_{dc}_{criterion}')
+                            entered.append((criterion,status,note))
+            if st.form_submit_button('💾 Guardar checklist',type='primary'):
+                with connection() as con:
+                    for criterion,status,note in entered:
+                        con.execute('''INSERT INTO checklist(delivery_code,criterion,result,notes) VALUES(?,?,?,?)
+                            ON CONFLICT(delivery_code,criterion) DO UPDATE SET result=excluded.result,notes=excluded.notes''',
+                            (dc,criterion,status,note))
+                    con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                        ('Checklist',dc,f'{len(entered)} criterios actualizados'))
+                st.success('Checklist actualizado.');st.rerun()
+    else:
+        st.info('Consulta: verificación de solo lectura.')
+        for group,criteria in CHECK_GROUPS.items():
+            subset=[criterion for criterion in criteria if wanted is None or results[criterion]==wanted]
+            if not subset:continue
+            with st.expander(group,expanded=True):
+                for criterion in subset:
+                    current=results[criterion]
+                    symbol={'OK':'🟢','PENDIENTE':'🟡','NO APLICA':'⚪'}[current]
+                    with st.container(border=True):
+                        st.markdown(f'{symbol} **{escape(criterion)}** · {current}')
+                        note=existing.get(criterion,{}).get('notes')
+                        if note:st.caption(note)
+
 
 def versions_page():
     st.title('📚 Historial de versiones')
