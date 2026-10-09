@@ -1202,6 +1202,40 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
         raise
 
 
+
+def catalog_delete(catalog_id):
+    """Elimina SOLO la programación, siempre que no tenga entregas ni vínculos.
+
+    Nunca borra documentos, archivos de Drive, versiones o datos de otros módulos.
+    La comprobación y la eliminación se realizan en una sola transacción SQLite.
+    """
+    require_admin()
+    with connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        item=con.execute('SELECT id,code,project_code FROM deliverable_catalog WHERE id=?',
+                         (int(catalog_id),)).fetchone()
+        if item is None:
+            raise ValueError('Este entregable programado ya no existe. Actualiza la pantalla.')
+        code=item['code']
+        # Bloquear también si quedan referencias históricas después de borrar una entrega.
+        checks=(
+            ('deliverables','code'),
+            ('versions','delivery_code'),
+            ('version_counters','delivery_code'),
+            ('checklist','delivery_code'),
+            ('tasks','delivery_code'),
+        )
+        for table,column in checks:
+            if con.execute(f'SELECT 1 FROM {table} WHERE {column}=? LIMIT 1',(code,)).fetchone():
+                raise ValueError('No se puede eliminar: este entregable ya tiene una entrega, '
+                                 'versiones históricas, checklist o tareas asociadas. '
+                                 'Elimina o desvincula esos registros mediante su módulo correspondiente.')
+        con.execute('DELETE FROM deliverable_catalog WHERE id=?',(int(catalog_id),))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Catálogo entregables',code,'Eliminación por Administrador del proyecto '+item['project_code']))
+    return code
+
+
 def delivery_catalog_admin_ui():
     '''Catálogo por proyecto, solo Admin; permite seleccionar desde Consulta sin escribir IDs.'''
     require_admin()
@@ -1265,6 +1299,41 @@ def delivery_catalog_admin_ui():
                             st.success('Catálogo actualizado.');st.rerun()
                         except (ValueError,sqlite3.IntegrityError,requests.RequestException) as exc:
                             st.error(str(exc))
+            # Botón visible dentro de cada tarjeta. Confirmación en dos pasos.
+            # Los documentos/archivos de Google Drive nunca se eliminan desde aquí.
+            if item['registered']:
+                st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}',disabled=True)
+                st.caption('No disponible: la entrega ya tiene registros. Protege versiones y archivos existentes.')
+            else:
+                if st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}'):
+                    st.session_state[f'catalog_delete_open_{item["id"]}']=True
+                if st.session_state.get(f'catalog_delete_open_{item["id"]}'):
+                    with st.container(border=True):
+                        st.warning(f'¿Eliminar la programación {item["code"]} del proyecto {item["project_code"]}? '
+                                   'No se borrarán archivos de Google Drive ni otros entregables.')
+                        confirm=st.checkbox(
+                            f'Confirmo eliminar el entregable {item["code"]}',
+                            key=f'catalog_del_confirm_{item["id"]}')
+                        accept,cancel=st.columns(2)
+                        with accept:
+                            if st.button('Confirmar eliminación',type='primary',
+                                         key=f'catalog_del_confirm_btn_{item["id"]}',
+                                         disabled=not confirm,use_container_width=True):
+                                try:
+                                    backup=backup_database()
+                                    deleted=catalog_delete(item['id'])
+                                    st.session_state.pop(f'catalog_delete_open_{item["id"]}',None)
+                                    st.success(f'Entregable {deleted} eliminado del catálogo. '
+                                               f'Respaldo: {os.path.basename(backup)}')
+                                    st.rerun()
+                                except (ValueError,sqlite3.Error,OSError) as exc:
+                                    st.error(f'No se pudo eliminar: {exc}')
+                        with cancel:
+                            if st.button('Cancelar',key=f'catalog_del_cancel_{item["id"]}',
+                                         use_container_width=True):
+                                st.session_state.pop(f'catalog_delete_open_{item["id"]}',None)
+                                st.rerun()
+
 
 
 def connection_project_rows():
