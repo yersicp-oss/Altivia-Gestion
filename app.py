@@ -14,6 +14,7 @@ import json
 from contextlib import contextmanager
 from urllib.parse import quote
 from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -22,6 +23,9 @@ st.set_page_config(page_title='ALTIVIA | Gestión de Proyectos', page_icon='🏗
 ROOT=os.path.dirname(os.path.abspath(__file__))
 DB=os.environ.get('ALTIVIA_DB',os.path.join(ROOT,'altivia.db'))
 TODAY=date.today()
+
+def today_peru():
+    return datetime.now(ZoneInfo('America/Lima')).date()
 
 PROJECT_STATES=['No iniciado','En desarrollo','En revisión','En corrección','Terminado']
 TASK_STATES=['No iniciado','En desarrollo','En revisión','Con observaciones','Corregido','Aprobado']
@@ -41,7 +45,7 @@ SPECS={
  'Plan de trabajo':('tasks',[
  ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('specialty','Especialidad','select',False,'specialties'),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
  'Entregables':('deliverables',[
- ('code','ID Entregable','text',True,None),('project_code','ID Proyecto','project',True,None),('drawing_code','Código del plano','text',False,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha prevista','date',True,None),('actual_date','Fecha real','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Enlace del documento (Google Drive / OneDrive / SharePoint)','text',False,None)]),
+ ('project_code','ID Proyecto','project',True,None),('code','ID Entregable','text',True,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha de Presentación Final','date',True,None),('actual_date','Fecha de entregable','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Enlace del documento (Google Drive / OneDrive / SharePoint)','text',False,None)]),
  'Control de cambios':('changes',[
  ('code','ID Cambio','text',True,None),('project_code','ID Proyecto','project',True,None),('request_date','Fecha solicitud','date',True,None),('requester','Solicitante','text',True,None),('description','Descripción cambio','long',True,None),('reason','Motivo','long',False,None),('specialty','Especialidad afectada','select',False,'specialties'),('affected_drawings','Planos afectados','text',False,None),('owner','Responsable','person',True,None),('schedule_impact','Impacto en plazo','select',False,'risks'),('new_due_date','Nueva fecha entrega','date',False,None),('approved_by','Aprobado por','text',False,None),('approval_date','Fecha aprobación','date',False,None),('status','Estado','select',True,'change_states'),('notes','Observaciones','long',False,None)]),
  'Personal':('people',[
@@ -71,6 +75,26 @@ def initialize():
                 cols.append(f'"{key}" {sql_type}'+(' UNIQUE' if key=='code' else ''))
             if table=='people':cols.append('name TEXT')  # columna interna para compatibilidad con datos antiguos
             con.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(cols)})')
+        # Catálogo de entregables: alta y modificaciones reservadas al administrador.
+        # La tabla 'deliverables' sigue siendo el registro de la entrega y de su versión vigente.
+        con.execute('''CREATE TABLE IF NOT EXISTS deliverable_catalog (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_code TEXT NOT NULL,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            specialty TEXT,
+            final_due_date TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+        # Compatibilidad con SQLite existente: preservar vínculos y enlaces viejos, aunque
+        # la casilla 'Código del plano' ya no sea visible en el formulario.
+        cols={r[1] for r in con.execute('PRAGMA table_info(deliverables)')}
+        if 'drawing_code' not in cols:
+            con.execute('ALTER TABLE deliverables ADD COLUMN drawing_code TEXT')
+        if 'file_path' not in cols:
+            con.execute('ALTER TABLE deliverables ADD COLUMN file_path TEXT')
+        con.execute('''INSERT OR IGNORE INTO deliverable_catalog(project_code,code,name,specialty,final_due_date)
+            SELECT project_code,code,name,specialty,COALESCE(NULLIF(due_date,''),date('now'))
+            FROM deliverables WHERE code IS NOT NULL AND project_code IS NOT NULL''')
         con.execute('''CREATE TABLE IF NOT EXISTS meetings (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, project_code TEXT, owner TEXT, due_date TEXT, status TEXT)''')
         con.execute('CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, version TEXT NOT NULL, registered_at TEXT NOT NULL, notes TEXT, UNIQUE(delivery_code,version))')
         con.execute('CREATE TABLE IF NOT EXISTS checklist (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, criterion TEXT NOT NULL, result TEXT NOT NULL DEFAULT "PENDIENTE", notes TEXT, UNIQUE(delivery_code,criterion))')
@@ -425,7 +449,11 @@ def drive_upload(upload,delivery_id,code,version,kind,allow_new_consulta=False):
         raise ValueError('Formato de archivo no permitido.')
     mime= 'application/pdf' if kind=='pdf' else 'application/octet-stream'
     safe_code=re.sub(r'[^A-Za-z0-9_-]','_',code)
-    filename=f'{safe_code}_{version}_{kind}.{ext}'
+    with connection() as con:
+        prow=con.execute('SELECT project_code FROM deliverables WHERE id=? AND code=?',(delivery_id,code)).fetchone()
+    if not prow:raise ValueError('No se encontró el entregable registrado.')
+    safe_project=re.sub(r'[^A-Za-z0-9_-]','_',prow['project_code'] or '')
+    filename=f'{safe_project}_{safe_code}_{version}.{ext}'
     token=drive_token()
     version_folder_id=drive_delivery_folder(token,delivery_id,code,version)
     metadata={'name':filename,'parents':[version_folder_id], 'description':f'ALTIVIA {code} {version} {kind}'}
@@ -522,7 +550,7 @@ def client_portal():
       @media(max-width:640px){.altivia-client-card{padding:15px;margin-bottom:9px}}
     </style>''',unsafe_allow_html=True)
     for r in filtered:
-        title=escape(str(r['drawing_code'] or r['code']))+' – '+escape(str(r['name'] or 'Documento'))
+        title=escape(str(r['code']))+' – '+escape(str(r['name'] or 'Documento'))
         sub=escape(str(r['project_code'] or ''))+' · Versión '+escape(str(r['version'] or '—'))+' · '+escape(str(r['specialty'] or ''))
         st.markdown(f'<div class="altivia-client-card"><div class="altivia-client-head"><span class="altivia-client-title">{title}</span><span class="altivia-client-badge">{escape(r["status"])}</span></div><div class="altivia-client-sub">{sub}</div></div>',unsafe_allow_html=True)
         version=str(r['version'] or 'V01')
@@ -698,10 +726,9 @@ def update_project_sync(values,record_id):
             if old_code!=new_code or old_name!=new_name:
                 for f in remote:
                     ext=f['filename'].rsplit('.',1)[-1].lower() if '.' in f['filename'] else 'bin'
-                    safe_project=re.sub(r'[^A-Za-z0-9_-]','_',new_code)[:44]
-                    safe_name=re.sub(r'[^A-Za-z0-9_-]','_',new_name)[:40]
-                    safe_delivery=re.sub(r'[^A-Za-z0-9_-]','_',f['delivery_code'])[:45]
-                    target=f'{safe_project}_{safe_name}_{safe_delivery}_{f["version"]}_{f["kind"]}.{ext}'
+                    safe_project=re.sub(r'[^A-Za-z0-9_-]','_',new_code)
+                    safe_delivery=re.sub(r'[^A-Za-z0-9_-]','_',f['delivery_code'])
+                    target=f'{safe_project}_{safe_delivery}_{f["version"]}.{ext}'
                     if target!=f['filename']:
                         to_rename.append((f['file_id'],f['filename'],target))
     changes=[]
@@ -714,7 +741,7 @@ def update_project_sync(values,record_id):
             sets=', '.join(f'"{k}"=?' for k in vals)
             con.execute(f'UPDATE projects SET {sets} WHERE id=?',list(vals.values())+[record_id])
             if old_code!=new_code:
-                for table in ('tasks','deliverables','changes','meetings'):
+                for table in ('tasks','deliverables','changes','meetings','deliverable_catalog'):
                     con.execute(f'UPDATE {table} SET project_code=? WHERE project_code=?',(new_code,old_code))
             for file_id,old_filename,new_filename in to_rename:
                 con.execute('UPDATE drive_files SET filename=? WHERE file_id=?',(new_filename,file_id))
@@ -731,22 +758,66 @@ def update_project_sync(values,record_id):
 
 
 def save_record(module,values,record_id=None):
-    if module=='Entregables' and record_id is None and st.session_state.get('role')=='Consulta':
-        # Alta única permitida al rol Consulta; nunca edita registros ni autoriza clientes.
-        values=dict(values)
-        values['status']='Pendiente'
-        values['version']='V01'
-        values['approval_date']=None
-        values['actual_date']=None
-    else:
+    '''Guarda datos; en entregables el catálogo controla IDs y fecha final.
+
+    El servidor aplica las mismas reglas aunque un usuario altere widgets locales.
+    '''
+    values=dict(values)
+    is_consulta=(st.session_state.get('role')=='Consulta')
+    if not (module=='Entregables' and record_id is None and is_consulta):
         require_admin()
     if module=='Proyectos' and record_id is not None:
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
+    if module=='Entregables':
+        code=str(values.get('code') or '').strip()
+        project=str(values.get('project_code') or '').strip()
+        if not code or not project:raise ValueError('Selecciona un proyecto y un entregable del catálogo.')
+        with connection() as con:
+            catalog=con.execute('SELECT * FROM deliverable_catalog WHERE code=?',(code,)).fetchone()
+            # Carga ficticia/operación histórica por Admin: alta en catálogo.
+            if catalog is None and can_edit() and record_id is None:
+                con.execute('''INSERT INTO deliverable_catalog(project_code,code,name,specialty,final_due_date)
+                    VALUES(?,?,?,?,?)''',(project,code,str(values.get('name') or '').strip(),
+                    values.get('specialty') or '',values.get('due_date') or date.today().isoformat()))
+                catalog=con.execute('SELECT * FROM deliverable_catalog WHERE code=?',(code,)).fetchone()
+            if not catalog or catalog['project_code']!=project:
+                raise ValueError('El ID de entregable no está autorizado en el catálogo de este proyecto.')
+            registered=con.execute('SELECT * FROM deliverables WHERE code=?',(code,)).fetchone()
+        if record_id is None and registered:
+            raise ValueError('Este entregable ya fue registrado. Solo un administrador puede editarlo o crear otra versión.')
+        if record_id is not None and (not registered or registered['id']!=record_id or registered['project_code']!=project):
+            raise ValueError('No está permitido reasignar un entregable a otro proyecto.')
+        values['code']=code
+        values['project_code']=project
+        values['name']=catalog['name']
+        values['specialty']=catalog['specialty'] or ''
+        values['due_date']=catalog['final_due_date']
+        values.pop('drawing_code',None)
+        values.pop('file_path',None)
+        if record_id is None:
+            values['version']=next_version(code)
+            values['actual_date']=today_peru().isoformat()
+            if is_consulta:
+                values['status']='Pendiente'
+                for f in ('review_date','correction_date','approval_date'):
+                    values[f]=None
+        else:
+            original_version=registered['version'] or ''
+            if values.get('version')!=original_version:
+                expected=next_version(code,original_version)
+                if values['version']!=expected:
+                    raise ValueError('La nueva versión debe ser '+expected)
+                values['actual_date']=today_peru().isoformat()
+            else:
+                values['actual_date']=registered['actual_date']
+        if values.get('status') not in DELIVERY_STATES:
+            raise ValueError('Estado de entregable no válido.')
     mandatory=[label for k,label,_,required,_ in fields if required and (values.get(k) in ('',None))]
     if mandatory:raise ValueError('Campos obligatorios: '+', '.join(mandatory))
     if module=='Plan de trabajo' and values['start_date']>values['due_date']:raise ValueError('Fecha término anterior al inicio.')
-    if module=='Entregables' and not str(values['version']).upper().startswith('V'):raise ValueError('Use versiones V01, V02, etc.')
+    if module=='Entregables' and not str(values['version']).upper().startswith('V'):
+        raise ValueError('Use versiones V01, V02, etc.')
     if module=='Entregables' and values['status'] in ('Enviado al cliente','Aprobado','Entregado') and not values.get('review_date'):
         raise ValueError('Debe registrar fecha de revisión antes de enviar/aprobar/entregar.')
     if module=='Personal':
@@ -769,13 +840,16 @@ def save_record(module,values,record_id=None):
             keys=','.join(values.keys());placeholders=','.join('?' for _ in values)
             con.execute(f'INSERT INTO {table} ({keys}) VALUES ({placeholders})',list(values.values()))
         if module=='Entregables':
-            con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES (?,?,?,?)',(values['code'],values['version'],date.today().isoformat(),'Versión registrada desde formulario'))
+            con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES (?,?,?,?)',
+                (values['code'],values['version'],date.today().isoformat(),'Versión registrada desde formulario'))
             m=re.fullmatch(r'V(\d+)',str(values['version']).upper())
             if m:
                 con.execute('''INSERT INTO version_counters(delivery_code,highest) VALUES(?,?)
                     ON CONFLICT(delivery_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
                     (values['code'],int(m.group(1))))
-        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',(module,values['code'],'Actualización' if record_id else 'Alta'))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+            (module,values['code'],'Actualización' if record_id else 'Alta'))
+
 
 def backup_database():
     """Respaldo SQLite coherente; no copiar el archivo mientras está escribiéndose."""
@@ -805,6 +879,7 @@ def delete_selected(module,ids):
                 con.execute(f'DELETE FROM versions WHERE delivery_code IN ({dm})',dc)
                 con.execute(f'DELETE FROM checklist WHERE delivery_code IN ({dm})',dc)
             con.execute(f'DELETE FROM delivery_files WHERE delivery_id IN (SELECT id FROM deliverables WHERE project_code IN ({pm}))',codes)
+            con.execute(f'DELETE FROM deliverable_catalog WHERE project_code IN ({pm})',codes)
             for linked in ('tasks','deliverables','changes','meetings'):
                 con.execute(f'DELETE FROM {linked} WHERE project_code IN ({pm})',codes)
         if module=='Entregables' and codes:
@@ -868,7 +943,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','tasks','deliverables','projects','people','audit'):
+                for table in ('drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','tasks','deliverables','deliverable_catalog','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -891,7 +966,8 @@ def card_browser(module, frame, allow_version_edit=True):
     a,b=st.columns(2)
     with a:
         states=sorted(str(x) for x in frame['status'].dropna().unique()) if 'status' in frame else []
-        status=st.selectbox('Estado',['Todos']+states,key='cards_state_'+table)
+        status=('Todos' if module=='Entregables' and not can_edit() else
+                st.selectbox('Estado',['Todos']+states,key='cards_state_'+table))
     with b:
         projects=sorted(str(x) for x in frame['project_code'].dropna().unique()) if 'project_code' in frame else []
         project=st.selectbox('Proyecto',['Todos']+projects,key='cards_proj_'+table) if projects else 'Todos'
@@ -911,15 +987,16 @@ def card_browser(module, frame, allow_version_edit=True):
         with st.container(border=True):
             st.markdown(f'**{escape(title)}**')
             st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
-            st.markdown(f'**Estado:** {escape(status_text)}')
+            if module!='Entregables' or can_edit():
+                st.markdown(f'**Estado:** {escape(status_text)}')
             cols=st.columns(2)
-            details=[k for k in ('owner','reviewer','manager','due_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
+            details=[k for k in ('owner','reviewer','manager','due_date','actual_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
             for idx,k in enumerate(details):
                 with cols[idx%2]:st.caption(f'{labels.get(k,k)}: {r[k]}')
             with st.expander('Ver detalles'+(' y versiones' if module=='Entregables' else '')):
                 for k,label,_,_,_ in fields:
                     v=r.get(k)
-                    if k not in details and k not in ('code','name','activity','description','status','file_path') and v is not None and pd.notna(v) and str(v).strip():
+                    if k not in details and k not in ('code','name','activity','description','status','file_path','drawing_code') and v is not None and pd.notna(v) and str(v).strip():
                         st.markdown(f'**{label}:** {escape(str(v))}')
                 if module=='Entregables':
                     versions_for_delivery(code,allow_edit=allow_version_edit and can_edit())
@@ -1068,9 +1145,254 @@ def project_editor(data):
     if can_edit():bulk_delete_ui('Proyectos',data)
 
 
+def catalog_rows():
+    with connection() as con:
+        return [dict(r) for r in con.execute('''SELECT c.*,p.name AS project_name,
+            (SELECT COUNT(*) FROM deliverables d WHERE d.code=c.code) AS registered
+            FROM deliverable_catalog c LEFT JOIN projects p ON p.code=c.project_code
+            ORDER BY c.project_code,c.code''')]
+
+
+def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
+    '''Actualiza el catálogo y entregas vinculadas; preserva referencias Drive.'''
+    require_admin()
+    code=code.strip();name=name.strip()
+    if not code or not name:raise ValueError('Se requiere ID y nombre del entregable.')
+    with connection() as con:
+        previous=con.execute('SELECT * FROM deliverable_catalog WHERE id=?',(catalog_id,)).fetchone()
+        if previous is None:raise ValueError('El entregable de catálogo ya no existe.')
+        current=con.execute('SELECT * FROM deliverables WHERE code=?',(previous['code'],)).fetchone()
+        history=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',
+                            (previous['code'],)).fetchone()
+        if (current or (history and history['highest']>0)) and (code!=previous['code'] or project_code!=previous['project_code']):
+            raise ValueError('El ID y el proyecto no pueden cambiarse si existen entregas o versiones históricas.')
+        if con.execute('SELECT id FROM deliverable_catalog WHERE code=? AND id<>?',(code,catalog_id)).fetchone():
+            raise ValueError('El código ya está reservado para otro entregable.')
+        if con.execute('SELECT id FROM deliverables WHERE code=? AND code<>?',(code,previous['code'])).fetchone():
+            raise ValueError('El código coincide con un entregable registrado.')
+        remote=con.execute('SELECT COUNT(*) FROM drive_files WHERE delivery_id=?',(current['id'],)).fetchone()[0] if current else 0
+        project=con.execute('SELECT name FROM projects WHERE code=?',(previous['project_code'],)).fetchone()
+    change_folder=None
+    if current and remote and previous['name']!=name:
+        if not drive_ready():raise ValueError('Primero autoriza Google Drive para renombrar un entregable con archivos.')
+        token=drive_token()
+        folder=drive_safe_folder_name(previous['project_code']+' - '+(project['name'] or ''))
+        project_id=drive_find_folder(token,DRIVE_FOLDER_ID,folder)
+        original_name=drive_safe_folder_name(previous['code']+' - '+previous['name'])
+        new_name=drive_safe_folder_name(code+' - '+name)
+        found=drive_find_folder(token,project_id,original_name) if project_id else None
+        if not found:raise ValueError('No se encontró la carpeta anterior en Google Drive; no se modificaron datos.')
+        collision=drive_find_folder(token,project_id,new_name)
+        if collision and collision!=found:raise ValueError('Ya existe una carpeta con el nuevo nombre.')
+        drive_rename_item(token,found,new_name)
+        change_folder=(token,found,original_name)
+    try:
+        with connection() as con:
+            con.execute('''UPDATE deliverable_catalog SET project_code=?,code=?,name=?,specialty=?,final_due_date=?
+                WHERE id=?''',(project_code,code,name,specialty,final_date,catalog_id))
+            if current:
+                con.execute('''UPDATE deliverables SET name=?,specialty=?,due_date=? WHERE id=?''',
+                    (name,specialty,final_date,current['id']))
+            con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                ('Catálogo entregables',code,'Edición por Administrador'))
+    except Exception:
+        if change_folder:
+            try:drive_rename_item(*change_folder)
+            except Exception:pass
+        raise
+
+
+def delivery_catalog_admin_ui():
+    '''Catálogo por proyecto, solo Admin; permite seleccionar desde Consulta sin escribir IDs.'''
+    require_admin()
+    st.markdown('### 📋 Entregables programados por proyecto')
+    st.caption('Aquí defines el ID, el nombre, la especialidad y la Fecha de Presentación Final. '
+               'Esta programación NO equivale a registrar una entrega o subir archivos.')
+    projects=[dict(r) for r in connection_project_rows()]
+    if not projects:
+        st.warning('Primero crea un proyecto en el módulo Proyectos.');return
+    project_names={p['code']:p['name'] for p in projects}
+    with st.form('catalog_create_form'):
+        pr=st.selectbox('ID Proyecto',list(project_names),format_func=lambda c:f'{c} — {project_names[c]}')
+        code=st.text_input('ID Entregable *',placeholder='Ej.: ARQ-001').strip()
+        name=st.text_input('Nombre del entregable *',placeholder='Ej.: Plantas arquitectónicas').strip()
+        specialty=st.selectbox('Especialidad',['']+SPECIALTIES)
+        due=st.date_input('Fecha de Presentación Final *',value=date.today(),format='DD/MM/YYYY')
+        if st.form_submit_button('➕ Registrar entregable',type='primary'):
+            try:
+                if not code or not name:raise ValueError('Indica el ID y nombre del entregable.')
+                with connection() as con:
+                    con.execute('''INSERT INTO deliverable_catalog(project_code,code,name,specialty,final_due_date)
+                        VALUES(?,?,?,?,?)''',(pr,code,name,specialty,due.isoformat()))
+                    con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                        ('Catálogo entregables',code,'Alta en proyecto '+pr))
+                st.success('Entregable añadido al catálogo. Ya puede seleccionarse desde Consulta.');st.rerun()
+            except sqlite3.IntegrityError:
+                st.error('Ese ID de entregable ya existe. Utiliza un ID único en ALTIVIA.')
+            except ValueError as exc:st.error(str(exc))
+    catalog=catalog_rows()
+    st.caption(f'{len(catalog)} entregable(s) programado(s)')
+    term=st.text_input('🔎 Buscar entregable del catálogo',key='catalog_search').strip().casefold()
+    pfilter=st.selectbox('Filtrar proyecto',['Todos']+list(project_names),key='catalog_project_filter',
+                         format_func=lambda x:x if x=='Todos' else f'{x} — {project_names[x]}')
+    for item in catalog:
+        if pfilter!='Todos' and item['project_code']!=pfilter:continue
+        if term and term not in (item['code']+' '+item['name']+' '+(item['project_name'] or '')).casefold():continue
+        with st.container(border=True):
+            st.markdown(f"**{escape(item['code'])} — {escape(item['name'])}**")
+            st.caption(f"{escape(item['project_code'])} · Fecha final: {escape(item['final_due_date'])} · "
+                       + ('Entrega registrada' if item['registered'] else 'Pendiente de registrar'))
+            with st.expander('✏️ Editar entregable programado'):
+                with st.form(f'catalog_edit_{item["id"]}'):
+                    pr2=st.selectbox('ID Proyecto',list(project_names),
+                        index=list(project_names).index(item['project_code']),
+                        disabled=bool(item['registered']),key=f'cat_pr_{item["id"]}')
+                    code2=st.text_input('ID Entregable',value=item['code'],
+                        disabled=bool(item['registered']),key=f'cat_code_{item["id"]}').strip()
+                    name2=st.text_input('Nombre del entregable',value=item['name'],key=f'cat_name_{item["id"]}').strip()
+                    sp_list=['']+SPECIALTIES
+                    if (item['specialty'] or '') not in sp_list:sp_list.append(item['specialty'])
+                    sp=st.selectbox('Especialidad',sp_list,index=sp_list.index(item['specialty'] or ''),
+                                    key=f'cat_spec_{item["id"]}')
+                    due2=st.date_input('Fecha de Presentación Final',
+                        value=date.fromisoformat(item['final_due_date']),format='DD/MM/YYYY',key=f'cat_due_{item["id"]}')
+                    if item['registered']:
+                        st.caption('El ID y el proyecto permanecen bloqueados porque ya existe una entrega. '
+                                   'Sí puedes cambiar nombre, especialidad y fecha final.')
+                    if st.form_submit_button('💾 Guardar cambios'):
+                        try:
+                            catalog_update(item['id'],pr2,code2,name2,sp,due2.isoformat())
+                            st.success('Catálogo actualizado.');st.rerun()
+                        except (ValueError,sqlite3.IntegrityError,requests.RequestException) as exc:
+                            st.error(str(exc))
+
+
+def connection_project_rows():
+    with connection() as con:
+        return [dict(r) for r in con.execute('SELECT code,name FROM projects ORDER BY code')]
+
+
+def delivery_editor(data):
+    st.title('📑 Entregables')
+    admin=can_edit()
+    role=st.session_state.get('role')
+    if admin:
+        if st.button('📋 Registrar entregables',type='primary',key='toggle_delivery_catalog'):
+            st.session_state['catalog_visible']=not st.session_state.get('catalog_visible',False)
+        if st.session_state.get('catalog_visible'):
+            delivery_catalog_admin_ui()
+            st.divider()
+    if not (admin or role=='Consulta'):
+        card_browser('Entregables',data['Entregables'],allow_version_edit=False);return
+    st.subheader('Registrar entrega' if role=='Consulta' else 'Crear o editar una entrega')
+    if role=='Consulta':
+        st.info('Solo puedes registrar un entregable programado y pendiente. '
+                'Una vez guardado, únicamente el administrador podrá modificarlo.')
+    projects=connection_project_rows()
+    if not projects:
+        st.warning('Todavía no hay proyectos.');return
+    pn={p['code']:p['name'] for p in projects}
+    project=st.selectbox('01 · ID Proyecto',list(pn),format_func=lambda c:f'{c} — {pn[c]}',key='new_delivery_project')
+    cat=[r for r in catalog_rows() if r['project_code']==project]
+    with connection() as con:
+        used={r['code']:dict(r) for r in con.execute('SELECT * FROM deliverables WHERE project_code=?',(project,))}
+    if role=='Consulta':
+        cat=[r for r in cat if r['code'] not in used]
+    if not cat:
+        st.info('No hay entregables pendientes de registrar en este proyecto. '
+                + ('Regístralos con el botón «Registrar entregables».' if admin else 'Solicita su programación al Administrador.'))
+        card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
+        return
+    by_code={r['code']:r for r in cat}
+    code=st.selectbox('02 · ID Entregable',list(by_code),
+        format_func=lambda c:f'{c} — {by_code[c]["name"]}',key=f'new_delivery_code_{project}')
+    catalog=by_code[code]
+    existing=used.get(code)
+    rid=existing['id'] if existing else None
+    action='Nuevo registro'
+    if admin and rid:
+        action=st.radio('Acción',['Editar registro actual','Registrar nueva versión'],horizontal=True,
+                        key=f'delivery_action_{code}')
+    current=existing or {}
+    if existing and action=='Editar registro actual':
+        version=current.get('version') or 'V01'
+    else:
+        version=next_version(code,current.get('version'))
+    st.caption('Nombre, especialidad y fecha final definidos por el Administrador.')
+    form_key=f'delivery_editor_{code}_{action}'
+    with st.form(f'{form_key}_form'):
+        st.text_input('Nombre del entregable',value=catalog['name'],disabled=True)
+        st.text_input('Especialidad',value=catalog['specialty'] or 'No asignada',disabled=True)
+        st.text_input('Versión',value=version,disabled=True)
+        due=date.fromisoformat(catalog['final_due_date'])
+        st.date_input('Fecha de Presentación Final',value=due,disabled=True,format='DD/MM/YYYY')
+        delivery_date=(current.get('actual_date') if (existing and action=='Editar registro actual') else None)
+        if delivery_date:
+            st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),disabled=True,format='DD/MM/YYYY')
+        elif existing and action=='Editar registro actual':
+            st.text_input('Fecha de entregable',value='No registrada (dato histórico)',disabled=True)
+        else:
+            delivery_date=today_peru().isoformat()
+            st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),disabled=True,format='DD/MM/YYYY')
+        vals={'project_code':project,'code':code,'name':catalog['name'],
+              'specialty':catalog['specialty'] or '','version':version,'due_date':due.isoformat(),
+              'actual_date':delivery_date,'file_path':current.get('file_path') or ''}
+        for key,label,kind,required,opt in SPECS['Entregables'][1]:
+            if key in ('project_code','code','name','specialty','version','due_date','actual_date'):
+                continue
+            if key=='file_path':continue
+            if key=='status' and role=='Consulta':
+                vals[key]='Pendiente'
+                continue
+            old=current.get(key)
+            if old is not None and pd.isna(old):old=None
+            if key=='status' and action=='Registrar nueva versión':old='Pendiente'
+            if key in ('review_date','correction_date','approval_date') and action=='Registrar nueva versión':old=None
+            vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,old,form_key)
+        st.markdown('#### 📎 Documentos del entregable')
+        st.caption('Los archivos se subirán a Google Drive, dentro de Proyecto / Entregable / Versión.')
+        pdf_file=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'{form_key}_pdf')
+        edit_file=st.file_uploader('Archivo editable para descargar (DWG, DOC o DOCX)',
+                                    type=['dwg','doc','docx'],key=f'{form_key}_editable')
+        if not drive_ready():st.warning('Google Drive no está conectado. No podrás adjuntar archivos hasta configurarlo.')
+        submitted=st.form_submit_button('💾 Registrar entrega' if not rid else '💾 Guardar cambios',type='primary')
+    if submitted:
+        try:
+            vals={k:(v.isoformat() if isinstance(v,date) else v) for k,v in vals.items()}
+            uploads=[(k,f) for k,f in (('pdf',pdf_file),('editable',edit_file)) if f is not None]
+            if uploads and not drive_ready():raise ValueError('Google Drive no está conectado. No se guardaron datos.')
+            # Validar todos los adjuntos ANTES del registro; evita errores comunes de guardados parciales.
+            for kind,f in uploads:
+                raw=f.getvalue()
+                ext=f.name.rsplit('.',1)[-1].lower() if '.' in f.name else ''
+                if not raw or len(raw)>DRIVE_LIMIT:raise ValueError(f'{f.name}: vacío o mayor de 25 MB.')
+                if kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-')):
+                    raise ValueError('El PDF seleccionado no es válido.')
+                if kind=='editable' and ext not in ('dwg','doc','docx'):
+                    raise ValueError('Editable no admitido: utiliza DWG, DOC o DOCX.')
+            if role=='Consulta':
+                vals['status']='Pendiente'
+            save_record('Entregables',vals,rid)
+            for kind,f in uploads:
+                with connection() as con:
+                    stored=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
+                drive_upload(f,int(stored['id']),code,stored['version'],kind,
+                    allow_new_consulta=(role=='Consulta' and rid is None))
+            st.success('Entrega registrada correctamente.');st.rerun()
+        except (ValueError,PermissionError,sqlite3.IntegrityError,requests.RequestException) as exc:
+            st.error(f'No se completó la operación: {exc}')
+            st.caption('Si Google Drive falló después de guardar el registro, no vuelvas a usar otro código: '
+                       'un administrador debe revisar el registro y sus archivos.')
+    st.divider()
+    card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
+    if admin:bulk_delete_ui('Entregables',data)
+
+
 def edit_module(module,data):
     if module=='Proyectos':
         return project_editor(data)
+    if module=='Entregables':
+        return delivery_editor(data)
     table,fields=SPECS[module]
     st.title(module)
     admin=can_edit()
@@ -1315,7 +1637,7 @@ def versions_page():
     for _,r in deliveries.head(30).iterrows():
         with st.container(border=True):
             st.markdown(f'**{escape(str(r["name"]))}** · {escape(str(r["code"]))}')
-            st.caption(f'{r["project_code"]} · {r["status"]} · Versión vigente: {r["version"]}')
+            st.caption((f'{r["project_code"]} · {r["status"]} · ' if can_edit() else f'{r["project_code"]} · ') + f'Versión vigente: {r["version"]}')
             with st.expander('Consultar y gestionar versiones'):
                 versions_for_delivery(r['code'],allow_edit=can_edit())
 
