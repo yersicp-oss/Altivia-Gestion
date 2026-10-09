@@ -9,6 +9,8 @@ import secrets
 import tempfile
 import re
 import base64
+import requests
+import json
 from contextlib import contextmanager
 from datetime import date, timedelta, datetime
 import pandas as pd
@@ -84,6 +86,11 @@ def initialize():
             UNIQUE(delivery_id,version,kind),
             FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE
         )''')
+        con.execute('''CREATE TABLE IF NOT EXISTS drive_files (
+            delivery_id INTEGER NOT NULL, version TEXT NOT NULL, kind TEXT NOT NULL,
+            file_id TEXT NOT NULL, filename TEXT NOT NULL, uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(delivery_id,version,kind),
+            FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
         con.execute('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_code)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_deliveries_project ON deliverables(project_code)')
 
@@ -275,6 +282,88 @@ def upload_delivery_files(delivery_id,code,version):
             con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',('Archivos',code,'Archivos actualizados versión '+version))
         st.success('Archivos guardados.');st.rerun()
 
+# Los documentos se guardan exclusivamente en Drive, no como BLOB local.
+DRIVE_FOLDER_ID = '19sEVR8-vrm9m_8adHJVU_l1gYCYIz4Sq'
+DRIVE_LIMIT = 25 * 1024 * 1024
+
+def drive_credentials():
+    try:
+        cfg=st.secrets.get('google_drive',{})
+        return {k:str(cfg.get(k,'')).strip() for k in ('client_id','client_secret','refresh_token')}
+    except Exception:
+        return {}
+
+def drive_ready():
+    cfg=drive_credentials()
+    return all(cfg.values())
+
+def drive_token():
+    cfg=drive_credentials()
+    if not all(cfg.values()):
+        raise ValueError('Google Drive todavía no está autorizado en Secrets. No se subió ningún archivo.')
+    resp=requests.post('https://oauth2.googleapis.com/token',data={
+        'client_id':cfg['client_id'],'client_secret':cfg['client_secret'],
+        'refresh_token':cfg['refresh_token'],'grant_type':'refresh_token'},timeout=20)
+    if not resp.ok:raise ValueError(f'No se pudo autenticar Google Drive (HTTP {resp.status_code}).')
+    return resp.json()['access_token']
+
+def drive_upload(upload,delivery_id,code,version,kind):
+    require_admin()
+    if upload is None:return
+    raw=upload.getvalue()
+    if not raw or len(raw)>DRIVE_LIMIT:raise ValueError('El archivo está vacío o supera los 25 MB.')
+    ext=upload.name.rsplit('.',1)[-1].lower() if '.' in upload.name else ''
+    if (kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-'))) or (kind=='editable' and ext not in ('dwg','doc','docx')):
+        raise ValueError('Formato de archivo no permitido.')
+    mime= 'application/pdf' if kind=='pdf' else 'application/octet-stream'
+    safe_code=re.sub(r'[^A-Za-z0-9_-]','_',code)
+    filename=f'{safe_code}_{version}_{kind}.{ext}'
+    token=drive_token()
+    metadata={'name':filename,'parents':[DRIVE_FOLDER_ID], 'description':f'ALTIVIA {code} {version} {kind}'}
+    # Subida multipart; el token corresponde a la cuenta que posee la carpeta.
+    resp=requests.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
+        headers={'Authorization':f'Bearer {token}'},
+        files={'metadata':('metadata',json.dumps(metadata),'application/json; charset=UTF-8'),
+               'file':(filename,raw,mime)},timeout=90)
+    if not resp.ok:raise ValueError(f'Google Drive rechazó la carga ({resp.status_code}): {resp.text[:250]}')
+    file_id=resp.json()['id']
+    with connection() as con:
+        old=con.execute('SELECT file_id FROM drive_files WHERE delivery_id=? AND version=? AND kind=?',
+            (delivery_id,version,kind)).fetchone()
+        con.execute('''INSERT INTO drive_files(delivery_id,version,kind,file_id,filename)
+            VALUES(?,?,?,?,?) ON CONFLICT(delivery_id,version,kind)
+            DO UPDATE SET file_id=excluded.file_id,filename=excluded.filename,uploaded_at=CURRENT_TIMESTAMP''',
+            (delivery_id,version,kind,file_id,filename))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+            ('Drive',code,f'Archivo {kind} subido en {version}'))
+    # No se elimina automáticamente el fichero anterior: protege el historial.
+    return filename
+
+def drive_file_info(delivery_id,version):
+    with connection() as con:
+        return {r['kind']:dict(r) for r in con.execute('SELECT * FROM drive_files WHERE delivery_id=? AND version=?',(delivery_id,version)).fetchall()}
+
+def drive_bytes(file_id):
+    token=drive_token()
+    response=requests.get(f'https://www.googleapis.com/drive/v3/files/{file_id}',params={'alt':'media'},
+       headers={'Authorization':f'Bearer {token}'},timeout=75,stream=True)
+    if not response.ok:raise ValueError('No se pudo recuperar el documento autorizado desde Google Drive.')
+    chunks=[]; size=0
+    for chunk in response.iter_content(262144):
+        size+=len(chunk)
+        if size>DRIVE_LIMIT:raise ValueError('El documento supera los 25 MB.')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+def next_version(code,current=None):
+    versions=[]
+    if current:versions.append(str(current))
+    if code:
+        with connection() as con:
+            versions += [r[0] for r in con.execute('SELECT version FROM versions WHERE delivery_code=?',(code,))]
+    n=max([int(m.group(1)) for v in versions if (m:=re.fullmatch(r'V(\d+)',str(v).upper()))] or [0])
+    return f'V{n+1:02d}'
+
 def client_portal():
     if st.session_state.get('role')!='Cliente':st.error('Acceso restringido.');st.stop()
     st.title('📁 Mis planos y documentos')
@@ -304,7 +393,29 @@ def client_portal():
         st.markdown(f'<div class="altivia-client-card"><div class="altivia-client-head"><span class="altivia-client-title">{title}</span><span class="altivia-client-badge">{escape(r["status"])}</span></div><div class="altivia-client-sub">{sub}</div></div>',unsafe_allow_html=True)
         reference=str(r['file_path'] or '').strip()
         attached=file_info(r['id'],str(r['version'] or 'V01'))
-        if attached:
+        google_docs=drive_file_info(r['id'],str(r['version'] or 'V01'))
+        if google_docs:
+            left,right=st.columns(2)
+            with left:
+                if 'pdf' in google_docs and st.button('👁 Visualizar PDF aquí',key=f'drive_view_{r["id"]}'):
+                    st.session_state['drive_preview']=None if st.session_state.get('drive_preview')==r['id'] else r['id']
+            with right:
+                if 'editable' in google_docs:
+                    if st.button('⬇ Preparar archivo editable',key=f'drive_prep_{r["id"]}'):
+                        try:st.session_state[f'drive_download_{r["id"]}']=drive_bytes(google_docs['editable']['file_id'])
+                        except Exception as exc:st.error(str(exc))
+                    content=st.session_state.get(f'drive_download_{r["id"]}')
+                    if content:st.download_button('Descargar editable',content,file_name=google_docs['editable']['filename'],key=f'drive_dl_{r["id"]}')
+            if st.session_state.get('drive_preview')==r['id'] and 'pdf' in google_docs:
+                try:
+                    content=drive_bytes(google_docs['pdf']['file_id'])
+                    if content.startswith(b'%PDF-'):
+                        internal_pdf_preview(content)
+                        st.download_button('⬇ Descargar PDF',content,file_name=google_docs['pdf']['filename'],mime='application/pdf',key=f'drive_pdf_dl_{r["id"]}')
+                    else:st.error('El archivo almacenado no es un PDF válido.')
+                except Exception as exc:st.error(str(exc))
+        elif attached:
+            st.warning('Hay adjuntos antiguos en SQLite. Migra estos archivos a Drive antes de utilizar esta cuenta en producción.')
             left,right=st.columns(2)
             with left:
                 if 'pdf' in attached and st.button('👁 Visualizar PDF aquí',key=f'client_pdf_{r["id"]}',use_container_width=True):
@@ -541,7 +652,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('delivery_files','checklist','versions','meetings','changes','tasks','deliverables','projects','people','audit'):
+                for table in ('drive_files','delivery_files','checklist','versions','meetings','changes','tasks','deliverables','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -592,12 +703,10 @@ def card_browser(module, frame, allow_version_edit=True):
             with st.expander('Ver detalles'+(' y versiones' if module=='Entregables' else '')):
                 for k,label,_,_,_ in fields:
                     v=r.get(k)
-                    if k not in details and k not in ('code','name','activity','description','status') and v is not None and pd.notna(v) and str(v).strip():
+                    if k not in details and k not in ('code','name','activity','description','status','file_path') and v is not None and pd.notna(v) and str(v).strip():
                         st.markdown(f'**{label}:** {escape(str(v))}')
                 if module=='Entregables':
                     versions_for_delivery(code,allow_edit=allow_version_edit and can_edit())
-                    if can_edit():
-                        upload_delivery_files(int(r['id']),code,str(r.get('version') or 'V01'))
 
 
 def versions_for_delivery(code,allow_edit=False):
@@ -609,20 +718,8 @@ def versions_for_delivery(code,allow_edit=False):
         st.markdown(f'**{escape(str(v["version"]))}** · {escape(str(v["registered_at"]))}')
         st.caption(v['notes'] or 'Sin descripción')
     if not allow_edit:return
-    with st.form('new_version_'+str(code)):
-        ver=st.text_input('Nueva versión',value='V02')
-        notes=st.text_area('Descripción de cambios')
-        if st.form_submit_button('Registrar nueva versión'):
-            if not re.fullmatch(r'V[0-9]{2,}',ver.strip().upper()):st.error('Utiliza V01, V02, V03, etc.')
-            else:
-                try:
-                    with connection() as con:
-                        con.execute('INSERT INTO versions(delivery_code,version,registered_at,notes) VALUES(?,?,?,?)',(code,ver.strip().upper(),date.today().isoformat(),notes))
-                        con.execute('UPDATE deliverables SET version=? WHERE code=?',(ver.strip().upper(),code))
-                        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Nueva versión '+ver.strip().upper()))
-                    st.success('Versión registrada');st.rerun()
-                except sqlite3.IntegrityError:st.error('Ya existe esa versión en el entregable.')
-    if rows:
+    if allow_edit:st.caption('Para emitir otra versión, usa «Crear o editar registro» y selecciona «Registrar nueva versión».')
+    if rows and allow_edit:
         selected=st.selectbox('Versión cuya descripción quieres editar',[r['id'] for r in rows],format_func=lambda i:next(r['version'] for r in rows if r['id']==i),key='ver_selected_'+str(code))
         original=next(r for r in rows if r['id']==selected)
         with st.form('edit_version_'+str(code)+'_'+str(selected)):
@@ -648,14 +745,43 @@ def edit_module(module,data):
                 idx=items.index(choice)-1;row=existing.iloc[idx].to_dict();rid=int(row['id'])
             with st.form('form_'+table,clear_on_submit=False):
                 vals={}
+                version_choice=None
+                if module=='Entregables':
+                    st.caption('Una nueva revisión aumenta la versión. Puedes actualizar otros datos sin crear nueva versión.')
+                    version_choice=st.radio('Acción de versión',['Conservar versión actual','Registrar nueva versión'],horizontal=True,index=1,key=f'version_action_{rid}')
                 for key,label,kind,required,opt in fields:
+                    if module=='Entregables' and key=='file_path':
+                        vals['file_path']=row.get('file_path') or ''
+                        continue
                     raw=row.get('name') if module=='Personal' and key=='code' and row else row.get(key)
                     if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):raw=None
-                    vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
+                    if module=='Entregables' and key=='version':
+                        code=row.get('code') if row else ''
+                        proposed=next_version(code,row.get('version')) if (version_choice=='Registrar nueva versión' or not rid) else (raw or 'V01')
+                        vals['version']=st.text_input('Versión *',value=proposed,disabled=True,key=f'computed_version_{rid}_{version_choice}_{proposed}')
+                    else:
+                        vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
+                pdf_file=None; edit_file=None
+                if module=='Entregables':
+                    st.markdown('#### 📎 Documentos del entregable')
+                    st.caption('Los archivos se cargarán directamente a tu carpeta de Google Drive. No se guardarán como BLOB en SQLite.')
+                    pdf_file=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'main_pdf_{rid}_{version_choice}')
+                    edit_file=st.file_uploader('Editable para descargar (DWG, DOC o DOCX)',type=['dwg','doc','docx'],key=f'main_edit_{rid}_{version_choice}')
+                    if not drive_ready():
+                        st.warning('Google Drive aún no está autorizado. Puedes registrar los datos, pero no subir archivos hasta configurar el acceso seguro.')
                 if st.form_submit_button('💾 Guardar cambios',type='primary'):
                     vals={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v) for k,v in vals.items()}
-                    try:save_record(module,vals,rid);st.success('Registro guardado');st.rerun()
-                    except (ValueError,sqlite3.IntegrityError) as ex:st.error(str(ex))
+                    try:
+                        if module=='Entregables' and (pdf_file or edit_file) and not drive_ready():
+                            raise ValueError('Falta autorizar Google Drive. No se guardó el formulario ni los archivos.')
+                        save_record(module,vals,rid)
+                        if module=='Entregables' and (pdf_file or edit_file):
+                            with connection() as con:
+                                rowid=con.execute('SELECT id FROM deliverables WHERE code=?',(vals['code'],)).fetchone()['id']
+                            for kind,f in [('pdf',pdf_file),('editable',edit_file)]:
+                                if f:drive_upload(f,rowid,vals['code'],vals['version'],kind)
+                        st.success('Registro guardado');st.rerun()
+                    except (ValueError,sqlite3.IntegrityError,requests.RequestException) as ex:st.error(str(ex))
         bulk_delete_ui(module,data)
     else:st.info('Modo consulta: puedes buscar y examinar los registros, pero no modificarlos.')
     card_browser(module,data[module])
