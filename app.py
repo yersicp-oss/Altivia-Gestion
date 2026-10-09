@@ -13,7 +13,7 @@ import requests
 import json
 from contextlib import contextmanager
 from urllib.parse import quote
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
@@ -23,6 +23,11 @@ st.set_page_config(page_title='ALTIVIA | Gestión de Proyectos', page_icon='🏗
 ROOT=os.path.dirname(os.path.abspath(__file__))
 DB=os.environ.get('ALTIVIA_DB',os.path.join(ROOT,'altivia.db'))
 TODAY=date.today()
+
+# Mantener el acceso en este dispositivo es opcional. Se guardan únicamente
+# tokens aleatorios en el navegador; los tokens se almacenan con hash en SQLite.
+REMEMBER_COOKIE = 'gp_altivia_remember_v1'
+REMEMBER_DAYS = 7
 
 def today_peru():
     return datetime.now(ZoneInfo('America/Lima')).date()
@@ -158,6 +163,15 @@ def initialize_auth():
             role TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         con.execute('''CREATE TABLE IF NOT EXISTS client_access (user_id INTEGER NOT NULL, delivery_id INTEGER NOT NULL, granted_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(user_id,delivery_id), FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE, FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        con.execute("""CREATE TABLE IF NOT EXISTS remembered_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE,
+            password_fingerprint TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )""")
+        con.execute('CREATE INDEX IF NOT EXISTS idx_remembered_user ON remembered_sessions(user_id)')
         users=con.execute('SELECT COUNT(*) FROM users').fetchone()[0]
         if users==0:
             password=os.getenv('ALTIVIA_ADMIN_PASSWORD','')
@@ -181,12 +195,132 @@ def can_create_deliverable():
     return st.session_state.get('role') in ('Administrador','Consulta')
 
 
+def _password_fingerprint(stored_hash):
+    # Invalida sesiones persistentes después de cambiar una contraseña.
+    return hashlib.sha256(str(stored_hash).encode('utf-8')).hexdigest()
+
+
+def issue_remember_token(user_id, stored_hash):
+    """Crea una autorización revocable; nunca se guarda el token sin hash."""
+    token = secrets.token_urlsafe(48)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=REMEMBER_DAYS)
+    with connection() as con:
+        con.execute('DELETE FROM remembered_sessions WHERE expires_at<=?', (now.isoformat(),))
+        con.execute('''INSERT INTO remembered_sessions
+            (user_id, token_hash, password_fingerprint, created_at, expires_at)
+            VALUES (?,?,?,?,?)''',
+            (int(user_id), hashlib.sha256(token.encode()).hexdigest(),
+             _password_fingerprint(stored_hash), now.isoformat(), expires.isoformat()))
+        # Máximo 10 dispositivos activos por usuario, privilegiando los recientes.
+        con.execute('''DELETE FROM remembered_sessions
+           WHERE user_id=? AND id NOT IN
+           (SELECT id FROM remembered_sessions WHERE user_id=? ORDER BY id DESC LIMIT 10)''',
+           (int(user_id),int(user_id)))
+    return token
+
+
+def validate_remember_token(token):
+    """Devuelve usuario activo si el token sigue vigente y no cambió su clave."""
+    if not isinstance(token,str) or not (30 <= len(token) <= 250):
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with connection() as con:
+        r=con.execute('''SELECT s.id, s.expires_at, s.password_fingerprint,
+                        u.id AS user_id, u.username,u.full_name,u.role,u.active,u.password_hash
+                        FROM remembered_sessions s JOIN users u ON u.id=s.user_id
+                        WHERE s.token_hash=?''',(token_hash,)).fetchone()
+        if not r:return None
+        try:expires = datetime.fromisoformat(r['expires_at'])
+        except (ValueError,TypeError):expires = datetime.min.replace(tzinfo=timezone.utc)
+        if expires.tzinfo is None:expires=expires.replace(tzinfo=timezone.utc)
+        if (not r['active'] or expires <= datetime.now(timezone.utc)
+            or not hmac.compare_digest(r['password_fingerprint'],_password_fingerprint(r['password_hash']))):
+            con.execute('DELETE FROM remembered_sessions WHERE id=?',(r['id'],))
+            return None
+        return dict(r)
+
+
+def remembered_cookie_value():
+    # st.context.cookies refleja las cookies enviadas por el navegador al cargar
+    # esta sesión nueva y permite restaurarla sin incluir tokens en la URL.
+    try:return st.context.cookies.get(REMEMBER_COOKIE)
+    except (AttributeError,KeyError,TypeError):return None
+
+
+def clear_remember_token(token):
+    if isinstance(token,str) and token:
+        with connection() as con:
+            con.execute('DELETE FROM remembered_sessions WHERE token_hash=?',
+                (hashlib.sha256(token.encode()).hexdigest(),))
+
+
+def write_remember_cookie(token):
+    # CookieController usa JavaScript; la cookie NO es HttpOnly.
+    # Solo se incluye un token opaco aleatorio; nunca contraseñas o roles.
+    from streamlit_cookies_controller import CookieController
+    CookieController().set(REMEMBER_COOKIE, token,
+        max_age=REMEMBER_DAYS * 86400, secure=True, same_site='strict', path='/')
+
+
+def delete_remember_cookie():
+    from streamlit_cookies_controller import CookieController
+    CookieController().remove(REMEMBER_COOKIE)
+
+
+def restore_remembered_login():
+    if st.session_state.get('user_id') or st.session_state.get('_remember_checked'):
+        return
+    st.session_state['_remember_checked']=True
+    token=remembered_cookie_value()
+    account=validate_remember_token(token)
+    if account:
+        for key in ('user_id','username','full_name','role'):
+            st.session_state[key]=account[key]
+        st.session_state['_remember_token']=token
+        st.session_state['_remembered_login']=True
+
+
+def end_login_session():
+    token=st.session_state.get('_remember_token') or remembered_cookie_value()
+    clear_remember_token(token)
+    try:delete_remember_cookie()
+    except Exception:pass  # La revocación en servidor ya invalida el token.
+    for key in ('user_id','role','username','full_name','client_preview',
+                '_remember_token','_remembered_login'):
+        st.session_state.pop(key,None)
+    st.session_state['_remember_checked']=True
+
+
+def delete_user_account(target_id):
+    """Borra solo la cuenta y sus permisos, nunca proyectos ni archivos."""
+    require_admin()
+    target_id=int(target_id)
+    actor=int(st.session_state['user_id'])
+    if target_id==actor:
+        raise ValueError('No puedes eliminar tu propia cuenta de Administrador.')
+    with connection() as con:
+        r=con.execute('SELECT username,role,active FROM users WHERE id=?',(target_id,)).fetchone()
+        if not r:raise ValueError('El usuario ya no existe.')
+        if r['role']=='Administrador' and r['active']:
+            remaining=con.execute("SELECT COUNT(*) FROM users WHERE role='Administrador' AND active=1").fetchone()[0]
+            if remaining<=1:raise ValueError('Debe quedar al menos un administrador activo.')
+        con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(target_id,))
+        con.execute('DELETE FROM client_access WHERE user_id=?',(target_id,))
+        con.execute('DELETE FROM users WHERE id=?',(target_id,))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+            ('Usuarios',r['username'],f'Cuenta eliminada por administrador ID {actor}'))
+    return r['username']
+
+
 def login_page():
     st.title('🔐 ALTIVIA | Acceso al sistema')
     st.caption('Ingrese sus credenciales para acceder a la gestión de proyectos.')
     with st.form('login_form'):
         username=st.text_input('Usuario').strip().lower()
         password=st.text_input('Contraseña',type='password')
+        remember=st.checkbox('Mantener sesión iniciada en este dispositivo (7 días)',value=True,
+            help='No usar en equipos públicos o compartidos. Cerrar sesión revoca el acceso guardado.')
         submitted=st.form_submit_button('Ingresar',type='primary')
     if submitted:
         if st.session_state.get('failed_logins',0)>=8:
@@ -198,6 +332,20 @@ def login_page():
             st.session_state['user_id']=r['id'];st.session_state['role']=r['role']
             st.session_state['username']=r['username'];st.session_state['full_name']=r['full_name']
             st.session_state['failed_logins']=0
+            if remember:
+                try:
+                    new_token=issue_remember_token(r['id'],r['password_hash'])
+                    write_remember_cookie(new_token)
+                    st.session_state['_remember_token']=new_token
+                except Exception:
+                    # No impide usar la app: solo desactiva recordar sesión.
+                    if 'new_token' in locals():clear_remember_token(new_token)
+                    st.warning('Ingresaste correctamente, pero no se pudo activar «Mantener sesión».')
+            else:
+                clear_remember_token(remembered_cookie_value())
+                try:delete_remember_cookie()
+                except Exception:pass
+                st.session_state.pop('_remember_token',None)
             st.rerun()
         else:
             st.session_state['failed_logins']=st.session_state.get('failed_logins',0)+1
@@ -240,8 +388,36 @@ def user_management():
                         count=con.execute("SELECT COUNT(*) FROM users WHERE role='Administrador' AND active=1").fetchone()[0]
                         if count<=1:st.error('Debe quedar al menos un administrador activo.');return
                     con.execute('UPDATE users SET role=?, active=? WHERE id=?',(new_role,int(active),selected))
-                    if reset:con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(reset),selected))
+                    if reset:
+                        con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(reset),selected))
+                    if reset or new_role!=r['role'] or not active:
+                        # Un cambio de privilegios también anula accesos recordados.
+                        con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(selected,))
                 st.success('Acceso actualizado');st.rerun()
+    st.divider()
+    st.subheader('🗑️ Eliminar usuario')
+    with st.expander('Eliminar una cuenta de forma permanente'):
+        st.warning('Se eliminará la cuenta y sus autorizaciones; no se borrarán proyectos, entregables ni documentos en Google Drive.')
+        candidates=[int(i) for i in users.id.tolist() if int(i)!=int(st.session_state['user_id'])]
+        if not candidates:
+            st.info('No hay otros usuarios que se puedan eliminar.')
+        else:
+            target=st.selectbox('Usuario a eliminar',candidates,key='user_delete_select',
+                format_func=lambda i: f"{users.loc[users.id==i,'full_name'].iloc[0]} · {users.loc[users.id==i,'username'].iloc[0]}")
+            target_username=str(users.loc[users.id==target,'username'].iloc[0])
+            with st.form(f'user_delete_confirm_{target}'):
+                typed=st.text_input(f'Escribe el usuario «{target_username}» para confirmar')
+                confirmed=st.checkbox('Comprendo que esta cuenta dejará de tener acceso inmediatamente')
+                clicked=st.form_submit_button('🗑️ Eliminar usuario definitivamente',type='primary')
+            if clicked:
+                if not confirmed or typed.strip()!=target_username:
+                    st.error('Escribe el nombre de usuario exacto y marca la confirmación.')
+                else:
+                    try:
+                        removed=delete_user_account(target)
+                        st.success(f'Usuario {removed} eliminado. Sus sesiones se revocaron.')
+                        st.rerun()
+                    except (ValueError, sqlite3.Error) as exc:st.error(str(exc))
     client_permissions_ui()
 
 def client_permissions_ui():
@@ -622,7 +798,11 @@ def my_account():
                 elif len(new)<6 or new!=confirm:st.error('La nueva contraseña no cumple los requisitos o no coincide.')
                 else:
                     con.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_password(new),st.session_state['user_id']))
-                    st.success('Contraseña actualizada.')
+                    con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(st.session_state['user_id'],))
+                    st.session_state.pop('_remember_token',None)
+                    try:delete_remember_cookie()
+                    except Exception:pass
+                    st.success('Contraseña actualizada. Los accesos recordados quedaron revocados; al recargar deberás ingresar nuevamente.')
 
 def df(table):
     with connection() as con: return pd.read_sql_query(f'SELECT * FROM {table} ORDER BY id DESC',con)
@@ -1817,6 +1997,7 @@ def main():
     if not initialize_auth():
         st.error('Configuración inicial: establezca ALTIVIA_ADMIN_PASSWORD (mínimo 6 caracteres) antes de iniciar la aplicación. Consulte README_SEGURIDAD.txt.')
         st.stop()
+    restore_remembered_login()
     if 'user_id' in st.session_state:
         with connection() as con:
             current=con.execute('SELECT username,full_name,role,active FROM users WHERE id=?',(st.session_state['user_id'],)).fetchone()
@@ -1832,7 +2013,7 @@ def main():
         st.caption('Ingeniería · Consultoría · Planos')
         st.caption(f"{st.session_state['full_name']} · {st.session_state['role']}")
         if st.button('Cerrar sesión'):
-            for key in ('user_id','role','username','full_name','client_preview'):st.session_state.pop(key,None)
+            end_login_session()
             st.rerun()
         pages=['Mis documentos','Mi cuenta'] if st.session_state.get('role')=='Cliente' else ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta']
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
