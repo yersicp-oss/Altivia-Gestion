@@ -754,25 +754,103 @@ def card_browser(module, frame, allow_version_edit=True):
 
 
 def versions_for_delivery(code,allow_edit=False):
+    """Historial por tarjetas; permisos: Admin gestiona, Consulta solo visualiza PDF."""
     with connection() as con:
+        delivery=con.execute('SELECT id,version,name FROM deliverables WHERE code=?',(code,)).fetchone()
         rows=[dict(r) for r in con.execute('SELECT id,version,registered_at,notes FROM versions WHERE delivery_code=? ORDER BY id DESC',(code,)).fetchall()]
-    st.markdown('**Historial de versiones**')
-    if not rows:st.caption('Todavía no se han registrado versiones.')
+    if not delivery:
+        st.info('Entregable no disponible.');return
+    did=int(delivery['id'])
+    st.markdown('**📚 Versiones del entregable**')
+    if not rows:
+        st.caption('Aún no hay versiones registradas.');return
+    is_admin=allow_edit and can_edit()
     for v in rows:
-        st.markdown(f'**{escape(str(v["version"]))}** · {escape(str(v["registered_at"]))}')
-        st.caption(v['notes'] or 'Sin descripción')
-    if not allow_edit:return
-    if allow_edit:st.caption('Para emitir otra versión, usa «Crear o editar registro» y selecciona «Registrar nueva versión».')
-    if rows and allow_edit:
-        selected=st.selectbox('Versión cuya descripción quieres editar',[r['id'] for r in rows],format_func=lambda i:next(r['version'] for r in rows if r['id']==i),key='ver_selected_'+str(code))
-        original=next(r for r in rows if r['id']==selected)
-        with st.form('edit_version_'+str(code)+'_'+str(selected)):
-            revised=st.text_area('Editar descripción',value=original['notes'] or '')
-            if st.form_submit_button('Guardar descripción'):
-                with connection() as con:
-                    con.execute('UPDATE versions SET notes=? WHERE id=? AND delivery_code=?',(revised,selected,code))
-                    con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Descripción '+original['version']+' editada'))
-                st.success('Descripción actualizada');st.rerun()
+        ver=str(v['version']); vid=int(v['id'])
+        docs=drive_file_info(did,ver)
+        with st.container(border=True):
+            col1,col2=st.columns([4,1])
+            with col1:st.markdown(f'**📄 {escape(ver)}** · {escape(str(v["registered_at"]))}')
+            with col2:
+                if ver==delivery['version']:st.caption('Versión vigente')
+            if is_admin:
+                st.caption(v['notes'] or 'Sin descripción')
+            pdf=docs.get('pdf')
+            if pdf:
+                if st.button('👁 Visualizar PDF',key=f'v_pdf_{did}_{vid}'):
+                    key=f'version_pdf_open_{did}'
+                    st.session_state[key]=None if st.session_state.get(key)==vid else vid
+                if st.session_state.get(f'version_pdf_open_{did}')==vid:
+                    try:
+                        payload=drive_bytes(pdf['file_id'])
+                        if not payload.startswith(b'%PDF-'):raise ValueError('El archivo no es un PDF válido.')
+                        internal_pdf_preview(payload)
+                        if is_admin:
+                            st.download_button('⬇ Descargar PDF',payload,file_name=pdf['filename'],mime='application/pdf',key=f'v_pdf_dl_{vid}')
+                    except Exception as exc:st.error(f'No se pudo visualizar el PDF: {exc}')
+            else:st.caption('Esta versión aún no tiene PDF.')
+            if not is_admin:continue
+            with st.expander(f'✏️ Administrar {ver}',expanded=False):
+                with st.form(f'ver_edit_{did}_{vid}'):
+                    new_note=st.text_area('Descripción de la revisión',value=v['notes'] or '',key=f'ver_note_{vid}')
+                    new_pdf=st.file_uploader('Sustituir o añadir PDF',type=['pdf'],key=f'ver_pdf_upload_{vid}')
+                    new_edit=st.file_uploader('Sustituir o añadir DWG / Word',type=['dwg','doc','docx'],key=f'ver_edit_upload_{vid}')
+                    if 'editable' in docs:st.caption('Editable actual: '+docs['editable']['filename'])
+                    if st.form_submit_button('💾 Guardar cambios de esta versión'):
+                        try:
+                            if (new_pdf or new_edit) and not drive_ready():raise ValueError('Google Drive no está autorizado.')
+                            for kind,item in (('pdf',new_pdf),('editable',new_edit)):
+                                if item:drive_upload(item,did,code,ver,kind)
+                            with connection() as con:
+                                con.execute('UPDATE versions SET notes=? WHERE id=? AND delivery_code=?',(new_note,vid,code))
+                                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Actualización de '+ver))
+                            st.success('Versión actualizada.');st.rerun()
+                        except Exception as exc:st.error(f'No se guardó completamente: {exc}')
+                st.divider()
+                st.markdown('**Eliminar archivos de esta versión**')
+                for kind,label in [('pdf','PDF'),('editable','Archivo editable')]:
+                    if kind in docs:
+                        if st.button('🗑 Eliminar '+label,key=f'ver_rm_{vid}_{kind}'):
+                            st.session_state[f'ver_confirm_file_{vid}_{kind}']=True
+                        if st.session_state.get(f'ver_confirm_file_{vid}_{kind}'):
+                            st.warning('Esta acción elimina el archivo de Google Drive. No se puede deshacer.')
+                            if st.button('Confirmar eliminación de '+label,key=f'ver_confirm_rm_{vid}_{kind}'):
+                                try:
+                                    drive_delete_document(docs[kind]['file_id'])
+                                    with connection() as con:
+                                        con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=? AND kind=?',(did,ver,kind))
+                                        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,f'Eliminado {kind} de {ver}'))
+                                    st.session_state.pop(f'ver_confirm_file_{vid}_{kind}',None)
+                                    st.rerun()
+                                except Exception as exc:st.error(f'No se pudo eliminar: {exc}')
+                if st.button('🗑 Eliminar versión '+ver,key=f'ver_delete_{vid}'):
+                    st.session_state[f'ver_confirm_{vid}']=True
+                if st.session_state.get(f'ver_confirm_{vid}'):
+                    st.error('Se eliminará la versión y sus archivos. Esta acción no se puede deshacer.')
+                    if st.button('Confirmar eliminación definitiva de '+ver,key=f'ver_del_confirm_{vid}'):
+                        try:
+                            # Se conservan las demás versiones; si es la vigente se activa la más reciente restante.
+                            for document in docs.values():drive_delete_document(document['file_id'])
+                            with connection() as con:
+                                con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=?',(did,ver))
+                                con.execute('DELETE FROM delivery_files WHERE delivery_id=? AND version=?',(did,ver))
+                                con.execute('DELETE FROM versions WHERE id=? AND delivery_code=?',(vid,code))
+                                remaining=con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC LIMIT 1',(code,)).fetchone()
+                                if delivery['version']==ver:
+                                    con.execute('UPDATE deliverables SET version=? WHERE id=?',(remaining['version'] if remaining else '',did))
+                                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Eliminación de '+ver))
+                            st.session_state.pop(f'ver_confirm_{vid}',None)
+                            st.rerun()
+                        except Exception as exc:st.error(f'No se pudo eliminar la versión: {exc}')
+
+
+def drive_delete_document(file_id):
+    """Borrado remoto solo para archivos previamente vinculados al entregable."""
+    require_admin()
+    response=requests.delete('https://www.googleapis.com/drive/v3/files/'+quote(file_id,safe=''),
+        headers={'Authorization':'Bearer '+drive_token()},timeout=45)
+    if response.status_code not in (200,204,404):
+        raise ValueError(f'Google Drive rechazó la eliminación (HTTP {response.status_code}).')
 
 
 def edit_module(module,data):
