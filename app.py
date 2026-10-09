@@ -578,20 +578,68 @@ def edit_module(module,data):
         else:st.info('No hay registros todavía. Usa el formulario para crear el primero.')
 
 def add_examples():
+    """Carga ejemplos de los módulos vigentes, sin duplicar ni borrar datos.
+
+    Una sola transacción: si algo falla no queda una demostración incompleta.
+    Los registros de ejemplo preexistentes se respetan sin sobrescribirlos.
+    """
     require_admin()
-    with connection() as con:
-        if con.execute('SELECT COUNT(*) FROM projects').fetchone()[0]:raise ValueError('Solo se pueden cargar los ejemplos si aún no existen proyectos.')
     d=lambda n:(date.today()+timedelta(days=n)).isoformat()
-    for item in [dict(code='Andrea Torres (EJEMPLO)',name='Andrea Torres (EJEMPLO)',role='Jefe de Proyecto',specialty='Coordinación',capacity=4,status='Disponible'),dict(code='Luis Vega (EJEMPLO)',name='Luis Vega (EJEMPLO)',role='Ingeniero',specialty='Estructuras',capacity=3,status='Disponible'),dict(code='María Rojas (EJEMPLO)',name='María Rojas (EJEMPLO)',role='Modelador BIM',specialty='BIM',capacity=2,status='Disponible')]:
-        save_record('Personal',{k:item.get(k) for k,_,_,_,_ in SPECS['Personal'][1]})
-    save_record('Proyectos',dict(code='PR-EX-001',name='Proyecto Ejemplo - Edificio Multifamiliar (EJEMPLO)',client='Cliente ficticio',type='Expediente técnico',location='Lima - Perú',manager='Andrea Torres (EJEMPLO)',start_date=d(-20),due_date=d(12),status='En desarrollo',priority='Alta',notes='REGISTRO FICTICIO - reemplazar para producción'))
-    tasks=[('T-EX-001','Arquitectura','Plantas y elevaciones', 'Andrea Torres (EJEMPLO)',-4,65,'En desarrollo',0),('T-EX-002','Estructuras','Planos de cimentación','Luis Vega (EJEMPLO)',3,80,'En revisión',0),('T-EX-003','BIM','Compatibilización de interferencias','María Rojas (EJEMPLO)',6,25,'En desarrollo',0),('T-EX-004','Eléctricas','Circuitos y tableros','Andrea Torres (EJEMPLO)',10,0,'No iniciado',0),('T-EX-005','Sanitarias','Redes de agua y desagüe','Luis Vega (EJEMPLO)',-2,100,'Aprobado',0)]
-    for code,sp,activity,owner,due,progress,status,blocked in tasks:
-        save_record('Plan de trabajo',dict(code=code,project_code='PR-EX-001',specialty=sp,activity=activity,delivery_code='',owner=owner,reviewer='Andrea Torres (EJEMPLO)',start_date=d(-18),due_date=d(due),progress=progress,status=status,priority='Alta' if due<0 else 'Media',updated_at=d(0),notes='EJEMPLO'))
-    for code,sp,name,owner,due,status,obs in [('E-EX-001','Arquitectura','Planta arquitectónica','Andrea Torres (EJEMPLO)',-2,'Con observaciones',3),('E-EX-002','Estructuras','Cimentaciones','Luis Vega (EJEMPLO)',4,'En revisión interna',1),('E-EX-003','BIM','Modelo federado','María Rojas (EJEMPLO)',8,'En desarrollo',0)]:
-        save_record('Entregables',dict(code=code,project_code='PR-EX-001',drawing_code=code.replace('E-EX','PL-EX'),name=name,specialty=sp,owner=owner,reviewer='Andrea Torres (EJEMPLO)',version='V01',due_date=d(due),actual_date=None,status=status,review_date=d(-1) if obs else None,correction_date=None,approval_date=None,notes='EJEMPLO',file_path=''))
-    save_record('Control de cambios',dict(code='C-EX-001',project_code='PR-EX-001',request_date=d(-2),requester='Cliente ficticio',description='Cambio de distribución de ambientes',reason='Nueva necesidad del cliente',specialty='Arquitectura',affected_drawings='PL-EX-001',owner='Andrea Torres (EJEMPLO)',schedule_impact='Alto',new_due_date=d(16),approved_by='',approval_date=None,status='Solicitado',notes='EJEMPLO'))
-    save_record(dict(code='R-EX-001',meeting_date=d(-4),project_code='PR-EX-001',meeting_type='Coordinación',participants='Equipo técnico',topic='Interferencias BIM',problem='Cruce de instalaciones',agreement='Validar y corregir interferencias detectadas',owner='María Rojas (EJEMPLO)',due_date=d(-1),status='Pendiente',notes='EJEMPLO'))
+    people=[
+        dict(code='Andrea Torres (EJEMPLO)', role='Jefe de Proyecto', specialty='Coordinación', email='', phone='', status='Disponible', notes='REGISTRO FICTICIO'),
+        dict(code='Luis Vega (EJEMPLO)', role='Ingeniero', specialty='Estructuras', email='', phone='', status='Disponible', notes='REGISTRO FICTICIO'),
+        dict(code='María Rojas (EJEMPLO)', role='Modelador BIM', specialty='BIM', email='', phone='', status='Disponible', notes='REGISTRO FICTICIO'),
+    ]
+    records={
+        'Personal':people,
+        'Proyectos':[
+            dict(code='PR-EX-001',name='Proyecto Ejemplo - Edificio Multifamiliar (EJEMPLO)',client='Cliente ficticio',type='Expediente técnico',location='Lima - Perú',manager='Andrea Torres (EJEMPLO)',start_date=d(-20),due_date=d(12),status='En desarrollo',priority='Alta',notes='REGISTRO FICTICIO - reemplazar para producción')
+        ],
+        'Plan de trabajo':[
+            dict(code=code,project_code='PR-EX-001',specialty=sp,activity=activity,delivery_code='',owner=owner,reviewer='Andrea Torres (EJEMPLO)',start_date=d(-18),due_date=d(due),progress=progress,status=status,priority='Alta' if due<0 else 'Media',updated_at=d(0),notes='EJEMPLO')
+            for code,sp,activity,owner,due,progress,status in [
+                ('T-EX-001','Arquitectura','Plantas y elevaciones','Andrea Torres (EJEMPLO)',-4,65,'En desarrollo'),
+                ('T-EX-002','Estructuras','Planos de cimentación','Luis Vega (EJEMPLO)',3,80,'En revisión'),
+                ('T-EX-003','BIM','Compatibilización de interferencias','María Rojas (EJEMPLO)',6,25,'En desarrollo'),
+                ('T-EX-004','Eléctricas','Circuitos y tableros','Andrea Torres (EJEMPLO)',10,0,'No iniciado'),
+                ('T-EX-005','Sanitarias','Redes de agua y desagüe','Luis Vega (EJEMPLO)',-2,100,'Aprobado')
+            ]
+        ],
+        'Entregables':[
+            dict(code=code,project_code='PR-EX-001',drawing_code=code.replace('E-EX','PL-EX'),name=name,specialty=sp,owner=owner,reviewer='Andrea Torres (EJEMPLO)',version='V01',due_date=d(due),actual_date=None,status=status,review_date=d(-1) if obs else None,correction_date=None,approval_date=None,notes='EJEMPLO',file_path='')
+            for code,sp,name,owner,due,status,obs in [
+                ('E-EX-001','Arquitectura','Planta arquitectónica','Andrea Torres (EJEMPLO)',-2,'Con observaciones',True),
+                ('E-EX-002','Estructuras','Cimentaciones','Luis Vega (EJEMPLO)',4,'En revisión interna',True),
+                ('E-EX-003','BIM','Modelo federado','María Rojas (EJEMPLO)',8,'En desarrollo',False)
+            ]
+        ],
+        'Control de cambios':[
+            dict(code='C-EX-001',project_code='PR-EX-001',request_date=d(-2),requester='Cliente ficticio',description='Cambio de distribución de ambientes',reason='Nueva necesidad del cliente',specialty='Arquitectura',affected_drawings='PL-EX-001',owner='Andrea Torres (EJEMPLO)',schedule_impact='Alto',new_due_date=d(16),approved_by='',approval_date=None,status='Solicitado',notes='EJEMPLO')
+        ],
+    }
+    inserted=0
+    # Evitar sobrescribir registros reales; cada registro ficticio tiene un código fijo.
+    with connection() as con:
+        for module,entries in records.items():
+            table,fields=SPECS[module]
+            valid_columns={field[0] for field in fields}
+            if module=='Personal':valid_columns.add('name')
+            for item in entries:
+                code=item['code']
+                if con.execute(f'SELECT 1 FROM {table} WHERE code=?',(code,)).fetchone():
+                    continue
+                values={k:v for k,v in item.items() if k in valid_columns}
+                if module=='Personal':values['name']=code
+                cols=list(values)
+                columns_sql=', '.join('"'+k+'"' for k in cols)
+                marks=', '.join('?' for _ in cols)
+                con.execute(f'INSERT INTO {table} ({columns_sql}) VALUES ({marks})',[values[k] for k in cols])
+                if module=='Entregables':
+                    con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES(?,?,?,?)',
+                                (code,item['version'],date.today().isoformat(),'Versión de ejemplo'))
+                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',(module,code,'Alta de ejemplo'))
+                inserted+=1
+    return inserted
 
 def priorities(data):
     t=data['Plan de trabajo'];e=data['Entregables'];p=data['Proyectos'];c=data['Control de cambios']
@@ -797,10 +845,12 @@ def main():
         with open(backup_path,'rb') as f:backup=f.read()
         st.download_button('💾 Descargar respaldo íntegro (.db)',data=backup,file_name=f'ALTIVIA_respaldo_{TODAY.isoformat()}.db',mime='application/octet-stream')
         st.warning('El Excel exportado sirve para reportes. La base SQLite es la fuente principal: conserva versiones y checklists. No edite la base mientras la aplicación está abierta.')
-        if not len(data['Proyectos']):
-            if st.button('Cargar datos ficticios de demostración'):
-                try:add_examples();st.success('Ejemplos creados');st.rerun()
-                except ValueError as exc:st.error(str(exc))
+        if st.button('Cargar / completar datos ficticios de demostración'):
+            try:
+                n=add_examples()
+                st.success(f'{n} registros de ejemplo incorporados. Los que ya existían se conservaron sin duplicar.')
+                st.rerun()
+            except (ValueError, sqlite3.Error) as exc:st.error(f'No se pudieron cargar los ejemplos: {exc}')
         st.subheader('Bitácora de actividad');st.dataframe(df('audit').head(100),hide_index=True,use_container_width=True)
         reset_database_ui()
         st.caption('Esta instalación usa SQLite local: no la publique en Streamlit Community Cloud para datos reales. Para varios usuarios, migre a PostgreSQL y alojamiento privado.')
