@@ -450,10 +450,11 @@ def drive_upload(upload,delivery_id,code,version,kind,allow_new_consulta=False):
     mime= 'application/pdf' if kind=='pdf' else 'application/octet-stream'
     safe_code=re.sub(r'[^A-Za-z0-9_-]','_',code)
     with connection() as con:
-        prow=con.execute('SELECT project_code FROM deliverables WHERE id=? AND code=?',(delivery_id,code)).fetchone()
-    if not prow:raise ValueError('No se encontró el entregable registrado.')
-    safe_project=re.sub(r'[^A-Za-z0-9_-]','_',prow['project_code'] or '')
-    filename=f'{safe_project}_{safe_code}_{version}.{ext}'
+        exists=con.execute('SELECT 1 FROM deliverables WHERE id=? AND code=?',(delivery_id,code)).fetchone()
+    if not exists:raise ValueError('No se encontró el entregable registrado.')
+    # NUNCA anteponer el proyecto ni su nombre: el ID Entregable ya es completo.
+    # Ej.: 202607_ARQ-001_V01.pdf y 202607_ARQ-001_V01.dwg
+    filename=f'{safe_code}_{version}.{ext}'
     token=drive_token()
     version_folder_id=drive_delivery_folder(token,delivery_id,code,version)
     metadata={'name':filename,'parents':[version_folder_id], 'description':f'ALTIVIA {code} {version} {kind}'}
@@ -721,14 +722,14 @@ def update_project_sync(values,record_id):
                 if target_id and target_id!=old_folder_id:
                     raise ValueError('Ya existe una carpeta con el nuevo nombre. No se modificó el proyecto para evitar mezclar archivos.')
                 to_rename.append((old_folder_id,project_old_folder,project_new_folder))
-            # Los archivos ya estaban identificados por entregable, no por proyecto.
-            # Al cambiar el código asignamos un prefijo consistente, sin alterar el ID de Drive.
+            # Los archivos se nombran solo con ID Entregable + versión, nunca con
+            # el nombre del proyecto. Mantener inmutables los IDs de entregables
+            # existentes protege sus vínculos y los contadores históricos.
             if old_code!=new_code or old_name!=new_name:
                 for f in remote:
                     ext=f['filename'].rsplit('.',1)[-1].lower() if '.' in f['filename'] else 'bin'
-                    safe_project=re.sub(r'[^A-Za-z0-9_-]','_',new_code)
                     safe_delivery=re.sub(r'[^A-Za-z0-9_-]','_',f['delivery_code'])
-                    target=f'{safe_project}_{safe_delivery}_{f["version"]}.{ext}'
+                    target=f'{safe_delivery}_{f["version"]}.{ext}'
                     if target!=f['filename']:
                         to_rename.append((f['file_id'],f['filename'],target))
     changes=[]
@@ -879,6 +880,13 @@ def delete_selected(module,ids):
                 con.execute(f'DELETE FROM versions WHERE delivery_code IN ({dm})',dc)
                 con.execute(f'DELETE FROM checklist WHERE delivery_code IN ({dm})',dc)
             con.execute(f'DELETE FROM delivery_files WHERE delivery_id IN (SELECT id FROM deliverables WHERE project_code IN ({pm}))',codes)
+            # La eliminación de un PROYECTO elimina también sus catálogos y sus
+            # contadores (no solo los que tenían una entrega registrada).
+            all_catalog_codes=[r[0] for r in con.execute(f'SELECT code FROM deliverable_catalog WHERE project_code IN ({pm})',codes)]
+            all_counter_codes=list(dict.fromkeys(all_catalog_codes+dc))
+            if all_counter_codes:
+                cm=','.join('?' for _ in all_counter_codes)
+                con.execute(f'DELETE FROM version_counters WHERE delivery_code IN ({cm})',all_counter_codes)
             con.execute(f'DELETE FROM deliverable_catalog WHERE project_code IN ({pm})',codes)
             for linked in ('tasks','deliverables','changes','meetings'):
                 con.execute(f'DELETE FROM {linked} WHERE project_code IN ({pm})',codes)
@@ -1145,6 +1153,27 @@ def project_editor(data):
     if can_edit():bulk_delete_ui('Proyectos',data)
 
 
+def build_deliverable_id(project_code,admin_code):
+    """ID estable: prefijo obligatorio del proyecto + código dado por el Admin.
+
+    La convención se aplica a nuevas altas, no reescribe entregables anteriores.
+    """
+    project=str(project_code or '').strip()
+    suffix=str(admin_code or '').strip().upper()
+    if not project:
+        raise ValueError('Selecciona un ID Proyecto antes de registrar el entregable.')
+    if not suffix:
+        raise ValueError('Escribe el código del entregable, por ejemplo ARQ-001.')
+    if not re.fullmatch(r'[A-Z0-9][A-Z0-9_-]*',suffix):
+        raise ValueError('El código adicional solo permite letras, números, guiones y guiones bajos.')
+    if suffix.startswith(project.upper()+'_'):
+        raise ValueError('Escribe solo el código adicional; el ID Proyecto se agrega automáticamente.')
+    full=f'{project}_{suffix}'
+    if len(full)>120:
+        raise ValueError('El ID Entregable supera los 120 caracteres.')
+    return full
+
+
 def catalog_rows():
     with connection() as con:
         return [dict(r) for r in con.execute('''SELECT c.*,p.name AS project_name,
@@ -1161,6 +1190,14 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
     with connection() as con:
         previous=con.execute('SELECT * FROM deliverable_catalog WHERE id=?',(catalog_id,)).fetchone()
         if previous is None:raise ValueError('El entregable de catálogo ya no existe.')
+        # Los IDs creados antes de esta convención se mantienen intactos.
+        # Si el Admin cambia un ID, el nuevo debe incluir el prefijo del proyecto.
+        if code!=previous['code'] or project_code!=previous['project_code']:
+            prefix=project_code+'_'
+            if not code.startswith(prefix):
+                raise ValueError('El ID Entregable debe iniciar con el ID Proyecto y un guion bajo: '+prefix)
+            if build_deliverable_id(project_code,code[len(prefix):])!=code:
+                raise ValueError('El ID Entregable debe seguir el formato del proyecto y código adicional.')
         current=con.execute('SELECT * FROM deliverables WHERE code=?',(previous['code'],)).fetchone()
         history=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',
                             (previous['code'],)).fetchone()
@@ -1206,10 +1243,11 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
 def catalog_delete(catalog_id):
     """Elimina la programación sin bloquearla por versiones antiguas eliminadas.
 
-    No borra entregas activas, tareas ni archivos de Drive. Los contadores históricos
-    se conservan para no reutilizar V01/V02 si se vuelve a dar de alta el mismo ID.
-    Se limpian exclusivamente las versiones/checklists huérfanos de un código que
-    ya no tiene una entrega activa, evitando que reaparezcan al reutilizar el código.
+    No borra entregas activas, tareas ni archivos de Drive. Borra el contador
+    histórico ÚNICAMENTE de este entregable completo, permitiendo que un nuevo
+    entregable con el mismo ID comience en V01. Al borrar solo una versión, el
+    contador se sigue conservando (next_version y version_counters no cambian).
+    También limpia versiones/checklists locales huérfanos de ese código.
     """
     require_admin()
     with connection() as con:
@@ -1227,16 +1265,17 @@ def catalog_delete(catalog_id):
         if con.execute('SELECT 1 FROM tasks WHERE delivery_code=? LIMIT 1',(code,)).fetchone():
             raise ValueError('Existen tareas vinculadas a este ID. Desvincúlalas en Plan de trabajo '
                              'antes de borrar la programación; las versiones históricas no bloquean.')
-        # No hay entrega activa: son filas históricas sueltas; se limpia su relación
-        # al catálogo, pero se deja el máximo de versión en version_counters.
+        # No hay entrega activa: se limpian referencias locales y el contador
+        # solo de ESTE ID; no afecta a versiones ni a contadores de otros IDs.
         versions_deleted=con.execute('DELETE FROM versions WHERE delivery_code=?',(code,)).rowcount
         checks_deleted=con.execute('DELETE FROM checklist WHERE delivery_code=?',(code,)).rowcount
+        counter_deleted=con.execute('DELETE FROM version_counters WHERE delivery_code=?',(code,)).rowcount
         con.execute('DELETE FROM deliverable_catalog WHERE id=?',(int(catalog_id),))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Catálogo entregables',code,
                      'Eliminado del proyecto '+item['project_code']+
                      f'; referencias históricas locales limpiadas: {versions_deleted} versiones, {checks_deleted} checks; '
-                     'contador conservado; sin cambios en Google Drive'))
+                     f'contador histórico del entregable retirado: {counter_deleted}; sin cambios en Google Drive'))
     return code
 
 
@@ -1250,23 +1289,34 @@ def delivery_catalog_admin_ui():
     if not projects:
         st.warning('Primero crea un proyecto en el módulo Proyectos.');return
     project_names={p['code']:p['name'] for p in projects}
+    # Fuera del formulario para actualizar en vivo el ID cuando cambia el proyecto
+    # o el sufijo escrito por el administrador.
+    pr=st.selectbox('ID Proyecto *',list(project_names),
+        format_func=lambda c:f'{c} — {project_names[c]}',key='catalog_new_project')
+    suffix=st.text_input('Código adicional del entregable *',placeholder='Ej.: ARQ-001',
+        help='ALTIVIA antepone automáticamente el ID Proyecto. Escribe solo el código adicional.',
+        key='catalog_new_suffix').strip()
+    code=f'{pr}_{suffix.upper()}' if suffix else f'{pr}_'
+    st.text_input('ID Entregable (automático)',value=code,disabled=True,
+        help='Este es el identificador que se guardará. Ej.: 202607_ARQ-001.')
     with st.form('catalog_create_form'):
-        pr=st.selectbox('ID Proyecto',list(project_names),format_func=lambda c:f'{c} — {project_names[c]}')
-        code=st.text_input('ID Entregable *',placeholder='Ej.: ARQ-001').strip()
         name=st.text_input('Nombre del entregable *',placeholder='Ej.: Plantas arquitectónicas').strip()
         specialty=st.selectbox('Especialidad',['']+SPECIALTIES)
-        due=st.date_input('Fecha de Presentación Final *',value=date.today(),format='DD/MM/YYYY')
+        due=st.date_input('Fecha de Presentación Final *',value=today_peru(),format='DD/MM/YYYY')
         if st.form_submit_button('➕ Registrar entregable',type='primary'):
             try:
-                if not code or not name:raise ValueError('Indica el ID y nombre del entregable.')
+                code=build_deliverable_id(pr,suffix)
+                if not name:raise ValueError('Indica el nombre del entregable.')
                 with connection() as con:
+                    if not con.execute('SELECT 1 FROM projects WHERE code=?',(pr,)).fetchone():
+                        raise ValueError('El proyecto seleccionado ya no existe.')
                     con.execute('''INSERT INTO deliverable_catalog(project_code,code,name,specialty,final_due_date)
                         VALUES(?,?,?,?,?)''',(pr,code,name,specialty,due.isoformat()))
                     con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                         ('Catálogo entregables',code,'Alta en proyecto '+pr))
                 st.success('Entregable añadido al catálogo. Ya puede seleccionarse desde Consulta.');st.rerun()
             except sqlite3.IntegrityError:
-                st.error('Ese ID de entregable ya existe. Utiliza un ID único en ALTIVIA.')
+                st.error('Ese ID de entregable ya existe. Utiliza otro código adicional.')
             except ValueError as exc:st.error(str(exc))
     catalog=catalog_rows()
     st.caption(f'{len(catalog)} entregable(s) programado(s)')
@@ -1315,7 +1365,9 @@ def delivery_catalog_admin_ui():
                     with st.container(border=True):
                         st.warning(f'¿Eliminar la programación {item["code"]} del proyecto {item["project_code"]}? '
                                    'No se borrarán archivos de Google Drive ni otros entregables. '
-                                   'El historial de numeración permanece reservado.')
+                                   'Se reiniciará el contador histórico de este ID, pero no el de los demás. '
+                                   'Si luego reutilizas el mismo ID, revisa o archiva sus archivos antiguos en Drive '
+                                   'para evitar documentos con nombres duplicados.')
                         confirm=st.checkbox(
                             f'Confirmo eliminar el entregable {item["code"]}',
                             key=f'catalog_del_confirm_{item["id"]}')
