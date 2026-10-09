@@ -9,9 +9,6 @@ import secrets
 import tempfile
 import re
 import base64
-import requests
-import msal
-from urllib.parse import quote
 from contextlib import contextmanager
 from datetime import date, timedelta, datetime
 import pandas as pd
@@ -76,6 +73,17 @@ def initialize():
         con.execute('CREATE TABLE IF NOT EXISTS checklist (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, criterion TEXT NOT NULL, result TEXT NOT NULL DEFAULT "PENDIENTE", notes TEXT, UNIQUE(delivery_code,criterion))')
         con.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT DEFAULT CURRENT_TIMESTAMP, module TEXT, record_code TEXT, action TEXT)')
         # Compatibilidad: conservar datos de instalaciones anteriores.
+        con.execute('''CREATE TABLE IF NOT EXISTS delivery_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_id INTEGER NOT NULL,
+            version TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('pdf','editable')),
+            filename TEXT NOT NULL,
+            content BLOB NOT NULL,
+            uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(delivery_id,version,kind),
+            FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE
+        )''')
         con.execute('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_code)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_deliveries_project ON deliverables(project_code)')
 
@@ -213,55 +221,6 @@ def client_permissions_ui():
         st.success('Permisos actualizados.');st.rerun()
 
 
-def graph_settings():
-    """Secrets only: never store credentials in the database or repository."""
-    try:
-        conf=st.secrets.get('microsoft_graph',{})
-        return {k:str(conf.get(k,'')).strip() for k in ('tenant_id','client_id','client_secret')}
-    except Exception:
-        return {}
-
-
-def graph_pdf(reference):
-    """Fetch a private PDF server-side; never disclose the Graph app token or signed URL."""
-    match=re.fullmatch(r'graph://([A-Za-z0-9_.!~-]+)/([A-Za-z0-9_.!~-]+)',reference or '')
-    if not match:
-        raise ValueError('Referencia no válida. Use graph://ID_UNIDAD/ID_ARCHIVO (no un enlace público).')
-    cfg=graph_settings()
-    if not all(cfg.get(k) for k in ('tenant_id','client_id','client_secret')):
-        raise ValueError('Falta configurar [microsoft_graph] en los Secrets privados de Streamlit.')
-    app=msal.ConfidentialClientApplication(cfg['client_id'],authority='https://login.microsoftonline.com/'+cfg['tenant_id'],client_credential=cfg['client_secret'])
-    token=app.acquire_token_for_client(scopes=['https://graph.microsoft.com/.default'])
-    if 'access_token' not in token:
-        raise ValueError('Microsoft Graph rechazó la autenticación. Revise credenciales y consentimiento.')
-    drive,item=match.groups()
-    base=f'https://graph.microsoft.com/v1.0/drives/{quote(drive,safe="")}/items/{quote(item,safe="")}'
-    headers={'Authorization':'Bearer '+token['access_token']}
-    meta=requests.get(base,headers=headers,timeout=20)
-    if meta.status_code != 200:
-        raise ValueError(f'No se pudo consultar el archivo en Microsoft Graph (HTTP {meta.status_code}).')
-    info=meta.json()
-    if not str(info.get('name','')).lower().endswith('.pdf') or 'file' not in info:
-        raise ValueError('La vista integrada admite únicamente documentos PDF.')
-    limit=25*1024*1024
-    if int(info.get('size') or 0)>limit:
-        raise ValueError('El PDF supera el límite de 25 MB para visualización/descarga integrada.')
-    with requests.get(base+'/content',headers=headers,timeout=60,stream=True) as res:
-        if res.status_code!=200:
-            raise ValueError(f'No se pudo descargar el PDF desde Graph (HTTP {res.status_code}).')
-        chunks=[];size=0
-        for chunk in res.iter_content(256*1024):
-            if not chunk:continue
-            size+=len(chunk)
-            if size>limit:
-                raise ValueError('El PDF supera el límite de 25 MB.')
-            chunks.append(chunk)
-    data=b''.join(chunks)
-    if not data.startswith(b'%PDF-'):
-        raise ValueError('El archivo descargado no es un PDF válido.')
-    return data,info['name']
-
-
 def internal_pdf_preview(data):
     if hasattr(st,'pdf'):
         st.pdf(data,height=680)
@@ -271,6 +230,50 @@ def internal_pdf_preview(data):
         components.html('<iframe title="Plano PDF" src="data:application/pdf;base64,'+payload+'" style="width:100%;height:680px;border:0" loading="lazy"></iframe>',height=700,scrolling=False)
         st.caption('Si tu navegador bloquea el visor integrado, utiliza Descargar PDF.')
 
+
+MAX_UPLOAD_MB = 15
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+def file_info(delivery_id, version):
+    with connection() as con:
+        rows=con.execute('SELECT kind,filename,uploaded_at,length(content) AS size FROM delivery_files WHERE delivery_id=? AND version=?',(delivery_id,version)).fetchall()
+    return {r['kind']:dict(r) for r in rows}
+
+def file_bytes(delivery_id,version,kind):
+    with connection() as con:
+        r=con.execute('SELECT filename,content FROM delivery_files WHERE delivery_id=? AND version=? AND kind=?',(delivery_id,version,kind)).fetchone()
+    return (r['filename'],bytes(r['content'])) if r else None
+
+def upload_delivery_files(delivery_id,code,version):
+    require_admin()
+    st.markdown('**📎 Archivos de esta versión**')
+    existing=file_info(delivery_id,version)
+    pdf=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'pdf_{delivery_id}_{version}')
+    editable=st.file_uploader('Archivo editable para descargar (DWG, DOC o DOCX)',type=['dwg','doc','docx'],key=f'edit_{delivery_id}_{version}')
+    st.caption(f'Máximo {MAX_UPLOAD_MB} MB por archivo. Se guardan en la base de datos local; no subas documentos confidenciales a Streamlit Community Cloud.')
+    for kind,title in [('pdf','PDF'),('editable','Editable')]:
+        if kind in existing:st.caption(f'{title} actual: {existing[kind]["filename"]} · {existing[kind]["size"] / 1048576:.1f} MB')
+    if st.button('💾 Guardar archivos de esta versión',key=f'save_files_{delivery_id}_{version}'):
+        pending=[]
+        for kind,f in [('pdf',pdf),('editable',editable)]:
+            if f is None:continue
+            raw=f.getvalue()
+            if not raw or len(raw)>MAX_UPLOAD_BYTES:
+                st.error(f'{f.name}: archivo vacío o superior a {MAX_UPLOAD_MB} MB.');return
+            if kind=='pdf' and not raw.startswith(b'%PDF-'):
+                st.error('El PDF no tiene una cabecera válida.');return
+            ext=f.name.rsplit('.',1)[-1].lower() if '.' in f.name else ''
+            if (kind=='pdf' and ext!='pdf') or (kind=='editable' and ext not in ('dwg','doc','docx')):
+                st.error('Formato no permitido.');return
+            pending.append((kind,f.name,raw))
+        if not pending:st.info('Selecciona al menos un archivo para guardar.');return
+        with connection() as con:
+            for kind,name,raw in pending:
+                con.execute("""INSERT INTO delivery_files(delivery_id,version,kind,filename,content) VALUES (?,?,?,?,?)
+                    ON CONFLICT(delivery_id,version,kind) DO UPDATE SET filename=excluded.filename,content=excluded.content,uploaded_at=CURRENT_TIMESTAMP""",
+                    (delivery_id,version,kind,name,raw))
+            con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',('Archivos',code,'Archivos actualizados versión '+version))
+        st.success('Archivos guardados.');st.rerun()
 
 def client_portal():
     if st.session_state.get('role')!='Cliente':st.error('Acceso restringido.');st.stop()
@@ -300,7 +303,23 @@ def client_portal():
         sub=escape(str(r['project_code'] or ''))+' · Versión '+escape(str(r['version'] or '—'))+' · '+escape(str(r['specialty'] or ''))
         st.markdown(f'<div class="altivia-client-card"><div class="altivia-client-head"><span class="altivia-client-title">{title}</span><span class="altivia-client-badge">{escape(r["status"])}</span></div><div class="altivia-client-sub">{sub}</div></div>',unsafe_allow_html=True)
         reference=str(r['file_path'] or '').strip()
-        if reference.startswith('https://'):
+        attached=file_info(r['id'],str(r['version'] or 'V01'))
+        if attached:
+            left,right=st.columns(2)
+            with left:
+                if 'pdf' in attached and st.button('👁 Visualizar PDF aquí',key=f'client_pdf_{r["id"]}',use_container_width=True):
+                    st.session_state['client_view_pdf']=r['id'] if st.session_state.get('client_view_pdf')!=r['id'] else None
+            with right:
+                if 'editable' in attached:
+                    editable_file=file_bytes(r['id'],str(r['version'] or 'V01'),'editable')
+                    if editable_file:
+                        st.download_button('⬇ Descargar archivo editable',editable_file[1],file_name=editable_file[0],mime='application/octet-stream',key=f'client_edit_{r["id"]}',use_container_width=True)
+            if st.session_state.get('client_view_pdf')==r['id'] and 'pdf' in attached:
+                pdf_file=file_bytes(r['id'],str(r['version'] or 'V01'),'pdf')
+                if pdf_file:
+                    internal_pdf_preview(pdf_file[1])
+                    st.download_button('⬇ Descargar PDF',pdf_file[1],file_name=pdf_file[0],mime='application/pdf',key=f'client_download_pdf_{r["id"]}')
+        elif reference.startswith('https://'):
             # Los enlaces externos conservan los permisos del proveedor de almacenamiento.
             # El cliente solo ve documentos aprobados que ALTIVIA le ha asignado.
             left,right=st.columns(2)
@@ -458,9 +477,11 @@ def delete_selected(module,ids):
                 dm=','.join('?' for _ in dc)
                 con.execute(f'DELETE FROM versions WHERE delivery_code IN ({dm})',dc)
                 con.execute(f'DELETE FROM checklist WHERE delivery_code IN ({dm})',dc)
+            con.execute(f'DELETE FROM delivery_files WHERE delivery_id IN (SELECT id FROM deliverables WHERE project_code IN ({pm}))',codes)
             for linked in ('tasks','deliverables','changes','meetings'):
                 con.execute(f'DELETE FROM {linked} WHERE project_code IN ({pm})',codes)
         if module=='Entregables' and codes:
+            con.execute(f'DELETE FROM delivery_files WHERE delivery_id IN ({marks})',ids)
             dm=','.join('?' for _ in codes)
             con.execute(f'DELETE FROM versions WHERE delivery_code IN ({dm})',codes)
             con.execute(f'DELETE FROM checklist WHERE delivery_code IN ({dm})',codes)
@@ -520,7 +541,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('checklist','versions','meetings','changes','tasks','deliverables','projects','people','audit'):
+                for table in ('delivery_files','checklist','versions','meetings','changes','tasks','deliverables','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -575,6 +596,8 @@ def card_browser(module, frame, allow_version_edit=True):
                         st.markdown(f'**{label}:** {escape(str(v))}')
                 if module=='Entregables':
                     versions_for_delivery(code,allow_edit=allow_version_edit and can_edit())
+                    if can_edit():
+                        upload_delivery_files(int(r['id']),code,str(r.get('version') or 'V01'))
 
 
 def versions_for_delivery(code,allow_edit=False):
