@@ -307,6 +307,49 @@ def drive_token():
     if not resp.ok:raise ValueError(f'No se pudo autenticar Google Drive (HTTP {resp.status_code}).')
     return resp.json()['access_token']
 
+def drive_safe_folder_name(value):
+    """Nombre legible, estable y sin separadores de ruta."""
+    name=re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', str(value or '').strip())
+    return name[:135] or 'Sin nombre'
+
+
+def drive_find_or_create_folder(token,parent_id,folder_name):
+    """Reutiliza carpetas por nombre y padre; nunca crea una carpeta por cada guardado."""
+    name=drive_safe_folder_name(folder_name)
+    headers={'Authorization':f'Bearer {token}'}
+    escaped=name.replace('\\','\\\\').replace("'", "\\'")
+    q=f"name = '{escaped}' and '{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    response=requests.get('https://www.googleapis.com/drive/v3/files',
+        params={'q':q,'fields':'nextPageToken,files(id,name)','page_size':100},headers=headers,timeout=30)
+    if not response.ok:
+        raise ValueError(f'No se pudo buscar carpeta en Google Drive (HTTP {response.status_code}): {response.text[:200]}')
+    matches=response.json().get('files',[])
+    if matches:return matches[0]['id']
+    created=requests.post('https://www.googleapis.com/drive/v3/files',headers=headers,
+        json={'name':name,'mimeType':'application/vnd.google-apps.folder','parents':[parent_id]},
+        params={'fields':'id,name'},timeout=30)
+    if not created.ok:
+        raise ValueError(f'No se pudo crear carpeta en Google Drive (HTTP {created.status_code}): {created.text[:200]}')
+    return created.json()['id']
+
+
+def drive_delivery_folder(token,delivery_id,code,version):
+    """Carpeta raíz / proyecto / entregable / versión."""
+    with connection() as con:
+        record=con.execute("""SELECT d.project_code,p.name AS project_name,d.name AS delivery_name
+                              FROM deliverables d LEFT JOIN projects p ON p.code=d.project_code
+                              WHERE d.id=?""",(delivery_id,)).fetchone()
+    if record is None:raise ValueError('No existe el entregable para vincular archivos.')
+    project=record['project_code'] or 'PROYECTO'
+    project_name=(record['project_name'] or '').strip()
+    delivery_name=(record['delivery_name'] or '').strip()
+    project_folder=drive_safe_folder_name(project + (' - '+project_name if project_name else ''))
+    delivery_folder=drive_safe_folder_name(code + (' - '+delivery_name if delivery_name else ''))
+    project_id=drive_find_or_create_folder(token,DRIVE_FOLDER_ID,project_folder)
+    deliverable_id=drive_find_or_create_folder(token,project_id,delivery_folder)
+    return drive_find_or_create_folder(token,deliverable_id,version)
+
+
 def drive_upload(upload,delivery_id,code,version,kind):
     require_admin()
     if upload is None:return
@@ -319,7 +362,8 @@ def drive_upload(upload,delivery_id,code,version,kind):
     safe_code=re.sub(r'[^A-Za-z0-9_-]','_',code)
     filename=f'{safe_code}_{version}_{kind}.{ext}'
     token=drive_token()
-    metadata={'name':filename,'parents':[DRIVE_FOLDER_ID], 'description':f'ALTIVIA {code} {version} {kind}'}
+    version_folder_id=drive_delivery_folder(token,delivery_id,code,version)
+    metadata={'name':filename,'parents':[version_folder_id], 'description':f'ALTIVIA {code} {version} {kind}'}
     # Subida multipart; el token corresponde a la cuenta que posee la carpeta.
     resp=requests.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
         headers={'Authorization':f'Bearer {token}'},
