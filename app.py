@@ -531,115 +531,126 @@ def reset_database_ui():
         except Exception as exc:st.error(f'El restablecimiento falló: {exc}')
 
 
+def card_browser(module, frame, allow_version_edit=True):
+    """Visualizador responsive sin exponer campos técnicos."""
+    st.markdown('### 📂 Registros')
+    if frame.empty:
+        st.info('Todavía no hay registros en este módulo.')
+        return
+    table,fields=SPECS[module]
+    labels={k:label for k,label,_,_,_ in fields}
+    q=st.text_input('🔎 Buscar por código, nombre o responsable',key='cards_search_'+table)
+    a,b=st.columns(2)
+    with a:
+        states=sorted(str(x) for x in frame['status'].dropna().unique()) if 'status' in frame else []
+        status=st.selectbox('Estado',['Todos']+states,key='cards_state_'+table)
+    with b:
+        projects=sorted(str(x) for x in frame['project_code'].dropna().unique()) if 'project_code' in frame else []
+        project=st.selectbox('Proyecto',['Todos']+projects,key='cards_proj_'+table) if projects else 'Todos'
+    if q:frame=frame[frame.astype(str).apply(lambda series:series.str.contains(q,case=False,regex=False)).any(axis=1)]
+    if status!='Todos':frame=frame[frame['status'].astype(str)==status]
+    if project!='Todos':frame=frame[frame['project_code'].astype(str)==project]
+    st.caption(f'{len(frame)} registro(s) encontrados')
+    page_size=10
+    max_page=max(1,(len(frame)+page_size-1)//page_size)
+    page=st.number_input('Página',min_value=1,max_value=max_page,value=1,step=1,key='cards_page_'+table)
+    frame=frame.iloc[(page-1)*page_size:page*page_size]
+    for _,r in frame.iterrows():
+        title=str(r.get('name') or r.get('activity') or r.get('description') or r.get('code') or 'Registro')
+        status_text=str(r.get('status') or 'Sin estado')
+        code=str(r.get('code') or '')
+        subtitle=' · '.join(str(r.get(k)) for k in ('project_code','specialty','version') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip())
+        with st.container(border=True):
+            st.markdown(f'**{escape(title)}**')
+            st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
+            st.markdown(f'**Estado:** {escape(status_text)}')
+            cols=st.columns(2)
+            details=[k for k in ('owner','reviewer','manager','due_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
+            for idx,k in enumerate(details):
+                with cols[idx%2]:st.caption(f'{labels.get(k,k)}: {r[k]}')
+            with st.expander('Ver detalles'+(' y versiones' if module=='Entregables' else '')):
+                for k,label,_,_,_ in fields:
+                    v=r.get(k)
+                    if k not in details and k not in ('code','name','activity','description','status') and v is not None and pd.notna(v) and str(v).strip():
+                        st.markdown(f'**{label}:** {escape(str(v))}')
+                if module=='Entregables':
+                    versions_for_delivery(code,allow_edit=allow_version_edit and can_edit())
+
+
+def versions_for_delivery(code,allow_edit=False):
+    with connection() as con:
+        rows=[dict(r) for r in con.execute('SELECT id,version,registered_at,notes FROM versions WHERE delivery_code=? ORDER BY id DESC',(code,)).fetchall()]
+    st.markdown('**Historial de versiones**')
+    if not rows:st.caption('Todavía no se han registrado versiones.')
+    for v in rows:
+        st.markdown(f'**{escape(str(v["version"]))}** · {escape(str(v["registered_at"]))}')
+        st.caption(v['notes'] or 'Sin descripción')
+    if not allow_edit:return
+    with st.form('new_version_'+str(code)):
+        ver=st.text_input('Nueva versión',value='V02')
+        notes=st.text_area('Descripción de cambios')
+        if st.form_submit_button('Registrar nueva versión'):
+            if not re.fullmatch(r'V[0-9]{2,}',ver.strip().upper()):st.error('Utiliza V01, V02, V03, etc.')
+            else:
+                try:
+                    with connection() as con:
+                        con.execute('INSERT INTO versions(delivery_code,version,registered_at,notes) VALUES(?,?,?,?)',(code,ver.strip().upper(),date.today().isoformat(),notes))
+                        con.execute('UPDATE deliverables SET version=? WHERE code=?',(ver.strip().upper(),code))
+                        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Nueva versión '+ver.strip().upper()))
+                    st.success('Versión registrada');st.rerun()
+                except sqlite3.IntegrityError:st.error('Ya existe esa versión en el entregable.')
+    if rows:
+        selected=st.selectbox('Versión cuya descripción quieres editar',[r['id'] for r in rows],format_func=lambda i:next(r['version'] for r in rows if r['id']==i),key='ver_selected_'+str(code))
+        original=next(r for r in rows if r['id']==selected)
+        with st.form('edit_version_'+str(code)+'_'+str(selected)):
+            revised=st.text_area('Editar descripción',value=original['notes'] or '')
+            if st.form_submit_button('Guardar descripción'):
+                with connection() as con:
+                    con.execute('UPDATE versions SET notes=? WHERE id=? AND delivery_code=?',(revised,selected,code))
+                    con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Descripción '+original['version']+' editada'))
+                st.success('Descripción actualizada');st.rerun()
+
+
 def edit_module(module,data):
     table,fields=SPECS[module]
     st.subheader(module)
-    if module=='Proyectos': st.caption('El avance y el riesgo se calculan automáticamente a partir del cronograma y las tareas.')
-    left,right=st.columns([1,2])
-    with left:
-        if not can_edit():
-            st.info("Modo consulta: puede visualizar los registros, pero no editarlos.")
-            st.dataframe(data[module],hide_index=True,use_container_width=True)
-            return
-        existing=data[module]
-        items=['➕ Nuevo registro']+[f'{r["code"]} — {r.get("name",r.get("activity",r.get("topic","")))}' for _,r in existing.iterrows()]
-        choice=st.selectbox('Registro a editar',items,key='pick_'+table)
-        rid=None;row={}
-        if choice!='➕ Nuevo registro':
-            idx=items.index(choice)-1
-            row=existing.iloc[idx].to_dict();rid=int(row['id'])
-        with st.form('form_'+table,clear_on_submit=False):
-            vals={}
-            for key,label,kind,required,opt in fields:
-                raw=row.get('name') if module=='Personal' and key=='code' and row else row.get(key)
-                if pd.isna(raw) if raw is not None and not isinstance(raw,(list,dict)) else False:raw=None
-                vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
-            submitted=st.form_submit_button('💾 Guardar cambios',use_container_width=True,type='primary')
-            if submitted:
-                vals={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v) for k,v in vals.items()}
-                try:
-                    save_record(module,vals,rid);st.success('Registro guardado correctamente.');st.rerun()
-                except (ValueError,sqlite3.IntegrityError) as ex:
-                    if isinstance(ex,sqlite3.IntegrityError) and 'deliverables.code' in str(ex):
-                        st.error('Ya existe un entregable con ese ID. Selecciona el registro existente en «Registro a editar» para actualizar su enlace, o utiliza otro ID para uno nuevo.')
-                    else:st.error(str(ex))
+    if module=='Proyectos':st.caption('Avance y riesgo calculados desde las tareas.')
+    if can_edit():
+        with st.expander('✏️ Crear o editar registro',expanded=False):
+            existing=data[module]
+            items=['➕ Nuevo registro']+[f'{r["code"]} — {r.get("name",r.get("activity",r.get("description","")))}' for _,r in existing.iterrows()]
+            choice=st.selectbox('Registro a editar',items,key='pick_'+table)
+            rid=None;row={}
+            if choice!='➕ Nuevo registro':
+                idx=items.index(choice)-1;row=existing.iloc[idx].to_dict();rid=int(row['id'])
+            with st.form('form_'+table,clear_on_submit=False):
+                vals={}
+                for key,label,kind,required,opt in fields:
+                    raw=row.get('name') if module=='Personal' and key=='code' and row else row.get(key)
+                    if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):raw=None
+                    vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
+                if st.form_submit_button('💾 Guardar cambios',type='primary'):
+                    vals={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v) for k,v in vals.items()}
+                    try:save_record(module,vals,rid);st.success('Registro guardado');st.rerun()
+                    except (ValueError,sqlite3.IntegrityError) as ex:st.error(str(ex))
         bulk_delete_ui(module,data)
-    with right:
-        st.markdown('**Registros y seguimiento**')
-        view=data[module].copy()
-        if not view.empty:
-            show=[k for k,_,_,_,_ in fields]
-            if module=='Personal':view=view.rename(columns={'code':'Nombre'});show=['Nombre' if k=='code' else k for k in show]
-            show+= [c for c in ['% Avance','Días restantes','Días atraso','Semáforo','Riesgo calculado','Situación','Alerta','Tareas activas','Proyectos asignados','Carga de trabajo'] if c in view.columns]
-            q=st.text_input('🔎 Buscar en registros',key='search_'+table)
-            if q:view=view[view.astype(str).apply(lambda x:x.str.contains(q,case=False,regex=False)).any(axis=1)]
-            st.dataframe(view[show],hide_index=True,use_container_width=True,height=570)
-            st.caption(f'{len(view)} registros visibles')
-        else:st.info('No hay registros todavía. Usa el formulario para crear el primero.')
+    else:st.info('Modo consulta: puedes buscar y examinar los registros, pero no modificarlos.')
+    card_browser(module,data[module])
 
 def add_examples():
-    """Carga ejemplos de los módulos vigentes, sin duplicar ni borrar datos.
-
-    Una sola transacción: si algo falla no queda una demostración incompleta.
-    Los registros de ejemplo preexistentes se respetan sin sobrescribirlos.
-    """
     require_admin()
-    d=lambda n:(date.today()+timedelta(days=n)).isoformat()
-    people=[
-        dict(code='Andrea Torres (EJEMPLO)', role='Jefe de Proyecto', specialty='Coordinación', email='', phone='', status='Disponible', notes='REGISTRO FICTICIO'),
-        dict(code='Luis Vega (EJEMPLO)', role='Ingeniero', specialty='Estructuras', email='', phone='', status='Disponible', notes='REGISTRO FICTICIO'),
-        dict(code='María Rojas (EJEMPLO)', role='Modelador BIM', specialty='BIM', email='', phone='', status='Disponible', notes='REGISTRO FICTICIO'),
-    ]
-    records={
-        'Personal':people,
-        'Proyectos':[
-            dict(code='PR-EX-001',name='Proyecto Ejemplo - Edificio Multifamiliar (EJEMPLO)',client='Cliente ficticio',type='Expediente técnico',location='Lima - Perú',manager='Andrea Torres (EJEMPLO)',start_date=d(-20),due_date=d(12),status='En desarrollo',priority='Alta',notes='REGISTRO FICTICIO - reemplazar para producción')
-        ],
-        'Plan de trabajo':[
-            dict(code=code,project_code='PR-EX-001',specialty=sp,activity=activity,delivery_code='',owner=owner,reviewer='Andrea Torres (EJEMPLO)',start_date=d(-18),due_date=d(due),progress=progress,status=status,priority='Alta' if due<0 else 'Media',updated_at=d(0),notes='EJEMPLO')
-            for code,sp,activity,owner,due,progress,status in [
-                ('T-EX-001','Arquitectura','Plantas y elevaciones','Andrea Torres (EJEMPLO)',-4,65,'En desarrollo'),
-                ('T-EX-002','Estructuras','Planos de cimentación','Luis Vega (EJEMPLO)',3,80,'En revisión'),
-                ('T-EX-003','BIM','Compatibilización de interferencias','María Rojas (EJEMPLO)',6,25,'En desarrollo'),
-                ('T-EX-004','Eléctricas','Circuitos y tableros','Andrea Torres (EJEMPLO)',10,0,'No iniciado'),
-                ('T-EX-005','Sanitarias','Redes de agua y desagüe','Luis Vega (EJEMPLO)',-2,100,'Aprobado')
-            ]
-        ],
-        'Entregables':[
-            dict(code=code,project_code='PR-EX-001',drawing_code=code.replace('E-EX','PL-EX'),name=name,specialty=sp,owner=owner,reviewer='Andrea Torres (EJEMPLO)',version='V01',due_date=d(due),actual_date=None,status=status,review_date=d(-1) if obs else None,correction_date=None,approval_date=None,notes='EJEMPLO',file_path='')
-            for code,sp,name,owner,due,status,obs in [
-                ('E-EX-001','Arquitectura','Planta arquitectónica','Andrea Torres (EJEMPLO)',-2,'Con observaciones',True),
-                ('E-EX-002','Estructuras','Cimentaciones','Luis Vega (EJEMPLO)',4,'En revisión interna',True),
-                ('E-EX-003','BIM','Modelo federado','María Rojas (EJEMPLO)',8,'En desarrollo',False)
-            ]
-        ],
-        'Control de cambios':[
-            dict(code='C-EX-001',project_code='PR-EX-001',request_date=d(-2),requester='Cliente ficticio',description='Cambio de distribución de ambientes',reason='Nueva necesidad del cliente',specialty='Arquitectura',affected_drawings='PL-EX-001',owner='Andrea Torres (EJEMPLO)',schedule_impact='Alto',new_due_date=d(16),approved_by='',approval_date=None,status='Solicitado',notes='EJEMPLO')
-        ],
-    }
-    inserted=0
-    # Evitar sobrescribir registros reales; cada registro ficticio tiene un código fijo.
     with connection() as con:
-        for module,entries in records.items():
-            table,fields=SPECS[module]
-            valid_columns={field[0] for field in fields}
-            if module=='Personal':valid_columns.add('name')
-            for item in entries:
-                code=item['code']
-                if con.execute(f'SELECT 1 FROM {table} WHERE code=?',(code,)).fetchone():
-                    continue
-                values={k:v for k,v in item.items() if k in valid_columns}
-                if module=='Personal':values['name']=code
-                cols=list(values)
-                columns_sql=', '.join('"'+k+'"' for k in cols)
-                marks=', '.join('?' for _ in cols)
-                con.execute(f'INSERT INTO {table} ({columns_sql}) VALUES ({marks})',[values[k] for k in cols])
-                if module=='Entregables':
-                    con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES(?,?,?,?)',
-                                (code,item['version'],date.today().isoformat(),'Versión de ejemplo'))
-                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',(module,code,'Alta de ejemplo'))
-                inserted+=1
-    return inserted
+        if con.execute('SELECT COUNT(*) FROM projects').fetchone()[0]:raise ValueError('Solo se pueden cargar los ejemplos si aún no existen proyectos.')
+    d=lambda n:(date.today()+timedelta(days=n)).isoformat()
+    for item in [dict(code='Andrea Torres (EJEMPLO)',name='Andrea Torres (EJEMPLO)',role='Jefe de Proyecto',specialty='Coordinación',capacity=4,status='Disponible'),dict(code='Luis Vega (EJEMPLO)',name='Luis Vega (EJEMPLO)',role='Ingeniero',specialty='Estructuras',capacity=3,status='Disponible'),dict(code='María Rojas (EJEMPLO)',name='María Rojas (EJEMPLO)',role='Modelador BIM',specialty='BIM',capacity=2,status='Disponible')]:
+        save_record('Personal',{k:item.get(k) for k,_,_,_,_ in SPECS['Personal'][1]})
+    save_record('Proyectos',dict(code='PR-EX-001',name='Proyecto Ejemplo - Edificio Multifamiliar (EJEMPLO)',client='Cliente ficticio',type='Expediente técnico',location='Lima - Perú',manager='Andrea Torres (EJEMPLO)',start_date=d(-20),due_date=d(12),status='En desarrollo',priority='Alta',notes='REGISTRO FICTICIO - reemplazar para producción'))
+    tasks=[('T-EX-001','Arquitectura','Plantas y elevaciones', 'Andrea Torres (EJEMPLO)',-4,65,'En desarrollo',0),('T-EX-002','Estructuras','Planos de cimentación','Luis Vega (EJEMPLO)',3,80,'En revisión',0),('T-EX-003','BIM','Compatibilización de interferencias','María Rojas (EJEMPLO)',6,25,'En desarrollo',0),('T-EX-004','Eléctricas','Circuitos y tableros','Andrea Torres (EJEMPLO)',10,0,'No iniciado',0),('T-EX-005','Sanitarias','Redes de agua y desagüe','Luis Vega (EJEMPLO)',-2,100,'Aprobado',0)]
+    for code,sp,activity,owner,due,progress,status,blocked in tasks:
+        save_record('Plan de trabajo',dict(code=code,project_code='PR-EX-001',specialty=sp,activity=activity,delivery_code='',owner=owner,reviewer='Andrea Torres (EJEMPLO)',start_date=d(-18),due_date=d(due),progress=progress,status=status,priority='Alta' if due<0 else 'Media',updated_at=d(0),notes='EJEMPLO'))
+    for code,sp,name,owner,due,status,obs in [('E-EX-001','Arquitectura','Planta arquitectónica','Andrea Torres (EJEMPLO)',-2,'Con observaciones',3),('E-EX-002','Estructuras','Cimentaciones','Luis Vega (EJEMPLO)',4,'En revisión interna',1),('E-EX-003','BIM','Modelo federado','María Rojas (EJEMPLO)',8,'En desarrollo',0)]:
+        save_record('Entregables',dict(code=code,project_code='PR-EX-001',drawing_code=code.replace('E-EX','PL-EX'),name=name,specialty=sp,owner=owner,reviewer='Andrea Torres (EJEMPLO)',version='V01',due_date=d(due),actual_date=None,status=status,review_date=d(-1) if obs else None,correction_date=None,approval_date=None,notes='EJEMPLO',file_path=''))
+    save_record('Control de cambios',dict(code='C-EX-001',project_code='PR-EX-001',request_date=d(-2),requester='Cliente ficticio',description='Cambio de distribución de ambientes',reason='Nueva necesidad del cliente',specialty='Arquitectura',affected_drawings='PL-EX-001',owner='Andrea Torres (EJEMPLO)',schedule_impact='Alto',new_due_date=d(16),approved_by='',approval_date=None,status='Solicitado',notes='EJEMPLO'))
 
 def priorities(data):
     t=data['Plan de trabajo'];e=data['Entregables'];p=data['Proyectos'];c=data['Control de cambios']
@@ -735,28 +746,19 @@ def checklist_page():
     st.caption(f'OK: {counts["OK"]} · Pendientes: {counts["PENDIENTE"]} · No aplica: {counts["NO APLICA"]}')
 
 def versions_page():
-    st.title('Historial de versiones de entregables')
-    delivs=df('deliverables')
-    if delivs.empty:st.info('Primero registre un entregable.');return
-    if not can_edit():
-        st.info('Modo consulta: historial de versiones.')
-        st.dataframe(df('versions'),hide_index=True,use_container_width=True)
-        return
-    with st.form('versions_form'):
-        dc=st.selectbox('Entregable',delivs.code.tolist())
-        ver=st.text_input('Nueva versión',value='V02')
-        notes=st.text_area('Descripción de revisión / cambios')
-        submit=st.form_submit_button('Registrar versión',type='primary')
-        if submit:
-            try:
-                if not ver.upper().startswith('V'):raise ValueError('Formato: V01, V02, etc.')
-                with connection() as con:
-                    con.execute('INSERT INTO versions(delivery_code,version,registered_at,notes) VALUES(?,?,?,?)',(dc,ver.upper(),date.today().isoformat(),notes))
-                    con.execute('UPDATE deliverables SET version=? WHERE code=?',(ver.upper(),dc))
-                st.success('Versión incorporada al historial');st.rerun()
-            except (ValueError,sqlite3.IntegrityError) as exc:st.error(str(exc))
-    st.dataframe(df('versions'),hide_index=True,use_container_width=True)
-    st.caption('El historial no se sobrescribe al cambiar la versión vigente del entregable.')
+    st.title('📚 Historial de versiones')
+    st.caption('También puedes administrar las versiones desde la ficha de cada entregable.')
+    deliveries=df('deliverables')
+    if deliveries.empty:st.info('Primero registra un entregable.');return
+    q=st.text_input('🔎 Buscar entregable por nombre o código',key='versions_search')
+    if q:deliveries=deliveries[deliveries.astype(str).apply(lambda x:x.str.contains(q,case=False,regex=False)).any(axis=1)]
+    st.caption(f'{len(deliveries)} entregables encontrados')
+    for _,r in deliveries.head(30).iterrows():
+        with st.container(border=True):
+            st.markdown(f'**{escape(str(r["name"]))}** · {escape(str(r["code"]))}')
+            st.caption(f'{r["project_code"]} · {r["status"]} · Versión vigente: {r["version"]}')
+            with st.expander('Consultar y gestionar versiones'):
+                versions_for_delivery(r['code'],allow_edit=can_edit())
 
 def export_xlsx(data):
     dest=io.BytesIO()
@@ -845,12 +847,10 @@ def main():
         with open(backup_path,'rb') as f:backup=f.read()
         st.download_button('💾 Descargar respaldo íntegro (.db)',data=backup,file_name=f'ALTIVIA_respaldo_{TODAY.isoformat()}.db',mime='application/octet-stream')
         st.warning('El Excel exportado sirve para reportes. La base SQLite es la fuente principal: conserva versiones y checklists. No edite la base mientras la aplicación está abierta.')
-        if st.button('Cargar / completar datos ficticios de demostración'):
-            try:
-                n=add_examples()
-                st.success(f'{n} registros de ejemplo incorporados. Los que ya existían se conservaron sin duplicar.')
-                st.rerun()
-            except (ValueError, sqlite3.Error) as exc:st.error(f'No se pudieron cargar los ejemplos: {exc}')
+        if not len(data['Proyectos']):
+            if st.button('Cargar datos ficticios de demostración'):
+                try:add_examples();st.success('Ejemplos creados');st.rerun()
+                except ValueError as exc:st.error(str(exc))
         st.subheader('Bitácora de actividad');st.dataframe(df('audit').head(100),hide_index=True,use_container_width=True)
         reset_database_ui()
         st.caption('Esta instalación usa SQLite local: no la publique en Streamlit Community Cloud para datos reales. Para varios usuarios, migre a PostgreSQL y alojamiento privado.')
