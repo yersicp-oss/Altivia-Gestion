@@ -1,4 +1,4 @@
-streamlit[pdf]>=1.50
+streamlit[pdf]>=1.52.0
 pandas>=2.2
 plotly>=5.24
 openpyxl>=3.1

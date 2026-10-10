@@ -1127,6 +1127,66 @@ def drive_bytes(file_id):
         chunks.append(chunk)
     return b''.join(chunks)
 
+
+def _download_drive_bytes(file_id, credentials, *, validate_pdf=False):
+    """Descarga diferida segura: no usa st.session_state ni st.secrets en el hilo del botón.
+
+    Las credenciales se capturan del servidor al crear el botón; nunca se envían al cliente.
+    Se solicita un token OAuth nuevo por descarga para evitar tokens caducados.
+    """
+    if not all(credentials.get(k) for k in ('client_id','client_secret','refresh_token')):
+        raise ValueError('Google Drive no está conectado.')
+    response=requests.post('https://oauth2.googleapis.com/token',data={
+        'client_id':credentials['client_id'],
+        'client_secret':credentials['client_secret'],
+        'refresh_token':credentials['refresh_token'],
+        'grant_type':'refresh_token'},timeout=20)
+    if not response.ok:
+        raise ValueError('No se pudo iniciar la descarga desde Google Drive.')
+    token=response.json()['access_token']
+    # Evitar URLs basadas en datos de usuario y seguir la API oficial de Drive.
+    with requests.get('https://www.googleapis.com/drive/v3/files/'+quote(file_id,safe=''),
+        params={'alt':'media'},headers={'Authorization':f'Bearer {token}'},
+        timeout=90,stream=True) as response:
+        if not response.ok:
+            raise ValueError('No se pudo recuperar el archivo desde Google Drive.')
+        chunks=[]
+        length=0
+        for block in response.iter_content(262144):
+            if not block:continue
+            length+=len(block)
+            if length>DRIVE_LIMIT:
+                raise ValueError('El archivo supera el límite de 25 MB.')
+            chunks.append(block)
+    data=b''.join(chunks)
+    if not data:raise ValueError('El archivo descargado está vacío.')
+    if validate_pdf and not data.startswith(b'%PDF-'):
+        raise ValueError('El archivo recuperado no es un PDF válido.')
+    return data
+
+
+def direct_document_download(document, kind):
+    """Proporciona la función diferida al botón de descarga, sin paso Preparar."""
+    files=document.get('files',{})
+    remote=files.get(kind)
+    if remote:
+        credentials=drive_credentials()
+        if not all(credentials.values()):return None,remote['filename']
+        file_id=remote['file_id']
+        # Importante: callback sin comandos Streamlit; se ejecuta fuera del script.
+        def on_demand():
+            return _download_drive_bytes(file_id, credentials, validate_pdf=(kind=='pdf'))
+        return on_demand,remote['filename']
+    # Compatibilidad con documentos heredados que todavía están en SQLite.
+    legacy=legacy_local_document(document['id'],kind)
+    if legacy:
+        filename,raw=legacy
+        def on_demand_legacy():
+            return raw
+        return on_demand_legacy,filename
+    return None,None
+
+
 def docs_for_version(delivery_id, version):
     with connection() as con:
         docs=[dict(r) for r in con.execute(
@@ -1224,7 +1284,11 @@ def legacy_local_document(document_id,kind):
 
 
 def document_preview_ui(document, *, allow_download=True, allow_editable=True, prefix='doc'):
-    """Visor y descargas explícitas (PDF de toda versión, editable de la última)."""
+    """Vista previa y descargas de un clic: PDF en toda versión, editable solo vigente.
+
+    Streamlit 1.52+ admite data=callable para descargar el archivo bajo demanda.
+    Así se evita el botón «Preparar» y la precarga de todos los archivos de Drive.
+    """
     doc_id=int(document['id'])
     files=document.get('files',{})
     legacy_pdf=legacy_local_document(doc_id,'pdf') if 'pdf' not in files else None
@@ -1237,32 +1301,27 @@ def document_preview_ui(document, *, allow_download=True, allow_editable=True, p
             if st.button('👁 Visualizar PDF',key=f'{prefix}_view_{doc_id}',use_container_width=True):
                 key=f'{prefix}_open_{doc_id}'
                 st.session_state[key]=not st.session_state.get(key,False)
-        else:st.caption('Sin PDF')
+        else:
+            st.caption('Sin PDF')
     if allow_download:
         with cols[1]:
-            if has_pdf and st.button('⬇ Preparar PDF',key=f'{prefix}_prepare_pdf_{doc_id}',use_container_width=True):
-                try:
-                    raw=drive_bytes(files['pdf']['file_id']) if 'pdf' in files else legacy_pdf[1]
-                    if not raw.startswith(b'%PDF-'):raise ValueError('PDF no válido.')
-                    st.session_state[f'{prefix}_pdf_data_{doc_id}']=raw
-                except Exception as exc:st.error(f'No se pudo preparar el PDF: {exc}')
-            pdf_data=st.session_state.get(f'{prefix}_pdf_data_{doc_id}')
-            if has_pdf and pdf_data is not None:
-                filename=files['pdf']['filename'] if 'pdf' in files else legacy_pdf[0]
-                st.download_button('⬇ Descargar PDF',pdf_data,file_name=filename,
-                    mime='application/pdf',key=f'{prefix}_download_pdf_{doc_id}',use_container_width=True)
+            if has_pdf:
+                pdf_data,pdf_filename=direct_document_download(document,'pdf')
+                st.download_button('⬇ Descargar PDF',data=pdf_data or b'',
+                    file_name=pdf_filename,mime='application/pdf',
+                    disabled=pdf_data is None,on_click='ignore',
+                    key=f'{prefix}_download_pdf_{doc_id}',use_container_width=True)
+                if pdf_data is None:st.caption('Google Drive no está conectado.')
+            else:
+                st.caption('Sin PDF')
         with cols[2]:
             if allow_editable and has_edit:
-                if st.button('⬇ Preparar editable',key=f'{prefix}_prepare_edit_{doc_id}',use_container_width=True):
-                    try:
-                        st.session_state[f'{prefix}_edit_data_{doc_id}']=(
-                            drive_bytes(files['editable']['file_id']) if 'editable' in files else legacy_edit[1])
-                    except Exception as exc:st.error(f'No se pudo preparar el editable: {exc}')
-                edit_data=st.session_state.get(f'{prefix}_edit_data_{doc_id}')
-                if edit_data is not None:
-                    filename=files['editable']['filename'] if 'editable' in files else legacy_edit[0]
-                    st.download_button('⬇ Descargar editable',edit_data,file_name=filename,
-                        mime='application/octet-stream',key=f'{prefix}_download_edit_{doc_id}',use_container_width=True)
+                edit_data,edit_filename=direct_document_download(document,'editable')
+                st.download_button('⬇ Descargar editable',data=edit_data or b'',
+                    file_name=edit_filename,mime='application/octet-stream',
+                    disabled=edit_data is None,on_click='ignore',
+                    key=f'{prefix}_download_edit_{doc_id}',use_container_width=True)
+                if edit_data is None:st.caption('Google Drive no está conectado.')
             else:
                 st.caption('Editable solo en versión más reciente' if has_edit and not allow_editable else 'Sin editable')
     if st.session_state.get(f'{prefix}_open_{doc_id}') and has_pdf:
@@ -1270,8 +1329,8 @@ def document_preview_ui(document, *, allow_download=True, allow_editable=True, p
             pdf=drive_bytes(files['pdf']['file_id']) if 'pdf' in files else legacy_pdf[1]
             if not pdf.startswith(b'%PDF-'):raise ValueError('El PDF no es válido.')
             internal_pdf_preview(pdf)
-        except Exception as exc:st.error(f'No se pudo visualizar el PDF: {exc}')
-
+        except Exception as exc:
+            st.error(f'No se pudo visualizar el PDF: {exc}')
 
 def next_version(code,current=None):
     """No reutiliza números de versiones eliminadas; registra el máximo histórico."""
@@ -1969,6 +2028,34 @@ def task_cards(frame):
                           use_container_width=True)
 
 
+
+def update_delivery_status(delivery_id, new_status):
+    """Cambio rápido de estado por el Administrador, sin modificar versiones ni archivos."""
+    require_admin()
+    if new_status not in DELIVERY_STATES:
+        raise ValueError('El estado seleccionado no es válido.')
+    with connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        record=con.execute("SELECT id,code,status,review_date,approval_date,correction_date FROM deliverables WHERE id=?",(int(delivery_id),)).fetchone()
+        if not record:raise ValueError('El entregable ya no existe.')
+        if record['status']==new_status:return False
+        fields={'status':new_status}
+        stamp=today_peru().isoformat()
+        # Respeta la validación del módulo: estos estados requieren revisión registrada.
+        if new_status in ('Enviado al cliente','Aprobado','Entregado') and not record['review_date']:
+            fields['review_date']=stamp
+        if new_status in ('Aprobado','Entregado') and not record['approval_date']:
+            fields['approval_date']=stamp
+        if new_status=='Corregido' and not record['correction_date']:
+            fields['correction_date']=stamp
+        assignments=', '.join(f'{k}=?' for k in fields)
+        con.execute(f'UPDATE deliverables SET {assignments} WHERE id=?',
+                    (*fields.values(),int(delivery_id)))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Entregables',record['code'],f'Cambio rápido de estado: {record["status"]} → {new_status}'))
+    return True
+
+
 def card_browser(module, frame, allow_version_edit=True):
     """Visualizador responsive sin exponer campos técnicos."""
     st.markdown('### 📂 Registros')
@@ -2004,6 +2091,26 @@ def card_browser(module, frame, allow_version_edit=True):
             st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
             if module!='Entregables' or can_edit():
                 st.markdown(f'**Estado:** {escape(status_text)}')
+            if module=='Entregables' and can_edit():
+                # Edición rápida directamente en la ficha, sin abrir el formulario completo.
+                delivery_id=int(r['id'])
+                with st.form(f'quick_delivery_state_{delivery_id}'):
+                    left,right=st.columns([3,1],gap='small',vertical_alignment='bottom')
+                    with left:
+                        selected_state=st.selectbox('Cambiar estado',DELIVERY_STATES,
+                            index=DELIVERY_STATES.index(status_text) if status_text in DELIVERY_STATES else 0,
+                            key=f'quick_delivery_state_value_{delivery_id}')
+                    with right:
+                        saved=st.form_submit_button('💾 Guardar estado',use_container_width=True)
+                if saved:
+                    try:
+                        changed=update_delivery_status(delivery_id,selected_state)
+                        if changed:
+                            st.toast('Estado actualizado',icon='✅')
+                            st.rerun()
+                        else:st.info('El entregable ya tiene ese estado.')
+                    except (ValueError,PermissionError,sqlite3.Error) as exc:
+                        st.error(f'No se pudo actualizar el estado: {exc}')
             cols=st.columns(2)
             details=[k for k in ('owner','reviewer','manager','due_date','actual_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
             for idx,k in enumerate(details):
