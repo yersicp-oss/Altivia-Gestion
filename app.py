@@ -86,6 +86,21 @@ def initialize():
             con.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(cols)})')
         # Catálogo de entregables: alta y modificaciones reservadas al administrador.
         # La tabla 'deliverables' sigue siendo el registro de la entrega y de su versión vigente.
+        # Vinculo permanente cuenta Consulta -> ficha en Personal.
+        cols_people={r[1] for r in con.execute('PRAGMA table_info(people)')}
+        if 'user_id' not in cols_people:
+            con.execute('ALTER TABLE people ADD COLUMN user_id INTEGER')
+        if 'linked_once' not in cols_people:
+            con.execute('ALTER TABLE people ADD COLUMN linked_once INTEGER NOT NULL DEFAULT 0')
+        con.execute('UPDATE people SET linked_once=1 WHERE user_id IS NOT NULL')
+        con.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_people_user ON people(user_id)')
+        # Multiples responsables y revisores por tarea, sin duplicar personas.
+        con.execute('''CREATE TABLE IF NOT EXISTS task_people (
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE RESTRICT,
+            assignment_role TEXT NOT NULL CHECK(assignment_role IN ('Responsable','Revisor')),
+            PRIMARY KEY(task_id,person_id,assignment_role))''')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_task_people_person ON task_people(person_id,task_id)')
         con.execute('''CREATE TABLE IF NOT EXISTS deliverable_catalog (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_code TEXT NOT NULL,
@@ -199,6 +214,21 @@ def initialize():
                 con.execute('''INSERT INTO version_counters(delivery_code,highest) VALUES(?,?)
                     ON CONFLICT(delivery_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
                     (r['delivery_code'],int(m.group(1))))
+        # Importa asignaciones antiguas basadas en texto UNA sola vez. No reimportar
+        # al quitar asignaciones desde el editor moderno.
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_people_migration'").fetchone():
+            con.execute('CREATE TABLE task_people_migration (task_id INTEGER PRIMARY KEY)')
+        for old in con.execute('SELECT id,owner,reviewer FROM tasks').fetchall():
+            if con.execute('SELECT 1 FROM task_people_migration WHERE task_id=?',(old['id'],)).fetchone():
+                continue
+            for role,field in [('Responsable','owner'),('Revisor','reviewer')]:
+                label=str(old[field] or '').strip()
+                if not label:continue
+                person=con.execute('SELECT id FROM people WHERE name=? COLLATE NOCASE',(label,)).fetchone()
+                if person:
+                    con.execute('INSERT OR IGNORE INTO task_people(task_id,person_id,assignment_role) VALUES(?,?,?)',
+                        (old['id'],person['id'],role))
+            con.execute('INSERT OR IGNORE INTO task_people_migration(task_id) VALUES(?)',(old['id'],))
         con.execute('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_code)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_deliveries_project ON deliverables(project_code)')
 
@@ -214,6 +244,82 @@ def verify_password(password,stored):
         actual=hashlib.pbkdf2_hmac('sha256',password.encode('utf-8'),bytes.fromhex(salt),int(iterations))
         return hmac.compare_digest(actual,bytes.fromhex(digest))
     except (ValueError,TypeError):return False
+
+def _unique_person_name(con, full_name, username, exclude_person_id=None):
+    """Evita confundir homónimos; conserva nombres existentes siempre que pueda."""
+    full_name=str(full_name or '').strip()
+    taken=con.execute('SELECT id FROM people WHERE name=? COLLATE NOCASE AND id<>?',
+                      (full_name,int(exclude_person_id or -1))).fetchone()
+    if not taken:return full_name
+    alternative=f'{full_name} ({username})'
+    taken=con.execute('SELECT id FROM people WHERE name=? COLLATE NOCASE AND id<>?',
+                      (alternative,int(exclude_person_id or -1))).fetchone()
+    if taken:raise ValueError('Hay una ficha de Personal con el mismo nombre y usuario; revisa los duplicados.')
+    return alternative
+
+
+def _refresh_task_display(con, task_ids):
+    """Actualiza campos legados owner/reviewer para reportes y edición histórica."""
+    for task_id in set(map(int,task_ids)):
+        labels={}
+        for role,field in [('Responsable','owner'),('Revisor','reviewer')]:
+            names=[r[0] for r in con.execute("""SELECT p.name FROM task_people tp JOIN people p ON p.id=tp.person_id
+                WHERE tp.task_id=? AND tp.assignment_role=? ORDER BY p.name""",(task_id,role))]
+            labels[field]=', '.join(names)
+        con.execute('UPDATE tasks SET owner=?,reviewer=? WHERE id=?',
+                    (labels['owner'],labels['reviewer'],task_id))
+
+
+def ensure_consulta_person(con,user_id,full_name,username):
+    """Crea o vincula Personal a una cuenta Consulta por ID; idempotente."""
+    account=con.execute('SELECT role FROM users WHERE id=?',(int(user_id),)).fetchone()
+    if not account or account['role']!='Consulta':return None
+    existing=con.execute('SELECT id,name FROM people WHERE user_id=?',(int(user_id),)).fetchone()
+    if existing:
+        new_name=_unique_person_name(con,full_name,username,existing['id'])
+        if existing['name']!=new_name:
+            con.execute('UPDATE people SET name=?,code=? WHERE id=?',(new_name,new_name,existing['id']))
+            _refresh_task_display(con,[r[0] for r in con.execute(
+                'SELECT DISTINCT task_id FROM task_people WHERE person_id=?',(existing['id'],))])
+        return existing['id']
+    # Si había Personal con el mismo nombre y sin vincular, recuperar esa ficha.
+    candidate=con.execute("""SELECT id FROM people WHERE name=? COLLATE NOCASE
+                             AND user_id IS NULL AND linked_once=0
+                             ORDER BY id LIMIT 1""",(str(full_name).strip(),)).fetchone()
+    if candidate:
+        con.execute('UPDATE people SET user_id=?,linked_once=1 WHERE id=?',(int(user_id),candidate['id']))
+        return candidate['id']
+    # Una cuenta nueva nunca hereda automáticamente las tareas de una cuenta eliminada,
+    # incluso si tienen el mismo nombre completo.
+    label=_unique_person_name(con,full_name,username)
+    cur=con.execute("""INSERT INTO people(code,name,role,specialty,status,user_id,linked_once)
+                       VALUES(?,?,?,'','Disponible',?,1)""",(label,label,'Otro',int(user_id)))
+    return cur.lastrowid
+
+
+def task_assigned_people(task_id):
+    with connection() as con:
+        rows=con.execute('SELECT person_id,assignment_role FROM task_people WHERE task_id=?',(int(task_id),)).fetchall()
+    return ({int(r['person_id']) for r in rows if r['assignment_role']=='Responsable'},
+            {int(r['person_id']) for r in rows if r['assignment_role']=='Revisor'})
+
+
+def visible_consulta_tasks(frame,user_id):
+    """Filtro servidor, no depende de listas aportadas por el navegador."""
+    with connection() as con:
+        ids={r[0] for r in con.execute("""SELECT DISTINCT tp.task_id
+            FROM task_people tp JOIN people p ON p.id=tp.person_id
+            JOIN users u ON u.id=p.user_id
+            WHERE u.id=? AND u.role='Consulta' AND u.active=1""",(int(user_id),))}
+    return frame[frame['id'].isin(ids)].copy()
+
+
+def people_for_assignment():
+    with connection() as con:
+        rows=con.execute("""SELECT p.id,p.name,p.status,u.role AS account_role,u.active AS account_active
+            FROM people p LEFT JOIN users u ON u.id=p.user_id ORDER BY p.name COLLATE NOCASE""").fetchall()
+    return [dict(r) for r in rows]
+
 
 def initialize_auth():
     # Preserva usuarios existentes y elimina la restriccion antigua de roles.
@@ -250,6 +356,22 @@ def initialize_auth():
                 con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES (?,?,?,?)',
                             ('admin','Administrador principal',hash_password(password),'Administrador'))
             else:return False
+        # Incorpora también las cuentas Consulta creadas antes de esta versión.
+        for user in con.execute("SELECT id,username,full_name FROM users WHERE role='Consulta'").fetchall():
+            ensure_consulta_person(con,user['id'],user['full_name'],user['username'])
+        # En instalaciones antiguas podía existir una tarea antes de crear su usuario.
+        # Se enlaza solo cuando el nombre coincide exactamente con una ficha y
+        # no existe aún una asignación de ese tipo. No se inventan asignaciones.
+        for task in con.execute('SELECT id,owner,reviewer FROM tasks').fetchall():
+            for role,column in [('Responsable','owner'),('Revisor','reviewer')]:
+                if con.execute('SELECT 1 FROM task_people WHERE task_id=? AND assignment_role=?',
+                               (task['id'],role)).fetchone():continue
+                old_name=str(task[column] or '').strip()
+                if not old_name:continue
+                person=con.execute('SELECT id FROM people WHERE name=? COLLATE NOCASE',(old_name,)).fetchone()
+                if person:
+                    con.execute('INSERT OR IGNORE INTO task_people(task_id,person_id,assignment_role) VALUES(?,?,?)',
+                                (task['id'],person['id'],role))
     return True
 
 def can_edit():
@@ -375,6 +497,8 @@ def delete_user_account(target_id):
             if remaining<=1:raise ValueError('Debe quedar al menos un administrador activo.')
         con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(target_id,))
         con.execute('DELETE FROM client_access WHERE user_id=?',(target_id,))
+        # Conservar la ficha de Personal y el historial de asignaciones.
+        con.execute('UPDATE people SET user_id=NULL WHERE user_id=?',(target_id,))
         con.execute('DELETE FROM users WHERE id=?',(target_id,))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
             ('Usuarios',r['username'],f'Cuenta eliminada por administrador ID {actor}'))
@@ -458,6 +582,8 @@ def update_user_by_admin(target_id,username,full_name,role,active,new_password='
         # Cambiar el nombre visible o el usuario no invalida la sesión existente.
         if new_password or role!=previous['role'] or bool(active)!=bool(previous['active']):
             con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(target_id,))
+        if role=='Consulta':
+            ensure_consulta_person(con,target_id,full_name,username)
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Usuarios',username,f'Perfil editado por Administrador ID {actor}'))
     if target_id==actor:
@@ -488,6 +614,7 @@ def update_own_profile(username,full_name,current_password):
         conflict=con.execute('SELECT id FROM users WHERE lower(username)=? AND id<>?',(username,actor)).fetchone()
         if conflict:raise ValueError('El nombre de usuario ya está registrado. Elige otro.')
         con.execute('UPDATE users SET username=?,full_name=? WHERE id=?',(username,full_name,actor))
+        ensure_consulta_person(con,actor,full_name,username)
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Mi cuenta',username,'Datos personales actualizados'))
     st.session_state['username']=username
@@ -517,8 +644,10 @@ def user_management():
                     if not name:raise ValueError('El nombre completo es obligatorio.')
                     if len(password)<6:raise ValueError('La contraseña debe tener al menos 6 caracteres.')
                     with connection() as con:
-                        con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES(?,?,?,?)',
+                        cursor=con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES(?,?,?,?)',
                                     (username,name,hash_password(password),role))
+                        if role=='Consulta':
+                            ensure_consulta_person(con,cursor.lastrowid,name,username)
                     st.success('Usuario creado.');st.rerun()
                 except sqlite3.IntegrityError:st.error('El nombre de usuario ya existe.')
                 except ValueError as exc:st.error(str(exc))
@@ -1065,6 +1194,12 @@ def datespan(value):
     try: return (date.fromisoformat(str(value)[:10])-date.today()).days
     except (ValueError,TypeError): return None
 
+def _person_task_ids(person_id):
+    with connection() as con:
+        return con.execute('SELECT DISTINCT task_id FROM task_people WHERE person_id=?',
+                           (int(person_id),)).fetchall()
+
+
 def decorate():
     data={x:df(t) for x,(t,_) in SPECS.items()}
     p,t,e,c,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal']]
@@ -1091,7 +1226,8 @@ def decorate():
     if not pe.empty:
         work=[];projects=[];load=[]
         for _,r in pe.iterrows():
-            assigned=t[(t.owner==r.name)&(~t.status.isin(FINISHED_TASK))] if not t.empty else pd.DataFrame()
+            assigned=(t[t['id'].isin([x[0] for x in _person_task_ids(int(r['id']))]) &
+                (~t.status.isin(FINISHED_TASK))] if not t.empty else pd.DataFrame())
             n=len(assigned)
             work.append(n)
             projects.append(assigned.project_code.nunique() if not assigned.empty else 0)
@@ -1231,12 +1367,13 @@ def update_project_sync(values,record_id):
         raise
 
 
-def save_record(module,values,record_id=None):
+def save_record(module,values,record_id=None,task_assignees=None):
     '''Guarda datos; en entregables el catálogo controla IDs y fecha final.
 
     El servidor aplica las mismas reglas aunque un usuario altere widgets locales.
     '''
     values=dict(values)
+    was_update=(record_id is not None)
     is_consulta=(st.session_state.get('role')=='Consulta')
     if not (module=='Entregables' and record_id is None and is_consulta):
         require_admin()
@@ -1244,6 +1381,18 @@ def save_record(module,values,record_id=None):
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
     if module=='Plan de trabajo':
+        if task_assignees is not None:
+            owners,reviewers=task_assignees
+            owners=set(map(int,owners));reviewers=set(map(int,reviewers))
+            if not owners:raise ValueError('Selecciona por lo menos un responsable.')
+            with connection() as con:
+                all_ids=owners | reviewers
+                marks=','.join('?' for _ in all_ids)
+                valid={int(r[0]) for r in con.execute(f'SELECT id FROM people WHERE id IN ({marks})',list(all_ids))}
+                if all_ids!=valid:raise ValueError('Un responsable o revisor ya no existe en Personal.')
+                all_people={int(r['id']):r['name'] for r in con.execute('SELECT id,name FROM people')}
+            values['owner']=', '.join(sorted(all_people[i] for i in owners))
+            values['reviewer']=', '.join(sorted(all_people[i] for i in reviewers))
         project=str(values.get('project_code') or '').strip()
         selected=str(values.get('delivery_code') or '').strip()
         with connection() as con:
@@ -1321,14 +1470,29 @@ def save_record(module,values,record_id=None):
             if record_id:
                 old=con.execute('SELECT name FROM people WHERE id=?',(record_id,)).fetchone()
                 if old and old['name']!=values['name']:
-                    for linked_table,column in [('projects','manager'),('tasks','owner'),('tasks','reviewer'),('deliverables','owner'),('deliverables','reviewer'),('changes','owner'),('meetings','owner')]:
+                    for linked_table,column in [('projects','manager'),('deliverables','owner'),('deliverables','reviewer'),('changes','owner'),('meetings','owner')]:
                         con.execute(f'UPDATE {linked_table} SET {column}=? WHERE {column}=?',(values['name'],old['name']))
+                linked=con.execute('SELECT user_id FROM people WHERE id=?',(record_id,)).fetchone()
+                if linked and linked['user_id']:
+                    con.execute('UPDATE users SET full_name=? WHERE id=?',
+                                (values['name'],linked['user_id']))
         if record_id:
             sets=', '.join(f'{k}=?' for k in values)
             con.execute(f'UPDATE {table} SET {sets} WHERE id=?',list(values.values())+[record_id])
+            if module=='Personal':
+                _refresh_task_display(con,[r[0] for r in con.execute(
+                    'SELECT DISTINCT task_id FROM task_people WHERE person_id=?',(record_id,))])
         else:
             keys=','.join(values.keys());placeholders=','.join('?' for _ in values)
-            con.execute(f'INSERT INTO {table} ({keys}) VALUES ({placeholders})',list(values.values()))
+            inserted=con.execute(f'INSERT INTO {table} ({keys}) VALUES ({placeholders})',list(values.values()))
+            if module=='Plan de trabajo':record_id=inserted.lastrowid
+        if module=='Plan de trabajo' and task_assignees is not None:
+            owners,reviewers=task_assignees
+            con.execute('DELETE FROM task_people WHERE task_id=?',(record_id,))
+            con.executemany('INSERT INTO task_people(task_id,person_id,assignment_role) VALUES(?,?,?)',
+                [(record_id,int(pid),'Responsable') for pid in set(owners)] +
+                [(record_id,int(pid),'Revisor') for pid in set(reviewers)])
+            con.execute('INSERT OR IGNORE INTO task_people_migration(task_id) VALUES(?)',(record_id,))
         if module=='Entregables':
             con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES (?,?,?,?)',
                 (values['code'],values['version'],date.today().isoformat(),'Versión registrada desde formulario'))
@@ -1338,7 +1502,7 @@ def save_record(module,values,record_id=None):
                     ON CONFLICT(delivery_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
                     (values['code'],int(m.group(1))))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
-            (module,values['code'],'Actualización' if record_id else 'Alta'))
+            (module,values['code'],'Actualización' if was_update else 'Alta'))
 
 
 def backup_database():
@@ -1361,6 +1525,13 @@ def delete_selected(module,ids):
         marks=','.join('?' for _ in ids)
         rows=con.execute(f'SELECT code FROM {table} WHERE id IN ({marks})',ids).fetchall()
         codes=[r['code'] for r in rows]
+        if module=='Personal':
+            protected=[dict(x) for x in con.execute(f'''SELECT p.name,p.user_id,
+                EXISTS(SELECT 1 FROM task_people tp WHERE tp.person_id=p.id) AS assigned
+                FROM people p WHERE p.id IN ({marks})''',ids)]
+            if any(r['user_id'] or r['assigned'] for r in protected):
+                raise ValueError('No se puede eliminar Personal vinculado a un usuario o a tareas. '
+                                 'Primero reasigna las tareas o elimina la cuenta y desvincula las tareas.')
         if module=='Proyectos' and codes:
             pm=','.join('?' for _ in codes)
             dc=[r[0] for r in con.execute(f'SELECT code FROM deliverables WHERE project_code IN ({pm})',codes)]
@@ -1379,6 +1550,8 @@ def delete_selected(module,ids):
             con.execute(f'DELETE FROM deliverable_catalog WHERE project_code IN ({pm})',codes)
             for linked in ('tasks','deliverables','changes','meetings'):
                 con.execute(f'DELETE FROM {linked} WHERE project_code IN ({pm})',codes)
+        if module=='Plan de trabajo':
+            con.execute(f'DELETE FROM task_people_migration WHERE task_id IN ({marks})',ids)
         if module=='Entregables' and codes:
             con.execute(f'DELETE FROM delivery_files WHERE delivery_id IN ({marks})',ids)
             dm=','.join('?' for _ in codes)
@@ -1440,7 +1613,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','tasks','deliverables','deliverable_catalog','projects','people','audit'):
+                for table in ('document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','task_people','task_people_migration','tasks','deliverables','deliverable_catalog','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -2074,24 +2247,49 @@ def task_editor(data):
                     st.caption('Esta especialidad se obtiene del entregable programado por el Administrador. '
                                'Para cambiarla, edita el catálogo de entregables.')
                     continue
+                if key in ('owner','reviewer'):
+                    continue  # Se editan juntos, mediante selectores múltiples.
                 if key=='specialty' and raw and raw not in SPECIALTIES:
                     st.caption(f'Especialidad anterior: {raw}. Selecciona una especialidad '
                                'vigente si esta tarea no tiene entregable relacionado.')
                 vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,
                                      form_key,project_code=project)
+            st.markdown('#### Asignación de equipo')
+            roster=people_for_assignment()
+            labels={int(person['id']):person for person in roster}
+            all_person_ids=list(labels)
+            if rid is not None:
+                default_owners,default_reviewers=task_assigned_people(rid)
+            else:
+                default_owners,default_reviewers=set(),set()
+            def person_label(pid):
+                person=labels[pid]
+                account=' · Usuario Consulta' if person.get('account_role')=='Consulta' else ''
+                return str(person['name'])+account
+            owner_ids=st.multiselect('Responsables * (uno o varios)',all_person_ids,
+                default=[i for i in all_person_ids if i in default_owners],
+                format_func=person_label,key=f'task_owners_{rid}')
+            reviewer_ids=st.multiselect('Revisores (uno o varios)',all_person_ids,
+                default=[i for i in all_person_ids if i in default_reviewers],
+                format_func=person_label,key=f'task_reviewers_{rid}')
+            if not all_person_ids:
+                st.warning('No hay integrantes en Personal. Crea un usuario Consulta o agrega Personal antes de asignar tareas.')
+            st.caption('Las tareas de cada usuario Consulta se filtran por su ficha de Personal; puede participar como responsable o revisor.')
             if st.button('💾 Guardar cambios',type='primary',key=f'save_task_{rid}'):
                 converted={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v)
                            for k,v in vals.items()}
                 try:
-                    save_record('Plan de trabajo',converted,rid)
+                    save_record('Plan de trabajo',converted,rid,task_assignees=(owner_ids,reviewer_ids))
                     st.success('Tarea guardada con la especialidad correspondiente al entregable.')
                     st.rerun()
                 except (ValueError,sqlite3.IntegrityError,requests.RequestException,PermissionError) as exc:
                     st.error(str(exc))
         bulk_delete_ui('Plan de trabajo',data)
     else:
-        st.info('Modo consulta: puedes buscar y visualizar el plan de trabajo sin modificarlo.')
-    card_browser('Plan de trabajo',data['Plan de trabajo'],allow_version_edit=admin)
+        st.info('Mis actividades: únicamente se muestran las tareas donde figuras como responsable o revisor.')
+    visible_tasks=(data['Plan de trabajo'] if admin else
+        visible_consulta_tasks(data['Plan de trabajo'],st.session_state['user_id']))
+    card_browser('Plan de trabajo',visible_tasks,allow_version_edit=admin)
 
 
 def edit_module(module,data):
