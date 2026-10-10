@@ -1099,21 +1099,40 @@ def decorate():
         pe['Tareas activas']=work;pe['Proyectos asignados']=projects;pe['Carga de trabajo']=load
     return data
 
-def selectors(kind,current=None):
+def programmed_deliveries(project_code):
+    # Catálogo previo a V01, filtrado siempre por ID Proyecto.
+    if not project_code:
+        return {}
+    with connection() as con:
+        rows=con.execute('''SELECT code,name FROM deliverable_catalog
+            WHERE project_code=? ORDER BY code''',(str(project_code),)).fetchall()
+    return {r['code']:r['name'] for r in rows}
+
+
+def selectors(kind,current=None,project_code=None):
     if kind=='project': return df('projects').code.dropna().tolist()
-    if kind=='delivery': return ['']+df('deliverables').code.dropna().tolist()
+    if kind=='delivery': return ['']+list(programmed_deliveries(project_code))
     if kind=='person': return df('people').name.dropna().tolist()
     return OPTIONS.get(kind,[])
 
-def form_input(key,label,kind,required,choice,value,form_key):
+def form_input(key,label,kind,required,choice,value,form_key,project_code=None):
     tag=form_key+'_'+key
     if kind in ('select','person','project','delivery'):
-        vals=selectors(choice if kind=='select' else kind)
+        vals=selectors(choice if kind=='select' else kind,project_code=project_code)
         if kind=='select' and key=='specialty' and 'form_people_' in form_key:
             vals=[v for v in vals if v not in ('Seguridad','Relaves')]
         if not required and kind!='delivery': vals=['']+vals
-        if value and value not in vals and kind!='select':vals=[value]+vals
+        if value and value not in vals and kind not in ('select','delivery'):vals=[value]+vals
         if not vals: st.warning(f'Primero registre {"personal" if kind=="person" else "proyectos" if kind=="project" else "entregables"}.') ;vals=['']
+        if kind=='delivery':
+            names=programmed_deliveries(project_code)
+            if len(vals)==1 and vals[0]=='':
+                st.caption('Este proyecto aún no tiene entregables programados por el Administrador.')
+            if value and value not in names:
+                st.warning('El entregable vinculado anteriormente no corresponde al proyecto seleccionado o fue retirado. Selecciona otro para guardar.')
+            return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,
+                format_func=lambda c:(f'{c} — {names[c]}' if c else '— Sin entregable relacionado —'),
+                key=tag+'_'+str(project_code)+'_'+str(value))
         return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,key=tag+'_'+str(value))
     if kind=='version': return st.text_input(label,value=value or 'V01',key=tag,help='Formato recomendado: V01, V02, V03…')
     if kind=='date':
@@ -1209,6 +1228,16 @@ def save_record(module,values,record_id=None):
     if module=='Proyectos' and record_id is not None:
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
+    if module=='Plan de trabajo':
+        project=str(values.get('project_code') or '').strip()
+        selected=str(values.get('delivery_code') or '').strip()
+        with connection() as con:
+            if not con.execute('SELECT 1 FROM projects WHERE code=?',(project,)).fetchone():
+                raise ValueError('Selecciona un proyecto registrado para esta tarea.')
+            if selected and not con.execute('''SELECT 1 FROM deliverable_catalog
+                    WHERE project_code=? AND code=?''',(project,selected)).fetchone():
+                raise ValueError('El entregable relacionado no está programado para este proyecto. '
+                                 'Selecciona uno del catálogo del proyecto correspondiente.')
     if module=='Entregables':
         code=str(values.get('code') or '').strip()
         project=str(values.get('project_code') or '').strip()
@@ -1647,6 +1676,11 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
             if build_deliverable_id(project_code,code[len(prefix):])!=code:
                 raise ValueError('El ID Entregable debe seguir el formato del proyecto y código adicional.')
         current=con.execute('SELECT * FROM deliverables WHERE code=?',(previous['code'],)).fetchone()
+        linked_tasks=con.execute('SELECT COUNT(*) FROM tasks WHERE delivery_code=?',
+                                 (previous['code'],)).fetchone()[0]
+        if linked_tasks and project_code!=previous['project_code']:
+            raise ValueError('Este entregable tiene tareas vinculadas. Antes de moverlo a otro proyecto, '
+                             'desvincula esas tareas en Plan de trabajo.')
         history=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',
                             (previous['code'],)).fetchone()
         if (current or (history and history['highest']>0)) and (code!=previous['code'] or project_code!=previous['project_code']):
@@ -1675,6 +1709,10 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
         with connection() as con:
             con.execute('''UPDATE deliverable_catalog SET project_code=?,code=?,name=?,specialty=?,final_due_date=?
                 WHERE id=?''',(project_code,code,name,specialty,final_date,catalog_id))
+            if code!=previous['code']:
+                # El ID es referencia de tareas, incluidas las que aún no tienen V01.
+                con.execute('UPDATE tasks SET delivery_code=? WHERE delivery_code=?',
+                            (code,previous['code']))
             if current:
                 con.execute('''UPDATE deliverables SET name=?,specialty=?,due_date=? WHERE id=?''',
                     (name,specialty,final_date,current['id']))
@@ -1989,14 +2027,32 @@ def edit_module(module,data):
                     idx=items.index(choice)-1;row=existing.iloc[idx].to_dict();rid=int(row['id'])
             else:
                 st.info('Puedes crear un entregable nuevo y adjuntar sus archivos iniciales. Después de guardarlo, solo el administrador podrá modificarlo.')
+            task_project=None
+            if module=='Plan de trabajo':
+                # Fuera de st.form: al cambiar el proyecto, Streamlit actualiza
+                # inmediatamente los entregables disponibles dentro del formulario.
+                project_list=selectors('project')
+                if not project_list:
+                    st.warning('Primero registra un proyecto para poder crear una tarea.')
+                    return
+                preferred=row.get('project_code')
+                task_project=st.selectbox('ID Proyecto *',project_list,
+                    index=project_list.index(preferred) if preferred in project_list else 0,
+                    key='task_project_'+str(rid if rid is not None else 'nuevo'))
+                st.caption('Los entregables relacionados proceden del catálogo del Administrador; '
+                           'no necesitan tener una primera versión (V01).')
             with st.form('form_'+table+'_'+str(rid),clear_on_submit=False):
                 vals={}
+                if module=='Plan de trabajo':
+                    vals['project_code']=task_project
                 version_choice=None
                 if module=='Entregables' and admin and rid:
                     st.caption('Una revisión nueva aumenta la versión. Los datos existentes se pueden modificar conservando la versión actual.')
                     version_choice=st.radio('Acción de versión',['Conservar versión actual','Registrar nueva versión'],
                         horizontal=True,index=1,key=f'version_action_{rid}')
                 for key,label,kind,required,opt in fields:
+                    if module=='Plan de trabajo' and key=='project_code':
+                        continue  # Ya elegido antes del formulario para filtrar entregables.
                     if module=='Entregables' and key=='file_path':
                         vals[key]=row.get('file_path') or ''
                         continue
@@ -2011,7 +2067,8 @@ def edit_module(module,data):
                         vals[key]='Pendiente';st.text_input('Estado *',value='Pendiente',disabled=True)
                     else:
                         vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,
-                            'form_'+table+'_'+str(rid if rid is not None else 'nuevo'))
+                            'form_'+table+'_'+str(rid if rid is not None else 'nuevo'),
+                            project_code=task_project if module=='Plan de trabajo' else None)
                 pdf_file=None;edit_file=None
                 if module=='Entregables':
                     st.markdown('#### 📎 Documentos del entregable')
