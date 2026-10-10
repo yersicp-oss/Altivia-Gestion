@@ -37,7 +37,7 @@ TASK_STATES=['No iniciado','En desarrollo','En revisión','Con observaciones','C
 DELIVERY_STATES=['Pendiente','En desarrollo','En revisión interna','Con observaciones','En corrección','Aprobado internamente','Enviado al cliente','Observado por cliente','Corregido','Aprobado','Entregado']
 CHANGE_STATES=['Solicitado','Aprobado','Ejecutado']
 MEETING_STATES=['Pendiente','En proceso','Completado','Atrasado','Cancelado']
-SPECIALTIES=['Arquitectura','Estructuras','Eléctricas','Sanitarias','HVAC','Seguridad','BIM','Coordinación','Geotecnia','Relaves','Hidráulica','Mecánica','Topografía','Otra']
+SPECIALTIES=['Arquitectura','Estructuras','Eléctricas','Sanitarias','Comunicaciones','Modelado','Metrados y Presupuesto','BIM','Coordinación','Topografía']
 PROJECT_TYPES=['Arquitectura','Estructuras','Instalaciones eléctricas','Instalaciones sanitarias','HVAC','BIM','Expediente técnico','Otro']
 PRIORITIES=['Alta','Media','Baja']; RISKS=['Bajo','Medio','Alto','Crítico']
 ROLES=['Gerente','Jefe de Proyecto','Coordinador','Arquitecto','Ingeniero','Dibujante','Modelador BIM','Revisor','Asistente','Otro']
@@ -48,7 +48,7 @@ SPECS={
  'Proyectos':('projects',[
  ('code','ID Proyecto','text',True,None),('name','Proyecto','text',True,None),('client','Cliente','text',False,None),('type','Tipo','select',False,'types'),('location','Ubicación','text',False,None),('manager','Jefe / Coordinador','person',False,None),('start_date','Fecha inicio','date',False,None),('due_date','Fecha entrega','date',False,None),('status','Estado','select',True,'project_states'),('priority','Prioridad','select',False,'priorities'),('notes','Observaciones','long',False,None)]),
  'Plan de trabajo':('tasks',[
- ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('specialty','Especialidad','select',False,'specialties'),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
+ ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
  'Entregables':('deliverables',[
  ('project_code','ID Proyecto','project',True,None),('code','ID Entregable','text',True,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha de Presentación Final','date',True,None),('actual_date','Fecha de entregable','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Enlace del documento (Google Drive / OneDrive / SharePoint)','text',False,None)]),
  'Control de cambios':('changes',[
@@ -1109,6 +1109,21 @@ def programmed_deliveries(project_code):
     return {r['code']:r['name'] for r in rows}
 
 
+def programmed_delivery_specialty(project_code, delivery_code):
+    """La especialidad de una tarea vinculada SIEMPRE viene del catálogo admin.
+
+    Acepta entregables aún sin V01. Un valor antiguo (p. ej. Geotecnia) se
+    conserva para registros históricos, aunque ya no aparezca en la lista
+    desplegable de especialidades nuevas.
+    """
+    if not project_code or not delivery_code:
+        return ''
+    with connection() as con:
+        row=con.execute("SELECT specialty FROM deliverable_catalog WHERE project_code=? AND code=?",
+                        (str(project_code), str(delivery_code))).fetchone()
+    return (row['specialty'] or '') if row else ''
+
+
 def selectors(kind,current=None,project_code=None):
     if kind=='project': return df('projects').code.dropna().tolist()
     if kind=='delivery': return ['']+list(programmed_deliveries(project_code))
@@ -1234,10 +1249,16 @@ def save_record(module,values,record_id=None):
         with connection() as con:
             if not con.execute('SELECT 1 FROM projects WHERE code=?',(project,)).fetchone():
                 raise ValueError('Selecciona un proyecto registrado para esta tarea.')
-            if selected and not con.execute('''SELECT 1 FROM deliverable_catalog
-                    WHERE project_code=? AND code=?''',(project,selected)).fetchone():
-                raise ValueError('El entregable relacionado no está programado para este proyecto. '
-                                 'Selecciona uno del catálogo del proyecto correspondiente.')
+            if selected:
+                catalog=con.execute("SELECT specialty FROM deliverable_catalog WHERE project_code=? AND code=?",
+                                    (project,selected)).fetchone()
+                if catalog is None:
+                    raise ValueError('El entregable relacionado no está programado para este proyecto. '
+                                     'Selecciona uno del catálogo del proyecto correspondiente.')
+                # La BD prevalece frente al campo del navegador.
+                values['specialty']=catalog['specialty'] or ''
+            elif values.get('specialty') not in ('',None,*SPECIALTIES):
+                raise ValueError('Selecciona una especialidad vigente del listado.')
     if module=='Entregables':
         code=str(values.get('code') or '').strip()
         project=str(values.get('project_code') or '').strip()
@@ -1713,6 +1734,9 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
                 # El ID es referencia de tareas, incluidas las que aún no tienen V01.
                 con.execute('UPDATE tasks SET delivery_code=? WHERE delivery_code=?',
                             (code,previous['code']))
+            # Los vínculos existen incluso si el entregable aún no tiene V01.
+            con.execute('''UPDATE tasks SET specialty=? WHERE project_code=? AND delivery_code=?''',
+                (specialty or '',project_code,code))
             if current:
                 con.execute('''UPDATE deliverables SET name=?,specialty=?,due_date=? WHERE id=?''',
                     (name,specialty,final_date,current['id']))
@@ -1825,8 +1849,12 @@ def delivery_catalog_admin_ui():
                         disabled=bool(item['registered']),key=f'cat_code_{item["id"]}').strip()
                     name2=st.text_input('Nombre del entregable',value=item['name'],key=f'cat_name_{item["id"]}').strip()
                     sp_list=['']+SPECIALTIES
-                    if (item['specialty'] or '') not in sp_list:sp_list.append(item['specialty'])
-                    sp=st.selectbox('Especialidad',sp_list,index=sp_list.index(item['specialty'] or ''),
+                    old_sp=item['specialty'] or ''
+                    if old_sp and old_sp not in sp_list:
+                        st.caption(f'Especialidad anterior: {old_sp}. Ya no está en el listado; '
+                                   'selecciona una especialidad vigente al guardar.')
+                    sp=st.selectbox('Especialidad',sp_list,
+                                    index=sp_list.index(old_sp) if old_sp in sp_list else 0,
                                     key=f'cat_spec_{item["id"]}')
                     due2=st.date_input('Fecha de Presentación Final',
                         value=date.fromisoformat(item['final_due_date']),format='DD/MM/YYYY',key=f'cat_due_{item["id"]}')
@@ -2006,9 +2034,71 @@ def delivery_editor(data):
     card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
     if admin:bulk_delete_ui('Entregables',data)
 
+def task_editor(data):
+    """Plan de trabajo con selección reactiva de entregable y especialidad."""
+    st.title('Plan de trabajo')
+    admin=can_edit()
+    table,fields=SPECS['Plan de trabajo']
+    if admin:
+        with st.expander('✏️ Crear o editar registro'):
+            existing=data['Plan de trabajo']
+            choices=['➕ Nuevo registro'] + [
+                f'{r["code"]} — {r.get("activity", "")}' for _,r in existing.iterrows()]
+            picked=st.selectbox('Registro a editar',choices,key='pick_tasks')
+            rid=None; row={}
+            if picked!='➕ Nuevo registro':
+                row=existing.iloc[choices.index(picked)-1].to_dict()
+                rid=int(row['id'])
+            form_key='form_tasks_'+str(rid if rid is not None else 'nuevo')
+            vals={};project=None
+            for key,label,kind,required,opt in fields:
+                raw=row.get(key)
+                if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):
+                    raw=None
+                if key=='project_code':
+                    vals[key]=form_input(key,label+' *',kind,required,opt,raw,form_key)
+                    project=vals[key]
+                    continue
+                if key=='delivery_code':
+                    # El control está FUERA de st.form. Streamlit reruns al cambiarlo.
+                    vals[key]=form_input(key,label,kind,required,opt,raw,form_key,
+                                         project_code=project)
+                    continue
+                if key=='specialty' and vals.get('delivery_code'):
+                    auto=programmed_delivery_specialty(project,vals['delivery_code'])
+                    vals[key]=auto
+                    st.text_input('Especialidad (automática)',
+                        value=auto or 'Sin especialidad asignada en el catálogo',
+                        disabled=True,
+                        key=f'task_auto_spec_{rid}_{project}_{vals["delivery_code"]}_{auto}')
+                    st.caption('Esta especialidad se obtiene del entregable programado por el Administrador. '
+                               'Para cambiarla, edita el catálogo de entregables.')
+                    continue
+                if key=='specialty' and raw and raw not in SPECIALTIES:
+                    st.caption(f'Especialidad anterior: {raw}. Selecciona una especialidad '
+                               'vigente si esta tarea no tiene entregable relacionado.')
+                vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,
+                                     form_key,project_code=project)
+            if st.button('💾 Guardar cambios',type='primary',key=f'save_task_{rid}'):
+                converted={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v)
+                           for k,v in vals.items()}
+                try:
+                    save_record('Plan de trabajo',converted,rid)
+                    st.success('Tarea guardada con la especialidad correspondiente al entregable.')
+                    st.rerun()
+                except (ValueError,sqlite3.IntegrityError,requests.RequestException,PermissionError) as exc:
+                    st.error(str(exc))
+        bulk_delete_ui('Plan de trabajo',data)
+    else:
+        st.info('Modo consulta: puedes buscar y visualizar el plan de trabajo sin modificarlo.')
+    card_browser('Plan de trabajo',data['Plan de trabajo'],allow_version_edit=admin)
+
+
 def edit_module(module,data):
     if module=='Proyectos':
         return project_editor(data)
+    if module=='Plan de trabajo':
+        return task_editor(data)
     if module=='Entregables':
         return delivery_editor(data)
     table,fields=SPECS[module]
