@@ -36,6 +36,38 @@ def peru_timestamp():
     """Marca con zona horaria de Perú para el semáforo de 72 horas."""
     return datetime.now(ZoneInfo('America/Lima')).isoformat(timespec='seconds')
 
+def task_signal(due_date, submitted=False, today=None):
+    '''Semáforo de tarea: entrega vinculada > vencimiento desde hoy > seguimiento.
+
+    Se usa la fecha local peruana, sin depender del estado manual de la tarea.
+    '''
+    if submitted:
+        return 'green'
+    today = today or today_peru()
+    try:
+        due = date.fromisoformat(str(due_date)[:10])
+    except (TypeError, ValueError):
+        return 'yellow'
+    return 'red' if due <= today else 'yellow'
+
+
+def task_ids_with_submitted_delivery():
+    '''Tareas vinculadas a una versión que SIGUE existiendo en el historial.
+
+    No marca una tarea verde por el simple hecho de estar en el catálogo; si
+    se elimina una versión, el enlace histórico huérfano no cuenta.
+    '''
+    with connection() as con:
+        records=con.execute('''SELECT DISTINCT vt.task_id
+          FROM delivery_version_tasks vt
+          JOIN deliverables d ON d.id=vt.delivery_id
+          JOIN versions v ON v.delivery_code=d.code AND v.version=vt.version
+          JOIN tasks t ON t.id=vt.task_id
+              AND t.project_code=d.project_code AND t.delivery_code=d.code
+          WHERE vt.task_id IS NOT NULL''').fetchall()
+    return {int(r[0]) for r in records}
+
+
 def delivery_signal(status,last_modified,now=None):
     """Verde si el Admin cambió Pendiente, si no amarillo o rojo a las 72 h."""
     if str(status or '').strip()!='Pendiente':
@@ -637,7 +669,7 @@ def update_user_by_admin(target_id,username,full_name,role,active,new_password='
     full_name=str(full_name or '').strip()
     if not full_name:raise ValueError('El nombre completo es obligatorio.')
     if len(full_name)>150:raise ValueError('El nombre completo no debe exceder 150 caracteres.')
-    if role not in ('Administrador','Consulta','Cliente'):
+    if role not in ('Administrador','Consulta','Cliente','Global'):
         raise ValueError('Rol no válido.')
     if new_password and len(new_password)<6:
         raise ValueError('La contraseña nueva debe tener al menos 6 caracteres.')
@@ -851,7 +883,7 @@ def user_management():
         with st.form('new_user'):
             username=st.text_input('Usuario nuevo').strip().lower()
             name=st.text_input('Nombre completo').strip()
-            role=st.selectbox('Rol',['Consulta','Cliente','Administrador'])
+            role=st.selectbox('Rol',['Consulta','Global','Cliente','Administrador'])
             password=st.text_input('Contraseña inicial (mínimo 6 caracteres)',type='password')
             initial_projects=st.multiselect('Proyectos visibles (aplica solo a Consulta)',project_ids,
                 format_func=lambda i:project_labels[i],key='new_consulta_project_grants',
@@ -885,7 +917,7 @@ def user_management():
                 with st.form(f'edit_user_form_{selected}'):
                     new_username=st.text_input('Nombre de usuario',value=str(r['username']))
                     new_full_name=st.text_input('Nombre completo',value=str(r['full_name']))
-                    allowed_roles=['Administrador','Consulta','Cliente']
+                    allowed_roles=['Administrador','Consulta','Global','Cliente']
                     new_role=st.selectbox('Rol',allowed_roles,index=allowed_roles.index(str(r['role'])))
                     active=st.checkbox('Cuenta activa',value=bool(r['active']))
                     reset=st.text_input('Nueva contraseña (opcional; dejar vacío para conservar)',type='password')
@@ -2091,6 +2123,7 @@ def task_cards(frame):
     with connection() as con:
         project_names={str(p['code']):(str(p['name'] or ''),str(p['client'] or ''))
             for p in con.execute('SELECT code,name,client FROM projects')}
+    submitted_ids=task_ids_with_submitted_delivery()
     page_size=10
     max_page=max(1,(len(frame)+page_size-1)//page_size)
     page=st.number_input('Página',min_value=1,max_value=max_page,value=1,step=1,key='cards_page_tasks')
@@ -2102,7 +2135,11 @@ def task_cards(frame):
         reviewers=escape(str(r.get('reviewer') or 'Sin asignar'))
         start=escape(str(r.get('start_date') or '—'))
         due=escape(str(r.get('due_date') or '—'))
-        with st.container(border=True):
+        signal=task_signal(r.get('due_date'), int(r['id']) in submitted_ids)
+        with st.container(border=True,key=f'gp_task_{signal}_card_{int(r["id"])}'):
+            st.caption({'yellow':'● En seguimiento',
+                        'red':'● Fecha de término alcanzada',
+                        'green':'● Entrega registrada'}[signal])
             # 1. Actividad destacada: 1.2rem = 20% más que el texto base.
             st.markdown(f'<div style="font-size:1.2rem;font-weight:750;line-height:1.35;overflow-wrap:anywhere">{activity}</div>',
                         unsafe_allow_html=True)
@@ -2439,10 +2476,12 @@ def project_editor(data):
                             st.session_state['show_project_create']=False
                             st.success('Proyecto creado correctamente.');st.rerun()
                         except (ValueError,sqlite3.IntegrityError) as exc:st.error(str(exc))
-    projects=data['Proyectos'] if can_edit() else visible_project_rows(
-        data['Proyectos'],st.session_state['user_id'])
-    if not can_edit():
+    projects=(data['Proyectos'] if can_edit() or st.session_state.get('role')=='Global'
+              else visible_project_rows(data['Proyectos'],st.session_state['user_id']))
+    if st.session_state.get('role')=='Consulta':
         st.caption('Solo se muestran los proyectos autorizados por el Administrador.')
+    elif st.session_state.get('role')=='Global':
+        st.caption('Global: todos los proyectos de ALTIVIA, en modo de solo lectura.')
     card_browser('Proyectos',projects)
     if can_edit():bulk_delete_ui('Proyectos',data)
 
@@ -2718,8 +2757,22 @@ def delivery_editor(data):
         if st.session_state.get('catalog_visible'):
             delivery_catalog_admin_ui()
             st.divider()
+    if role=='Global':
+        st.caption('Global: acceso de solo lectura a todos los entregables, sin asignación individual.')
+        with st.expander('📋 Entregables programados (incluye los que aún no tienen V01)'):
+            rows=catalog_rows()
+            if rows:
+                st.dataframe(pd.DataFrame([{
+                    'ID Proyecto':r['project_code'], 'ID Entregable':r['code'],
+                    'Nombre':r['name'], 'Especialidad':r['specialty'],
+                    'Presentación final':r['final_due_date'],
+                    'Registro': 'Con versiones' if r['registered'] else 'Pendiente de V01'
+                } for r in rows]),hide_index=True,use_container_width=True)
+            else:st.info('No hay entregables programados todavía.')
+        card_browser('Entregables',data['Entregables'],allow_version_edit=False)
+        return
     if not (admin or role=='Consulta'):
-        card_browser('Entregables',data['Entregables'],allow_version_edit=False);return
+        st.error('Acceso restringido a Entregables.');return
     st.subheader('Registrar entrega' if role=='Consulta' else 'Crear o editar una entrega')
     if role=='Consulta':
         st.info('Puedes registrar V01 y después V02, V03… para los entregables asignados. Cada versión anterior se conserva y no puede editarse desde Consulta.')
@@ -2970,9 +3023,11 @@ def task_editor(data):
                         except (ValueError,sqlite3.IntegrityError,requests.RequestException,PermissionError) as exc:
                             st.error(str(exc))
         bulk_delete_ui('Plan de trabajo',data)
-    else:
+    elif st.session_state.get('role')=='Consulta':
         st.info('Mis actividades: únicamente se muestran las tareas donde figuras como responsable o revisor.')
-    visible_tasks=(data['Plan de trabajo'] if admin else
+    else:
+        st.info('Global: vista de todas las actividades, en modo de solo lectura.')
+    visible_tasks=(data['Plan de trabajo'] if admin or st.session_state.get('role')=='Global' else
         visible_consulta_tasks(data['Plan de trabajo'],st.session_state['user_id']))
     task_cards(visible_tasks)
 
@@ -3318,6 +3373,25 @@ def setup_style():
       background:rgba(62,126,191,.16)!important;
       border-color:rgba(93,153,212,.52)!important;
     }
+    /* Semáforo PLAN DE TRABAJO: tonos pastel, sin modificar estilos de Proyectos. */
+    [class*="st-key-gp_task_yellow_card_"]{
+      background:rgba(226,178,44,.105)!important;
+      border:1px solid rgba(194,155,59,.32)!important;
+      border-left:4px solid #c7a24b!important;border-radius:12px!important;
+      padding:10px 12px!important;
+    }
+    [class*="st-key-gp_task_red_card_"]{
+      background:rgba(208,88,91,.095)!important;
+      border:1px solid rgba(199,93,98,.32)!important;
+      border-left:4px solid #c06a72!important;border-radius:12px!important;
+      padding:10px 12px!important;
+    }
+    [class*="st-key-gp_task_green_card_"]{
+      background:rgba(62,157,112,.105)!important;
+      border:1px solid rgba(77,156,111,.32)!important;
+      border-left:4px solid #54a57e!important;border-radius:12px!important;
+      padding:10px 12px!important;
+    }
     /* Semáforo de ENTREGABLES: tonos pastel discretos, compatibles con el azul ALTIVIA. */
     [class*="st-key-gp_delivery_yellow_card_"]{
       background:rgba(226,178,44,.11)!important;
@@ -3372,17 +3446,22 @@ def main():
         if st.button('Cerrar sesión'):
             end_login_session()
             st.rerun()
-        pages=(['Mis documentos','Mi cuenta'] if st.session_state.get('role')=='Cliente' else
+        role=st.session_state.get('role')
+        pages=(['Mis documentos','Mi cuenta'] if role=='Cliente' else
                ['Proyectos','Plan de trabajo','Entregables','Checklist','Versiones','Mi cuenta']
-               if st.session_state.get('role')=='Consulta' else
+               if role=='Consulta' else
+               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Checklist','Versiones','Mi cuenta']
+               if role=='Global' else
                ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
         page=st.radio('Navegación',pages)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
     data=decorate()
     if page=='Mis documentos':client_portal()
-    elif page=='Dashboard' and can_edit():dashboard(data)
-    elif page in SPECS and st.session_state.get('role')!='Cliente' and (page not in ('Personal','Control de cambios') or can_edit()):
+    elif page=='Dashboard' and st.session_state.get('role') in ('Administrador','Global'):dashboard(data)
+    elif page in SPECS and st.session_state.get('role')!='Cliente' and (
+            page!='Control de cambios' or can_edit()) and (
+            page!='Personal' or st.session_state.get('role') in ('Administrador','Global')):
         edit_module(page,data)
     elif page=='Checklist' and st.session_state.get('role')!='Cliente':checklist_page()
     elif page=='Versiones' and st.session_state.get('role')!='Cliente':versions_page()
