@@ -32,6 +32,29 @@ REMEMBER_DAYS = 7
 def today_peru():
     return datetime.now(ZoneInfo('America/Lima')).date()
 
+def peru_timestamp():
+    """Marca con zona horaria de Perú para el semáforo de 72 horas."""
+    return datetime.now(ZoneInfo('America/Lima')).isoformat(timespec='seconds')
+
+def delivery_signal(status,last_modified,now=None):
+    """Verde si el Admin cambió Pendiente, si no amarillo o rojo a las 72 h."""
+    if str(status or '').strip()!='Pendiente':
+        return 'green',None
+    clock=now or datetime.now(ZoneInfo('America/Lima'))
+    if last_modified:
+        try:
+            point=datetime.fromisoformat(str(last_modified).replace('Z','+00:00'))
+            if point.tzinfo is None:
+                # Registros migrados de SQLite created_at en UTC.
+                point=point.replace(tzinfo=timezone.utc)
+            diff=clock-point.astimezone(ZoneInfo('America/Lima'))
+            if diff>timedelta(hours=72):
+                return 'red',int(diff.total_seconds()//86400)
+        except (TypeError,ValueError,OverflowError):
+            pass
+    return 'yellow',None
+
+
 PROJECT_STATES=['No iniciado','En desarrollo','En revisión','En corrección','Terminado']
 TASK_STATES=['No iniciado','En desarrollo','En revisión','Con observaciones','Corregido','Aprobado']
 DELIVERY_STATES=['Pendiente','En desarrollo','En revisión interna','Con observaciones','En corrección','Aprobado internamente','Enviado al cliente','Observado por cliente','Corregido','Aprobado','Entregado']
@@ -50,7 +73,7 @@ SPECS={
  'Plan de trabajo':('tasks',[
  ('code','ID Tarea','text',True,None),('project_code','ID Proyecto','project',True,None),('activity','Actividad','text',True,None),('delivery_code','Entregable relacionado','delivery',False,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',False,None),('start_date','Fecha de inicio','date',True,None),('due_date','Fecha término','date',True,None),('progress','Avance (%)','int',True,None),('status','Estado','select',True,'task_states'),('priority','Prioridad','select',False,'priorities'),('updated_at','Fecha actualización','date',False,None),('notes','Observaciones','long',False,None)]),
  'Entregables':('deliverables',[
- ('project_code','ID Proyecto','project',True,None),('code','ID Entregable','text',True,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',True,None),('reviewer','Revisor','person',True,None),('version','Versión','version',True,None),('due_date','Fecha de Presentación Final','date',True,None),('actual_date','Fecha de entregable','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Enlace del documento (Google Drive / OneDrive / SharePoint)','text',False,None)]),
+ ('project_code','ID Proyecto','project',True,None),('code','ID Entregable','text',True,None),('name','Nombre del plano/documento','text',True,None),('specialty','Especialidad','select',False,'specialties'),('owner','Responsable','person',False,None),('reviewer','Revisor','person',False,None),('version','Versión','version',True,None),('due_date','Fecha de Presentación Final','date',True,None),('actual_date','Fecha de entregable','date',False,None),('status','Estado','select',True,'delivery_states'),('review_date','Fecha revisión','date',False,None),('correction_date','Fecha corrección','date',False,None),('approval_date','Fecha aprobación','date',False,None),('notes','Observaciones','long',False,None),('file_path','Enlace del documento (Google Drive / OneDrive / SharePoint)','text',False,None)]),
  'Control de cambios':('changes',[
  ('code','ID Cambio','text',True,None),('project_code','ID Proyecto','project',True,None),('request_date','Fecha solicitud','date',True,None),('requester','Solicitante','text',True,None),('description','Descripción cambio','long',True,None),('reason','Motivo','long',False,None),('specialty','Especialidad afectada','select',False,'specialties'),('affected_drawings','Planos afectados','text',False,None),('owner','Responsable','person',True,None),('schedule_impact','Impacto en plazo','select',False,'risks'),('new_due_date','Nueva fecha entrega','date',False,None),('approved_by','Aprobado por','text',False,None),('approval_date','Fecha aprobación','date',False,None),('status','Estado','select',True,'change_states'),('notes','Observaciones','long',False,None)]),
  'Personal':('people',[
@@ -109,6 +132,29 @@ def initialize():
             specialty TEXT,
             final_due_date TEXT NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+        # Nueva relación: tarea seleccionada en la entrega y snapshot por versión.
+        # No rompe entregas históricas que aún no tenían tarea elegida.
+        deliverable_cols={r[1] for r in con.execute('PRAGMA table_info(deliverables)')}
+        if 'task_id' not in deliverable_cols:
+            con.execute('ALTER TABLE deliverables ADD COLUMN task_id INTEGER')
+        if 'last_modified_at' not in deliverable_cols:
+            con.execute('ALTER TABLE deliverables ADD COLUMN last_modified_at TEXT')
+        con.execute('''CREATE TABLE IF NOT EXISTS delivery_version_tasks (
+            delivery_id INTEGER NOT NULL REFERENCES deliverables(id) ON DELETE CASCADE,
+            version TEXT NOT NULL,
+            task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+            task_code TEXT,
+            activity TEXT,
+            owners TEXT,
+            reviewers TEXT,
+            PRIMARY KEY(delivery_id,version))''')
+        # Backfill conservador: el campo actual_date/última versión representa la
+        # última entrega; created_at representa UTC y se usa solo como respaldo.
+        con.execute('''UPDATE deliverables SET last_modified_at =
+            CASE WHEN actual_date IS NOT NULL AND trim(actual_date)<>''
+                 THEN substr(actual_date,1,10)||'T00:00:00-05:00'
+                 ELSE replace(created_at,' ','T')||'+00:00' END
+            WHERE last_modified_at IS NULL OR trim(last_modified_at)='' ''')
         # Compatibilidad con SQLite existente: preservar vínculos y enlaces viejos, aunque
         # la casilla 'Código del plano' ya no sea visible en el formulario.
         cols={r[1] for r in con.execute('PRAGMA table_info(deliverables)')}
@@ -1219,6 +1265,8 @@ def register_document(delivery_id, version, title, actor_role=None):
         con.execute('''INSERT INTO document_serials(delivery_id,version,highest) VALUES(?,?,?)
             ON CONFLICT(delivery_id,version) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
                     (delivery_id,version,n))
+        con.execute('UPDATE deliverables SET last_modified_at=? WHERE id=?',
+                    (peru_timestamp(),int(delivery_id)))
         return cursor.lastrowid,doc_no
 
 
@@ -1256,6 +1304,8 @@ def upload_document_file(upload, document_id, kind, allow_consulta=False):
             VALUES (?,?,?,?) ON CONFLICT(document_id,kind)
             DO UPDATE SET file_id=excluded.file_id,filename=excluded.filename,uploaded_at=CURRENT_TIMESTAMP''',
             (document_id,kind,file_id,filename))
+        con.execute('UPDATE deliverables SET last_modified_at=? WHERE id=?',
+                    (peru_timestamp(),int(row['delivery_id'])))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
             ('Documentos',row['code'],f'{row["version"]}/{row["doc_no"]} - {kind} subido'))
     # Si se sustituyó un archivo, el anterior permanece en Drive como respaldo.
@@ -1641,6 +1691,32 @@ def preview_task_code(project_code):
         return task_code_for_project(project_code,con)
 
 
+def linked_delivery_tasks(project_code,delivery_code,user_id=None):
+    """Tareas del mismo entregable; Consulta ve solo sus asignaciones."""
+    with connection() as con:
+        params=[str(project_code),str(delivery_code)]
+        where='t.project_code=? AND t.delivery_code=?'
+        if user_id is not None:
+            where+=""" AND EXISTS (
+                SELECT 1 FROM task_people tp JOIN people p ON p.id=tp.person_id
+                JOIN users u ON u.id=p.user_id
+                WHERE tp.task_id=t.id AND u.id=? AND u.role='Consulta' AND u.active=1)"""
+            params.append(int(user_id))
+        rows=[dict(r) for r in con.execute(
+            f"""SELECT t.id,t.code,t.activity,t.owner,t.reviewer FROM tasks t
+                WHERE {where} ORDER BY t.code""",params)]
+        for row in rows:
+            assigned=con.execute("""SELECT tp.assignment_role,p.name
+                FROM task_people tp JOIN people p ON p.id=tp.person_id
+                WHERE tp.task_id=? ORDER BY p.name COLLATE NOCASE""",(row['id'],)).fetchall()
+            owners=[r['name'] for r in assigned if r['assignment_role']=='Responsable']
+            reviewers=[r['name'] for r in assigned if r['assignment_role']=='Revisor']
+            # Las tareas anteriores siguen funcionando aun sin tabla task_people poblada.
+            row['owners']=', '.join(owners) if owners else str(row['owner'] or '')
+            row['reviewers']=', '.join(reviewers) if reviewers else str(row['reviewer'] or '')
+    return rows
+
+
 def save_record(module,values,record_id=None,task_assignees=None):
     '''Guarda datos; en entregables el catálogo controla IDs y fecha final.
 
@@ -1749,6 +1825,28 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 values['status']='Pendiente'
                 for f in ('review_date','correction_date','approval_date'):
                     values[f]=None
+        # task_id NO es un campo libre. Se valida nuevamente contra la BD.
+        chosen_id=values.get('task_id')
+        try:chosen_id=int(chosen_id) if chosen_id not in ('',None) else None
+        except (TypeError,ValueError):raise ValueError('Selecciona un ID Tarea válido.')
+        if consulta_delivery and chosen_id is None:
+            raise ValueError('Selecciona una tarea vinculada a este entregable.')
+        if chosen_id is not None:
+            permitted=linked_delivery_tasks(project,code,
+                st.session_state['user_id'] if consulta_delivery else None)
+            selected_task=next((t for t in permitted if int(t['id'])==chosen_id),None)
+            if selected_task is None:
+                raise PermissionError('La tarea no pertenece al entregable o no estás asignado a ella.')
+            values['task_id']=chosen_id
+            values['owner']=selected_task['owners']
+            values['reviewer']=selected_task['reviewers']
+        else:
+            selected_task=None
+            values['task_id']=None
+        # Cada guardado/versión reinicia la antigüedad; la edición rápida solo el estado.
+        values['last_modified_at']=peru_timestamp()
+        registering_version=(record_id is None or
+                              str(values['version'])!=str(registered['version'] if registered else ''))
         if values.get('status') not in DELIVERY_STATES:
             raise ValueError('Estado de entregable no válido.')
     mandatory=[label for k,label,_,required,_ in fields if required and (values.get(k) in ('',None))]
@@ -1816,6 +1914,18 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 [(record_id,int(pid),'Revisor') for pid in set(reviewers)])
             con.execute('INSERT OR IGNORE INTO task_people_migration(task_id) VALUES(?)',(record_id,))
         if module=='Entregables':
+            if registering_version or (was_update and can_edit() and selected_task is not None):
+                stored=con.execute('SELECT id FROM deliverables WHERE code=?',(values['code'],)).fetchone()
+                if stored:
+                    con.execute('''INSERT INTO delivery_version_tasks
+                        (delivery_id,version,task_id,task_code,activity,owners,reviewers)
+                        VALUES(?,?,?,?,?,?,?) ON CONFLICT(delivery_id,version) DO UPDATE SET
+                        task_id=excluded.task_id,task_code=excluded.task_code,
+                        activity=excluded.activity,owners=excluded.owners,reviewers=excluded.reviewers''',
+                        (int(stored['id']),values['version'],values['task_id'],
+                         selected_task['code'] if selected_task else '',
+                         selected_task['activity'] if selected_task else '',
+                         values.get('owner') or '',values.get('reviewer') or ''))
             con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES (?,?,?,?)',
                 (values['code'],values['version'],date.today().isoformat(),'Versión registrada desde formulario'))
             m=re.fullmatch(r'V(\d+)',str(values['version']).upper())
@@ -2039,7 +2149,7 @@ def update_delivery_status(delivery_id, new_status):
         record=con.execute("SELECT id,code,status,review_date,approval_date,correction_date FROM deliverables WHERE id=?",(int(delivery_id),)).fetchone()
         if not record:raise ValueError('El entregable ya no existe.')
         if record['status']==new_status:return False
-        fields={'status':new_status}
+        fields={'status':new_status,'last_modified_at':peru_timestamp()}
         stamp=today_peru().isoformat()
         # Respeta la validación del módulo: estos estados requieren revisión registrada.
         if new_status in ('Enviado al cliente','Aprobado','Entregado') and not record['review_date']:
@@ -2086,8 +2196,19 @@ def card_browser(module, frame, allow_version_edit=True):
         status_text=str(r.get('status') or 'Sin estado')
         code=str(r.get('code') or '')
         subtitle=' · '.join(str(r.get(k)) for k in ('project_code','specialty','version') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip())
-        with st.container(border=True,key=f'gp_project_card_{int(r["id"])}') if module=='Proyectos' else st.container(border=True):
+        if module=='Proyectos':
+            card_key=f'gp_project_card_{int(r["id"])}'
+        elif module=='Entregables':
+            signal,elapsed=delivery_signal(status_text,r.get('last_modified_at'))
+            card_key=f'gp_delivery_{signal}_card_{int(r["id"])}'
+        else:
+            card_key=f'gp_generic_card_{table}_{int(r["id"])}'
+        with st.container(border=True,key=card_key):
             st.markdown(f'**{escape(title)}**')
+            if module=='Entregables':
+                label={'yellow':'En seguimiento','red':'Sin cambios por más de 3 días',
+                       'green':'Estado actualizado por Administrador'}[signal]
+                st.caption('● '+label)
             st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
             if module!='Entregables' or can_edit():
                 st.markdown(f'**Estado:** {escape(status_text)}')
@@ -2164,10 +2285,20 @@ def versions_for_delivery(code,allow_edit=False):
     for ver in versions:
         version=ver['version'];vid=ver['id']
         docs=docs_for_version(did,version)
+        with connection() as con:
+            version_task=con.execute('''SELECT task_code,activity,owners,reviewers
+                FROM delivery_version_tasks WHERE delivery_id=? AND version=?''',
+                (did,version)).fetchone()
         with st.container(border=True):
             st.markdown(f'**{escape(version)}** · {escape(str(ver["registered_at"]))}' +
                 (' · **Vigente**' if version==delivery['version'] else ''))
             st.caption((ver['notes'] or 'Sin descripción') if is_admin else f'{len(docs)} documento(s)')
+            if version_task and version_task['task_code']:
+                with st.expander('Tarea vinculada a esta versión'):
+                    st.markdown('**ID Tarea:** '+escape(str(version_task['task_code'])))
+                    st.markdown('**Actividad:** '+escape(str(version_task['activity'] or '—')))
+                    st.markdown('**Responsables:** '+escape(str(version_task['owners'] or '—')))
+                    st.markdown('**Revisores:** '+escape(str(version_task['reviewers'] or '—')))
             for d in docs:
                 with st.container(border=True):
                     st.markdown(f'**📄 {escape(d["doc_no"])} — {escape(d["title"])}**')
@@ -2626,31 +2757,66 @@ def delivery_editor(data):
     current=existing or {}
     version=(current.get('version') or 'V01') if existing and action=='Editar registro actual' else next_version(code,current.get('version'))
     st.caption('ID, especialidad y fecha final definidos por Administrador.')
-    form_key=f'delivery_editor_{code}_{action}'
+    form_key=f'delivery_editor_{code}_{action}_{version}'
     if action=='Editar registro actual' and rid:
         st.info('Para reemplazar documentos existentes usa «Ver detalles y versiones». Aquí puedes agregar más documentos.')
     optional_docs=bool(rid and action=='Editar registro actual')
     how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
         max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
+    # Fuera de st.form para que las asignaciones se actualicen al elegir tarea.
+    st.text_input('Nombre del entregable',value=catalog['name'],disabled=True,
+                  key=f'{form_key}_delivery_name')
+    st.text_input('Especialidad',value=catalog['specialty'] or 'No asignada',disabled=True,
+                  key=f'{form_key}_delivery_specialty')
+    st.text_input('Versión',value=version,disabled=True,key=f'{form_key}_delivery_version')
+    due=date.fromisoformat(catalog['final_due_date'])
+    st.date_input('Fecha de Presentación Final',value=due,disabled=True,
+                  format='DD/MM/YYYY',key=f'{form_key}_delivery_due')
+    delivery_date=(current.get('actual_date') if (existing and action=='Editar registro actual') else None)
+    if delivery_date:
+        st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),
+                      disabled=True,format='DD/MM/YYYY',key=f'{form_key}_delivery_date')
+    elif existing and action=='Editar registro actual':
+        st.text_input('Fecha de entregable',value='No registrada (dato histórico)',
+                      disabled=True,key=f'{form_key}_delivery_date_old')
+    else:
+        delivery_date=today_peru().isoformat()
+        st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),
+                      disabled=True,format='DD/MM/YYYY',key=f'{form_key}_delivery_date')
+    # Solo tareas del proyecto y entregable; Consulta solo las suyas.
+    linked=linked_delivery_tasks(project,code,
+        st.session_state['user_id'] if role=='Consulta' else None)
+    choices={int(t['id']):t for t in linked}
+    saved_task=current.get('task_id') if existing else None
+    current_task_id=int(saved_task) if saved_task and not pd.isna(saved_task) else None
+    default_task=current_task_id if current_task_id in choices else None
+    options=[None]+list(choices)
+    task_id=st.selectbox('ID Tarea vinculada al entregable',options,
+        index=options.index(default_task) if default_task in options else 0,
+        format_func=lambda tid:choices[tid]['code'] if tid is not None else '— Seleccionar tarea —',
+        key=f'{form_key}_linked_task',
+        help='Solo muestra tareas asignadas a este entregable y al proyecto seleccionado.')
+    chosen=choices.get(task_id)
+    if chosen:
+        st.markdown('**Actividad:** '+escape(str(chosen['activity'] or 'Sin actividad')))
+        cols=st.columns(2)
+        with cols[0]:st.text_area('Responsables (automático)',value=chosen['owners'] or 'Sin asignar',
+                                 disabled=True,key=f'{form_key}_owners_auto_{task_id}',height=75)
+        with cols[1]:st.text_area('Revisores (automático)',value=chosen['reviewers'] or 'Sin asignar',
+                                 disabled=True,key=f'{form_key}_reviewers_auto_{task_id}',height=75)
+    else:
+        st.info('Selecciona un ID Tarea para completar automáticamente la actividad, responsables y revisores.')
+        if not linked:
+            st.warning('No hay tareas vinculadas disponibles. Vincula una tarea a este entregable desde Plan de trabajo.')
     with st.form(f'{form_key}_form'):
-        st.text_input('Nombre del entregable',value=catalog['name'],disabled=True)
-        st.text_input('Especialidad',value=catalog['specialty'] or 'No asignada',disabled=True)
-        st.text_input('Versión',value=version,disabled=True)
-        due=date.fromisoformat(catalog['final_due_date'])
-        st.date_input('Fecha de Presentación Final',value=due,disabled=True,format='DD/MM/YYYY')
-        delivery_date=(current.get('actual_date') if (existing and action=='Editar registro actual') else None)
-        if delivery_date:
-            st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),disabled=True,format='DD/MM/YYYY')
-        elif existing and action=='Editar registro actual':
-            st.text_input('Fecha de entregable',value='No registrada (dato histórico)',disabled=True)
-        else:
-            delivery_date=today_peru().isoformat()
-            st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),disabled=True,format='DD/MM/YYYY')
         vals={'project_code':project,'code':code,'name':catalog['name'],
               'specialty':catalog['specialty'] or '','version':version,'due_date':due.isoformat(),
-              'actual_date':delivery_date,'file_path':current.get('file_path') or ''}
+              'actual_date':delivery_date,'file_path':current.get('file_path') or '',
+              'task_id':task_id,
+              'owner':chosen['owners'] if chosen else current.get('owner') or '',
+              'reviewer':chosen['reviewers'] if chosen else current.get('reviewer') or ''}
         for key,label,kind,required,opt in SPECS['Entregables'][1]:
-            if key in ('project_code','code','name','specialty','version','due_date','actual_date','file_path'):continue
+            if key in ('project_code','code','name','specialty','version','due_date','actual_date','file_path','owner','reviewer'):continue
             if key=='status' and role=='Consulta':
                 vals[key]='Pendiente';continue
             old=current.get(key)
@@ -3151,6 +3317,25 @@ def setup_style():
     [class*="st-key-gp_project_card_"]:hover{
       background:rgba(62,126,191,.16)!important;
       border-color:rgba(93,153,212,.52)!important;
+    }
+    /* Semáforo de ENTREGABLES: tonos pastel discretos, compatibles con el azul ALTIVIA. */
+    [class*="st-key-gp_delivery_yellow_card_"]{
+      background:rgba(226,178,44,.11)!important;
+      border:1px solid rgba(194,155,59,.30)!important;
+      border-left:4px solid #c7a24b!important;border-radius:12px!important;
+      padding:10px 12px!important;
+    }
+    [class*="st-key-gp_delivery_red_card_"]{
+      background:rgba(208,88,91,.095)!important;
+      border:1px solid rgba(199,93,98,.32)!important;
+      border-left:4px solid #c06a72!important;border-radius:12px!important;
+      padding:10px 12px!important;
+    }
+    [class*="st-key-gp_delivery_green_card_"]{
+      background:rgba(62,157,112,.10)!important;
+      border:1px solid rgba(77,156,111,.30)!important;
+      border-left:4px solid #54a57e!important;border-radius:12px!important;
+      padding:10px 12px!important;
     }
     .block-container{padding-top:1.5rem}
     @media(max-width:900px){
