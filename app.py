@@ -169,6 +169,17 @@ def initialize():
             delivery_id INTEGER NOT NULL, version TEXT NOT NULL, highest INTEGER NOT NULL,
             PRIMARY KEY(delivery_id,version),
             FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        # Acceso opcional por documento. Si no se configura, hereda responsables y
+        # revisores de las tareas relacionadas con el entregable (compatibilidad).
+        # Si el Admin configura la lista, solo sus miembros tienen acceso al Checklist.
+        con.execute('''CREATE TABLE IF NOT EXISTS document_assignment_mode (
+            document_id INTEGER PRIMARY KEY REFERENCES delivery_documents(id) ON DELETE CASCADE)''')
+        con.execute('''CREATE TABLE IF NOT EXISTS document_people (
+            document_id INTEGER NOT NULL REFERENCES delivery_documents(id) ON DELETE CASCADE,
+            person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+            assignment_role TEXT NOT NULL CHECK(assignment_role IN ('Responsable','Revisor')),
+            PRIMARY KEY(document_id,person_id,assignment_role))''')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_document_people_person ON document_people(person_id,document_id)')
         # Un marcador evita restaurar D01 si el Administrador lo elimina después.
         con.execute('''CREATE TABLE IF NOT EXISTS legacy_document_imports (
             delivery_id INTEGER NOT NULL, version TEXT NOT NULL,
@@ -651,6 +662,95 @@ def consulta_project_ids(user_id):
             'SELECT project_id FROM consulta_project_access WHERE user_id=?', (int(user_id),))}
 
 
+def consulta_project_codes(user_id):
+    """Proyectos autorizados expresamente al usuario Consulta."""
+    with connection() as con:
+        rows=con.execute('''SELECT p.code FROM projects p
+            JOIN consulta_project_access pa ON pa.project_id=p.id
+            JOIN users u ON u.id=pa.user_id
+            WHERE pa.user_id=? AND u.role='Consulta' AND u.active=1''',(int(user_id),)).fetchall()
+    return {str(row['code']) for row in rows}
+
+
+def consulta_delivery_codes(user_id):
+    """Entregables con tarea asignada al usuario y proyecto autorizado."""
+    with connection() as con:
+        rows=con.execute('''SELECT DISTINCT c.code
+            FROM deliverable_catalog c
+            JOIN projects p ON p.code=c.project_code
+            JOIN consulta_project_access pa ON pa.project_id=p.id AND pa.user_id=?
+            JOIN tasks t ON t.project_code=c.project_code AND t.delivery_code=c.code
+            JOIN task_people tp ON tp.task_id=t.id
+            JOIN people pers ON pers.id=tp.person_id AND pers.user_id=?
+            JOIN users u ON u.id=pers.user_id AND u.role='Consulta' AND u.active=1''',
+            (int(user_id),int(user_id))).fetchall()
+    return {str(row['code']) for row in rows}
+
+
+def consulta_document_ids(user_id):
+    """Acceso al checklist SOLO si hay asignación como revisor/responsable.
+
+    Un documento con lista editada explícitamente usa esa lista; los documentos
+    sin lista propia heredan las personas de tareas del mismo entregable.
+    En ambos casos se exige autorización del proyecto.
+    """
+    with connection() as con:
+        rows=con.execute('''SELECT DISTINCT dd.id
+          FROM delivery_documents dd
+          JOIN deliverables d ON d.id=dd.delivery_id
+          JOIN projects p ON p.code=d.project_code
+          JOIN consulta_project_access pa ON pa.project_id=p.id AND pa.user_id=?
+          JOIN people pe ON pe.user_id=?
+          JOIN users u ON u.id=pe.user_id AND u.active=1 AND u.role='Consulta'
+          WHERE (
+             (EXISTS(SELECT 1 FROM document_assignment_mode m WHERE m.document_id=dd.id)
+               AND EXISTS(SELECT 1 FROM document_people dp
+                    WHERE dp.document_id=dd.id AND dp.person_id=pe.id))
+             OR
+             (NOT EXISTS(SELECT 1 FROM document_assignment_mode m WHERE m.document_id=dd.id)
+               AND EXISTS(SELECT 1 FROM tasks t
+                    JOIN task_people tp ON tp.task_id=t.id
+                    WHERE t.project_code=d.project_code AND t.delivery_code=d.code
+                          AND tp.person_id=pe.id))
+          )''',(int(user_id),int(user_id))).fetchall()
+    return {int(row['id']) for row in rows}
+
+
+def document_assignments(document_id):
+    with connection() as con:
+        customized=bool(con.execute('SELECT 1 FROM document_assignment_mode WHERE document_id=?',
+                                    (int(document_id),)).fetchone())
+        if customized:
+            records=con.execute('SELECT person_id,assignment_role FROM document_people WHERE document_id=?',
+                                (int(document_id),)).fetchall()
+        else:
+            records=con.execute('''SELECT DISTINCT tp.person_id,tp.assignment_role
+                FROM delivery_documents doc JOIN deliverables d ON d.id=doc.delivery_id
+                JOIN tasks t ON t.project_code=d.project_code AND t.delivery_code=d.code
+                JOIN task_people tp ON tp.task_id=t.id
+                WHERE doc.id=?''',(int(document_id),)).fetchall()
+    return customized, ({int(r['person_id']) for r in records if r['assignment_role']=='Responsable'},
+                        {int(r['person_id']) for r in records if r['assignment_role']=='Revisor'})
+
+
+def save_document_assignments(document_id,owners,reviewers):
+    require_admin()
+    owners=set(map(int,owners));reviewers=set(map(int,reviewers))
+    with connection() as con:
+        if not con.execute('SELECT 1 FROM delivery_documents WHERE id=?',(int(document_id),)).fetchone():
+            raise ValueError('El documento ya no existe.')
+        allowed_ids=owners|reviewers
+        if allowed_ids:
+            slots=','.join('?' for _ in allowed_ids)
+            existing={r[0] for r in con.execute(f'SELECT id FROM people WHERE id IN ({slots})',tuple(allowed_ids))}
+            if existing!=allowed_ids:raise ValueError('Un integrante ya no existe.')
+        con.execute('INSERT OR IGNORE INTO document_assignment_mode(document_id) VALUES(?)',(int(document_id),))
+        con.execute('DELETE FROM document_people WHERE document_id=?',(int(document_id),))
+        con.executemany('INSERT INTO document_people(document_id,person_id,assignment_role) VALUES (?,?,?)',
+                        [(document_id,i,'Responsable') for i in owners]+[(document_id,i,'Revisor') for i in reviewers])
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                    ('Checklist',str(document_id),'Asignaciones de documento actualizadas'))
+
 def set_consulta_project_access(con, user_id, project_ids):
     """Actualiza solo accesos de un usuario, validando rol e IDs en el servidor."""
     require_admin()
@@ -1046,8 +1146,10 @@ def register_document(delivery_id, version, title, actor_role=None):
     if not title:raise ValueError('Cada documento debe tener un nombre descriptivo.')
     with connection() as con:
         if role=='Consulta':
-            # Solo se permite incluir documentos en una entrega nueva.
-            pass
+            row=con.execute('''SELECT d.code,d.project_code FROM deliverables d WHERE d.id=? AND d.version=?''',
+                            (int(delivery_id),str(version))).fetchone()
+            if not row or row['code'] not in consulta_delivery_codes(st.session_state['user_id']):
+                raise PermissionError('No puedes agregar documentos a una versión no autorizada.')
         count=con.execute('SELECT highest FROM document_serials WHERE delivery_id=? AND version=?',
                           (delivery_id,version)).fetchone()
         n=int(count['highest'])+1 if count else 1
@@ -1121,41 +1223,53 @@ def legacy_local_document(document_id,kind):
     return None
 
 
-def document_preview_ui(document, *, allow_download=True, prefix='doc'):
-    doc_id=document['id']
-    f=document.get('files',{})
-    legacy_pdf=legacy_local_document(doc_id,'pdf') if 'pdf' not in f else None
-    legacy_edit=legacy_local_document(doc_id,'editable') if 'editable' not in f else None
-    left,right=st.columns(2,gap='small')
-    with left:
-        if 'pdf' in f or legacy_pdf:
+def document_preview_ui(document, *, allow_download=True, allow_editable=True, prefix='doc'):
+    """Visor y descargas explícitas (PDF de toda versión, editable de la última)."""
+    doc_id=int(document['id'])
+    files=document.get('files',{})
+    legacy_pdf=legacy_local_document(doc_id,'pdf') if 'pdf' not in files else None
+    legacy_edit=legacy_local_document(doc_id,'editable') if 'editable' not in files else None
+    has_pdf=('pdf' in files or legacy_pdf is not None)
+    has_edit=('editable' in files or legacy_edit is not None)
+    cols=st.columns(3 if allow_download else 1,gap='small')
+    with cols[0]:
+        if has_pdf:
             if st.button('👁 Visualizar PDF',key=f'{prefix}_view_{doc_id}',use_container_width=True):
                 key=f'{prefix}_open_{doc_id}'
                 st.session_state[key]=not st.session_state.get(key,False)
-        else:st.caption('PDF aún no adjuntado')
-    with right:
-        if allow_download and ('editable' in f or legacy_edit):
-            if 'editable' in f:
-                if st.button('⬇ Preparar editable',key=f'{prefix}_prepare_{doc_id}',use_container_width=True):
-                    try:st.session_state[f'{prefix}_editable_{doc_id}']=drive_bytes(f['editable']['file_id'])
-                    except Exception as exc:st.error(str(exc))
-                data=st.session_state.get(f'{prefix}_editable_{doc_id}')
-                if data:
-                    st.download_button('⬇ Descargar editable',data,file_name=f['editable']['filename'],
-                        key=f'{prefix}_download_{doc_id}',use_container_width=True)
+        else:st.caption('Sin PDF')
+    if allow_download:
+        with cols[1]:
+            if has_pdf and st.button('⬇ Preparar PDF',key=f'{prefix}_prepare_pdf_{doc_id}',use_container_width=True):
+                try:
+                    raw=drive_bytes(files['pdf']['file_id']) if 'pdf' in files else legacy_pdf[1]
+                    if not raw.startswith(b'%PDF-'):raise ValueError('PDF no válido.')
+                    st.session_state[f'{prefix}_pdf_data_{doc_id}']=raw
+                except Exception as exc:st.error(f'No se pudo preparar el PDF: {exc}')
+            pdf_data=st.session_state.get(f'{prefix}_pdf_data_{doc_id}')
+            if has_pdf and pdf_data is not None:
+                filename=files['pdf']['filename'] if 'pdf' in files else legacy_pdf[0]
+                st.download_button('⬇ Descargar PDF',pdf_data,file_name=filename,
+                    mime='application/pdf',key=f'{prefix}_download_pdf_{doc_id}',use_container_width=True)
+        with cols[2]:
+            if allow_editable and has_edit:
+                if st.button('⬇ Preparar editable',key=f'{prefix}_prepare_edit_{doc_id}',use_container_width=True):
+                    try:
+                        st.session_state[f'{prefix}_edit_data_{doc_id}']=(
+                            drive_bytes(files['editable']['file_id']) if 'editable' in files else legacy_edit[1])
+                    except Exception as exc:st.error(f'No se pudo preparar el editable: {exc}')
+                edit_data=st.session_state.get(f'{prefix}_edit_data_{doc_id}')
+                if edit_data is not None:
+                    filename=files['editable']['filename'] if 'editable' in files else legacy_edit[0]
+                    st.download_button('⬇ Descargar editable',edit_data,file_name=filename,
+                        mime='application/octet-stream',key=f'{prefix}_download_edit_{doc_id}',use_container_width=True)
             else:
-                st.download_button('⬇ Descargar editable',legacy_edit[1],file_name=legacy_edit[0],
-                    key=f'{prefix}_legacy_download_{doc_id}',use_container_width=True)
-        elif allow_download:st.caption('Sin archivo editable')
-    if st.session_state.get(f'{prefix}_open_{doc_id}') and ('pdf' in f or legacy_pdf):
+                st.caption('Editable solo en versión más reciente' if has_edit and not allow_editable else 'Sin editable')
+    if st.session_state.get(f'{prefix}_open_{doc_id}') and has_pdf:
         try:
-            pdf=drive_bytes(f['pdf']['file_id']) if 'pdf' in f else legacy_pdf[1]
-            filename=f['pdf']['filename'] if 'pdf' in f else legacy_pdf[0]
+            pdf=drive_bytes(files['pdf']['file_id']) if 'pdf' in files else legacy_pdf[1]
             if not pdf.startswith(b'%PDF-'):raise ValueError('El PDF no es válido.')
             internal_pdf_preview(pdf)
-            if allow_download:
-                st.download_button('⬇ Descargar PDF',pdf,file_name=filename,
-                    mime='application/pdf',key=f'{prefix}_dlpdf_{doc_id}',use_container_width=True)
         except Exception as exc:st.error(f'No se pudo visualizar el PDF: {exc}')
 
 
@@ -1476,8 +1590,12 @@ def save_record(module,values,record_id=None,task_assignees=None):
     values=dict(values)
     was_update=(record_id is not None)
     is_consulta=(st.session_state.get('role')=='Consulta')
-    if not (module=='Entregables' and record_id is None and is_consulta):
+    consulta_delivery=(module=='Entregables' and is_consulta)
+    if not consulta_delivery:
         require_admin()
+    if consulta_delivery:
+        if str(values.get('code') or '') not in consulta_delivery_codes(st.session_state['user_id']):
+            raise PermissionError('No tienes acceso a este entregable: falta proyecto autorizado o tarea asignada.')
     if module=='Proyectos' and record_id is not None:
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
@@ -1537,7 +1655,12 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 raise ValueError('El ID de entregable no está autorizado en el catálogo de este proyecto.')
             registered=con.execute('SELECT * FROM deliverables WHERE code=?',(code,)).fetchone()
         if record_id is None and registered:
-            raise ValueError('Este entregable ya fue registrado. Solo un administrador puede editarlo o crear otra versión.')
+            raise ValueError('Este entregable ya tiene una versión. Actualiza la página antes de registrar otra.')
+        if consulta_delivery and record_id is not None:
+            if not registered:raise ValueError('El entregable aún no existe.')
+            expected=next_version(code,registered['version'])
+            if str(values.get('version') or '')!=expected:
+                raise ValueError(f'Consulta solo puede registrar una nueva versión ({expected}); no editar versiones existentes.')
         if record_id is not None and (not registered or registered['id']!=record_id or registered['project_code']!=project):
             raise ValueError('No está permitido reasignar un entregable a otro proyecto.')
         values['code']=code
@@ -1563,6 +1686,10 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 values['actual_date']=today_peru().isoformat()
             else:
                 values['actual_date']=registered['actual_date']
+            if consulta_delivery:
+                values['status']='Pendiente'
+                for f in ('review_date','correction_date','approval_date'):
+                    values[f]=None
         if values.get('status') not in DELIVERY_STATES:
             raise ValueError('Estado de entregable no válido.')
     mandatory=[label for k,label,_,required,_ in fields if required and (values.get(k) in ('',None))]
@@ -1577,6 +1704,18 @@ def save_record(module,values,record_id=None,task_assignees=None):
         if not values['code']:raise ValueError('El nombre es obligatorio.')
         values['name']=values['code']
     with connection() as con:
+        if consulta_delivery:
+            con.execute('BEGIN IMMEDIATE')
+            live=con.execute('SELECT id,version,project_code FROM deliverables WHERE code=?',
+                             (values['code'],)).fetchone()
+            if record_id is None and live:
+                raise ValueError('Este entregable acaba de registrarse. Recarga la pantalla.')
+            if record_id is not None:
+                if not live or live['id']!=int(record_id):
+                    raise ValueError('El entregable fue modificado. Actualiza la página.')
+                expected=next_version(values['code'],live['version'])
+                if values['version']!=expected:
+                    raise ValueError('Ya se registró otra versión. Actualiza la página para obtener la siguiente.')
         if module=='Personal':
             other=con.execute('SELECT id FROM people WHERE lower(name)=lower(?) AND id!=?',(values['name'],record_id or -1)).fetchone()
             if other:raise ValueError('Ya existe una persona con ese nombre.')
@@ -1897,7 +2036,15 @@ def card_browser(module, frame, allow_version_edit=True):
 
 
 def versions_for_delivery(code,allow_edit=False):
-    """Historial visual: cada versión incluye D01, D02... con PDF/checklist independientes."""
+    """Historial visual y descarga; Consulta ve versiones de proyectos autorizados."""
+    if st.session_state.get('role')=='Consulta':
+        with connection() as con:
+            authorized=con.execute('''SELECT 1 FROM deliverables d
+                JOIN projects p ON p.code=d.project_code
+                JOIN consulta_project_access pa ON pa.project_id=p.id
+                WHERE d.code=? AND pa.user_id=?''',(code,st.session_state['user_id'])).fetchone()
+        if not authorized:
+            st.error('No tienes acceso a las versiones de este proyecto.');return
     with connection() as con:
         delivery=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
         versions=[dict(v) for v in con.execute(
@@ -1905,6 +2052,7 @@ def versions_for_delivery(code,allow_edit=False):
     if not delivery:st.warning('Entregable no disponible.');return
     did=int(delivery['id'])
     is_admin=bool(allow_edit and can_edit())
+    latest_version=delivery['version'] or (versions[0]['version'] if versions else '')
     st.markdown('**📚 Versiones y documentos**')
     for ver in versions:
         version=ver['version'];vid=ver['id']
@@ -1916,8 +2064,35 @@ def versions_for_delivery(code,allow_edit=False):
             for d in docs:
                 with st.container(border=True):
                     st.markdown(f'**📄 {escape(d["doc_no"])} — {escape(d["title"])}**')
-                    document_preview_ui(d,allow_download=is_admin,prefix=f'version_{vid}')
+                    document_preview_ui(d,allow_download=True,
+                        allow_editable=(is_admin or version==latest_version),
+                        prefix=f'version_{vid}')
                     if is_admin:
+                        with st.expander(f'👥 Asignaciones del documento {d["doc_no"]} (Checklist)'):
+                            customized,(owners,reviewers)=document_assignments(d['id'])
+                            st.caption('Por defecto se heredan responsables y revisores de las tareas del entregable. '
+                                       'Al guardar una lista personalizada, el Checklist solo será visible para estas personas, '
+                                       'si además tienen acceso al proyecto.')
+                            roster=people_for_assignment()
+                            labels={int(p['id']):p['name'] for p in roster}
+                            with st.form(f'doc_assign_{d["id"]}'):
+                                selected_owners=st.multiselect('Responsables del documento',list(labels),
+                                    default=[i for i in labels if i in owners],
+                                    format_func=lambda i:labels[i],key=f'doc_assign_o_{d["id"]}')
+                                selected_reviewers=st.multiselect('Revisores del documento',list(labels),
+                                    default=[i for i in labels if i in reviewers],
+                                    format_func=lambda i:labels[i],key=f'doc_assign_r_{d["id"]}')
+                                if st.form_submit_button('💾 Guardar asignaciones'):
+                                    try:
+                                        save_document_assignments(d['id'],selected_owners,selected_reviewers)
+                                        st.success('Asignaciones de documento actualizadas');st.rerun()
+                                    except Exception as exc:st.error(str(exc))
+                            if customized and st.button('↩ Volver a heredar asignaciones de las tareas',
+                                                        key=f'doc_assign_reset_{d["id"]}'):
+                                with connection() as con:
+                                    con.execute('DELETE FROM document_assignment_mode WHERE document_id=?',(d['id'],))
+                                    con.execute('DELETE FROM document_people WHERE document_id=?',(d['id'],))
+                                st.rerun()
                         with st.expander(f'✏️ Administrar {d["doc_no"]}',expanded=False):
                             with st.form(f'doc_edit_{d["id"]}'):
                                 title=st.text_input('Nombre descriptivo',value=d['title'])
@@ -2309,20 +2484,27 @@ def delivery_editor(data):
         card_browser('Entregables',data['Entregables'],allow_version_edit=False);return
     st.subheader('Registrar entrega' if role=='Consulta' else 'Crear o editar una entrega')
     if role=='Consulta':
-        st.info('Puedes registrar un entregable programado con varios documentos. Una vez guardado no podrás editarlo.')
+        st.info('Puedes registrar V01 y después V02, V03… para los entregables asignados. Cada versión anterior se conserva y no puede editarse desde Consulta.')
     projects=connection_project_rows()
+    if role=='Consulta':
+        allowed_projects=consulta_project_codes(st.session_state['user_id'])
+        projects=[pr for pr in projects if pr['code'] in allowed_projects]
     if not projects:
         st.warning('No hay proyectos registrados.');return
     pn={p['code']:p['name'] for p in projects}
     project=st.selectbox('01 · ID Proyecto',list(pn),
         format_func=lambda code:f'{code} — {pn[code]}',key='new_delivery_project')
     cat=[r for r in catalog_rows() if r['project_code']==project]
+    if role=='Consulta':
+        allowed_deliveries=consulta_delivery_codes(st.session_state['user_id'])
+        cat=[r for r in cat if r['code'] in allowed_deliveries]
     with connection() as con:
         used={r['code']:dict(r) for r in con.execute('SELECT * FROM deliverables WHERE project_code=?',(project,))}
-    if role=='Consulta':cat=[r for r in cat if r['code'] not in used]
     if not cat:
-        st.info('No hay entregables programados pendientes en este proyecto.')
-        card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
+        st.info('No hay entregables asignados mediante tareas en este proyecto, o no tienes permiso de acceso.')
+        visible=data['Entregables']
+        if role=='Consulta':visible=visible[visible['code'].isin(consulta_delivery_codes(st.session_state['user_id']))]
+        card_browser('Entregables',visible,allow_version_edit=admin)
         return
     by_code={r['code']:r for r in cat}
     code=st.selectbox('02 · ID Entregable',list(by_code),
@@ -2330,7 +2512,7 @@ def delivery_editor(data):
     catalog=by_code[code]
     existing=used.get(code)
     rid=existing['id'] if existing else None
-    action='Nuevo registro'
+    action='Registrar nueva versión' if (role=='Consulta' and rid) else 'Nuevo registro'
     if admin and rid:
         action=st.radio('Acción',['Editar registro actual','Registrar nueva versión'],horizontal=True,
             key=f'delivery_action_{code}')
@@ -2382,7 +2564,9 @@ def delivery_editor(data):
                     type=['dwg','doc','docx','xls','xlsx','ifc','rvt'],key=f'{form_key}_editable_{i}')
                 entries.append((title,pdf,editable))
         if not drive_ready():st.warning('Google Drive no está autorizado; no podrás cargar archivos.')
-        submitted=st.form_submit_button('💾 Registrar entrega' if not rid else '💾 Guardar cambios',type='primary')
+        submitted=st.form_submit_button(
+            '💾 Registrar '+version if role=='Consulta' else ('💾 Registrar entrega' if not rid else '💾 Guardar cambios'),
+            type='primary')
     if submitted:
         try:
             if any(not name.strip() for name,_,_ in entries):raise ValueError('Escribe el nombre de cada documento.')
@@ -2399,22 +2583,24 @@ def delivery_editor(data):
                     if kind=='editable' and ext not in ('dwg','doc','docx','xls','xlsx','ifc','rvt'):
                         raise ValueError(f'{f.name}: formato editable no admitido.')
             if role=='Consulta':vals['status']='Pendiente'
-            # Revalidar en BD para evitar duplicados si dos usuarios envían simultáneamente.
-            if role=='Consulta':
-                with connection() as con:
-                    if con.execute('SELECT 1 FROM deliverables WHERE code=?',(code,)).fetchone():
-                        raise ValueError('Otro usuario ya registró este entregable. Actualiza la pantalla.')
+            # Revalidación de permisos y versión vigente dentro de save_record.
+            if role=='Consulta' and code not in consulta_delivery_codes(st.session_state['user_id']):
+                raise PermissionError('Ya no estás asignado a este entregable o proyecto.')
             save_record('Entregables',vals,rid)
             with connection() as con:
                 stored=con.execute('SELECT id FROM deliverables WHERE code=?',(code,)).fetchone()
-            numbers=attach_new_documents(int(stored['id']),version,entries,consulta=(role=='Consulta' and rid is None))
+            numbers=attach_new_documents(int(stored['id']),version,entries,
+                                         consulta=(role=='Consulta'))
             st.success('Entrega registrada. Documentos: '+', '.join(numbers));st.rerun()
         except (ValueError,PermissionError,sqlite3.IntegrityError,requests.RequestException) as exc:
             st.error(f'No se completó la operación: {exc}')
             st.caption('Si Google Drive falló durante la subida, el registro puede haberse creado parcialmente. '
                        'No repitas la carga sin revisar el historial; pide al Administrador completar los archivos faltantes.')
     st.divider()
-    card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
+    visible=data['Entregables']
+    if role=='Consulta':
+        visible=visible[visible['code'].isin(consulta_delivery_codes(st.session_state['user_id']))]
+    card_browser('Entregables',visible,allow_version_edit=admin)
     if admin:bulk_delete_ui('Entregables',data)
 
 def task_editor(data):
@@ -2703,7 +2889,18 @@ def checklist_page():
     st.title('✅ Checklist de calidad por documento')
     st.caption('Cada documento tiene su propio checklist; los resultados no se mezclan entre D01, D02 y otras versiones.')
     deliveries=df('deliverables')
-    if deliveries.empty:st.info('Registra primero un entregable.');return
+    allowed_docs=None
+    if st.session_state.get('role')=='Consulta':
+        allowed_docs=consulta_document_ids(st.session_state['user_id'])
+        if not allowed_docs:
+            st.info('Aún no tienes documentos con asignación de responsable o revisor en proyectos autorizados.');return
+        with connection() as con:
+            slots=','.join('?' for _ in allowed_docs)
+            delivery_ids={r[0] for r in con.execute(
+                f'SELECT DISTINCT delivery_id FROM delivery_documents WHERE id IN ({slots})',
+                tuple(allowed_docs))}
+        deliveries=deliveries[deliveries['id'].isin(delivery_ids)].copy()
+    if deliveries.empty:st.info('No hay entregables disponibles para tu cuenta.');return
     query=st.text_input('🔎 Buscar entregable',key='ck_search_doc')
     if query:
         deliveries=deliveries[deliveries.astype(str).apply(lambda x:x.str.contains(query,case=False,regex=False)).any(axis=1)]
@@ -2713,9 +2910,18 @@ def checklist_page():
     with connection() as con:
         record=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
         versions=[v[0] for v in con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC',(code,))]
-    if not versions:st.info('Sin versiones para este entregable.');return
+    if allowed_docs is not None:
+        with connection() as con:
+            marks=','.join('?' for _ in allowed_docs)
+            visible_versions={row[0] for row in con.execute(
+                f'SELECT DISTINCT version FROM delivery_documents WHERE delivery_id=? AND id IN ({marks})',
+                (record['id'],*tuple(allowed_docs)))}
+        versions=[ver for ver in versions if ver in visible_versions]
+    if not versions:st.info('No hay versiones con documentos asignados a tu cuenta.');return
     selected_version=st.selectbox('Versión',versions,index=0,key=f'ck_ver_{code}')
     docs=docs_for_version(record['id'],selected_version)
+    if allowed_docs is not None:
+        docs=[doc for doc in docs if doc['id'] in allowed_docs]
     if not docs:
         st.info('Esta versión todavía no tiene documentos. Agrega D01 desde Entregables.');return
     doc_ids=[d['id'] for d in docs]
@@ -2779,7 +2985,10 @@ def versions_page():
     st.title('📚 Historial de versiones')
     st.caption('También puedes administrar las versiones desde la ficha de cada entregable.')
     deliveries=df('deliverables')
-    if deliveries.empty:st.info('Primero registra un entregable.');return
+    if st.session_state.get('role')=='Consulta':
+        allowed_projects=consulta_project_codes(st.session_state['user_id'])
+        deliveries=deliveries[deliveries['project_code'].isin(allowed_projects)].copy()
+    if deliveries.empty:st.info('No hay versiones disponibles en tus proyectos autorizados.');return
     q=st.text_input('🔎 Buscar entregable por nombre o código',key='versions_search')
     if q:deliveries=deliveries[deliveries.astype(str).apply(lambda x:x.str.contains(q,case=False,regex=False)).any(axis=1)]
     st.caption(f'{len(deliveries)} entregables encontrados')
