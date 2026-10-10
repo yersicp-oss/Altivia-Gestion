@@ -69,7 +69,11 @@ def connection():
     try:
         yield con
         con.commit()
-    finally: con.close()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 def initialize():
     with connection() as con:
@@ -121,6 +125,70 @@ def initialize():
             file_id TEXT NOT NULL, filename TEXT NOT NULL, uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(delivery_id,version,kind),
             FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        # Cada versión puede contener múltiples documentos, con PDF y editable propios.
+        con.execute('''CREATE TABLE IF NOT EXISTS delivery_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_id INTEGER NOT NULL,
+            version TEXT NOT NULL,
+            doc_no TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(delivery_id,version,doc_no),
+            FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        con.execute('''CREATE TABLE IF NOT EXISTS document_files (
+            document_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('pdf','editable')),
+            file_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(document_id,kind),
+            FOREIGN KEY(document_id) REFERENCES delivery_documents(id) ON DELETE CASCADE)''')
+        con.execute('''CREATE TABLE IF NOT EXISTS document_checklist (
+            document_id INTEGER NOT NULL,
+            criterion TEXT NOT NULL,
+            result TEXT NOT NULL DEFAULT 'PENDIENTE',
+            notes TEXT,
+            PRIMARY KEY(document_id,criterion),
+            FOREIGN KEY(document_id) REFERENCES delivery_documents(id) ON DELETE CASCADE)''')
+        con.execute('''CREATE TABLE IF NOT EXISTS document_serials (
+            delivery_id INTEGER NOT NULL, version TEXT NOT NULL, highest INTEGER NOT NULL,
+            PRIMARY KEY(delivery_id,version),
+            FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        # Un marcador evita restaurar D01 si el Administrador lo elimina después.
+        con.execute('''CREATE TABLE IF NOT EXISTS legacy_document_imports (
+            delivery_id INTEGER NOT NULL, version TEXT NOT NULL,
+            PRIMARY KEY(delivery_id,version),
+            FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        legacy=con.execute('''SELECT delivery_id,version FROM drive_files
+                   UNION SELECT delivery_id,version FROM delivery_files''').fetchall()
+        for entry in legacy:
+            did,ver=entry['delivery_id'],entry['version']
+            flagged=con.execute('SELECT 1 FROM legacy_document_imports WHERE delivery_id=? AND version=?',(did,ver)).fetchone()
+            if flagged:continue
+            exists=con.execute('SELECT id FROM deliverables WHERE id=?',(did,)).fetchone()
+            if not exists:continue
+            con.execute('INSERT OR IGNORE INTO delivery_documents(delivery_id,version,doc_no,title) VALUES(?,?,?,?)',
+                        (did,ver,'D01','Documento migrado (D01)'))
+            doc=con.execute('SELECT id FROM delivery_documents WHERE delivery_id=? AND version=? AND doc_no=?',
+                            (did,ver,'D01')).fetchone()
+            for f in con.execute('SELECT kind,file_id,filename FROM drive_files WHERE delivery_id=? AND version=?',(did,ver)).fetchall():
+                con.execute('INSERT OR IGNORE INTO document_files(document_id,kind,file_id,filename) VALUES(?,?,?,?)',
+                            (doc['id'],f['kind'],f['file_id'],f['filename']))
+            # El antiguo checklist del entregable se copia a D01 UNA sola vez, sin borrar el original.
+            legacy_code=con.execute('SELECT code,version FROM deliverables WHERE id=?',(did,)).fetchone()
+            if legacy_code and legacy_code['version']==ver:
+                for ch in con.execute('SELECT criterion,result,notes FROM checklist WHERE delivery_code=?',(legacy_code['code'],)).fetchall():
+                    con.execute('INSERT OR IGNORE INTO document_checklist(document_id,criterion,result,notes) VALUES(?,?,?,?)',
+                                (doc['id'],ch['criterion'],ch['result'],ch['notes']))
+            con.execute('INSERT OR IGNORE INTO document_serials(delivery_id,version,highest) VALUES(?,?,1)',(did,ver))
+            con.execute('INSERT INTO legacy_document_imports(delivery_id,version) VALUES(?,?)',(did,ver))
+        # Sincroniza máximo con documentos existentes sin reducirlo tras eliminaciones.
+        for row in con.execute('SELECT delivery_id,version,doc_no FROM delivery_documents').fetchall():
+            match=re.fullmatch(r'D(\d+)',row['doc_no'])
+            if match:
+                con.execute('''INSERT INTO document_serials(delivery_id,version,highest) VALUES(?,?,?)
+                    ON CONFLICT(delivery_id,version) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
+                    (row['delivery_id'],row['version'],int(match.group(1))))
         # Máximo histórico: aunque se elimine V02, ese número nunca se reutiliza.
         con.execute('''CREATE TABLE IF NOT EXISTS version_counters (
             delivery_code TEXT PRIMARY KEY, highest INTEGER NOT NULL DEFAULT 0)''')
@@ -751,6 +819,138 @@ def drive_bytes(file_id):
         chunks.append(chunk)
     return b''.join(chunks)
 
+def docs_for_version(delivery_id, version):
+    with connection() as con:
+        docs=[dict(r) for r in con.execute(
+            'SELECT id,doc_no,title FROM delivery_documents WHERE delivery_id=? AND version=? ORDER BY id',
+            (delivery_id,version)).fetchall()]
+        for doc in docs:
+            doc['files']={r['kind']:dict(r) for r in con.execute(
+                'SELECT kind,file_id,filename,uploaded_at FROM document_files WHERE document_id=?',(doc['id'],)).fetchall()}
+    return docs
+
+
+def register_document(delivery_id, version, title, actor_role=None):
+    role=actor_role or st.session_state.get('role')
+    if role not in ('Administrador','Consulta'):
+        raise PermissionError('No tienes permiso para registrar documentos.')
+    title=str(title or '').strip()
+    if not title:raise ValueError('Cada documento debe tener un nombre descriptivo.')
+    with connection() as con:
+        if role=='Consulta':
+            # Solo se permite incluir documentos en una entrega nueva.
+            pass
+        count=con.execute('SELECT highest FROM document_serials WHERE delivery_id=? AND version=?',
+                          (delivery_id,version)).fetchone()
+        n=int(count['highest'])+1 if count else 1
+        doc_no=f'D{n:02d}'
+        cursor=con.execute('INSERT INTO delivery_documents(delivery_id,version,doc_no,title) VALUES(?,?,?,?)',
+                           (delivery_id,version,doc_no,title))
+        con.execute('''INSERT INTO document_serials(delivery_id,version,highest) VALUES(?,?,?)
+            ON CONFLICT(delivery_id,version) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
+                    (delivery_id,version,n))
+        return cursor.lastrowid,doc_no
+
+
+def upload_document_file(upload, document_id, kind, allow_consulta=False):
+    if not can_edit() and not (allow_consulta and st.session_state.get('role')=='Consulta'):
+        raise PermissionError('Solo el Administrador puede reemplazar documentos existentes.')
+    if upload is None:return None
+    with connection() as con:
+        row=con.execute('''SELECT doc.id,doc.doc_no,doc.version,d.code,d.id AS delivery_id
+             FROM delivery_documents doc JOIN deliverables d ON doc.delivery_id=d.id
+             WHERE doc.id=?''',(document_id,)).fetchone()
+    if not row:raise ValueError('Documento no encontrado.')
+    raw=upload.getvalue()
+    ext=upload.name.rsplit('.',1)[-1].lower() if '.' in upload.name else ''
+    if not raw or len(raw)>DRIVE_LIMIT:raise ValueError('Archivo vacío o mayor de 25 MB.')
+    if kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-')):
+        raise ValueError('Selecciona un PDF válido.')
+    if kind=='editable' and ext not in ('dwg','doc','docx','xlsx','xls','ifc','rvt'):
+        raise ValueError('Editable no admitido. Usa DWG, DOC, DOCX, XLSX, XLS, IFC o RVT.')
+    safe=re.sub(r'[^A-Za-z0-9_-]','_',row['code'])
+    filename=f'{safe}_{row["version"]}_{row["doc_no"]}.{ext}'
+    folder=drive_delivery_folder(drive_token(),row['delivery_id'],row['code'],row['version'])
+    token=drive_token()
+    meta={'name':filename,'parents':[folder], 'description':f'GP Altivia {row["code"]} {row["version"]} {row["doc_no"]}'}
+    mime='application/pdf' if kind=='pdf' else 'application/octet-stream'
+    response=requests.post('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name',
+        headers={'Authorization':f'Bearer {token}'},files={
+            'metadata':('metadata',json.dumps(meta),'application/json; charset=UTF-8'),
+            'file':(filename,raw,mime)},timeout=90)
+    if not response.ok:
+        raise ValueError(f'Google Drive no pudo subir {filename} (HTTP {response.status_code}): {response.text[:200]}')
+    file_id=response.json()['id']
+    with connection() as con:
+        con.execute('''INSERT INTO document_files(document_id,kind,file_id,filename)
+            VALUES (?,?,?,?) ON CONFLICT(document_id,kind)
+            DO UPDATE SET file_id=excluded.file_id,filename=excluded.filename,uploaded_at=CURRENT_TIMESTAMP''',
+            (document_id,kind,file_id,filename))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+            ('Documentos',row['code'],f'{row["version"]}/{row["doc_no"]} - {kind} subido'))
+    # Si se sustituyó un archivo, el anterior permanece en Drive como respaldo.
+    return filename
+
+
+def attach_new_documents(delivery_id,version,entries,consulta=False):
+    """Cada entrada (título, PDF opcional, editable opcional) crea un DNN único."""
+    result=[]
+    for title,pdf,editable in entries:
+        if not (str(title or '').strip() or pdf or editable):continue
+        doc_id,number=register_document(delivery_id,version,title)
+        result.append(number)
+        for kind,item in (('pdf',pdf),('editable',editable)):
+            if item:upload_document_file(item,doc_id,kind,allow_consulta=consulta)
+    return result
+
+
+def legacy_local_document(document_id,kind):
+    """Lectura transitoria para archivos antiguos conservados como BLOB en SQLite."""
+    with connection() as con:
+        doc=con.execute('SELECT delivery_id,version,doc_no FROM delivery_documents WHERE id=?',(document_id,)).fetchone()
+    if doc and doc['doc_no']=='D01':
+        return file_bytes(doc['delivery_id'],doc['version'],kind)
+    return None
+
+
+def document_preview_ui(document, *, allow_download=True, prefix='doc'):
+    doc_id=document['id']
+    f=document.get('files',{})
+    legacy_pdf=legacy_local_document(doc_id,'pdf') if 'pdf' not in f else None
+    legacy_edit=legacy_local_document(doc_id,'editable') if 'editable' not in f else None
+    left,right=st.columns(2,gap='small')
+    with left:
+        if 'pdf' in f or legacy_pdf:
+            if st.button('👁 Visualizar PDF',key=f'{prefix}_view_{doc_id}',use_container_width=True):
+                key=f'{prefix}_open_{doc_id}'
+                st.session_state[key]=not st.session_state.get(key,False)
+        else:st.caption('PDF aún no adjuntado')
+    with right:
+        if allow_download and ('editable' in f or legacy_edit):
+            if 'editable' in f:
+                if st.button('⬇ Preparar editable',key=f'{prefix}_prepare_{doc_id}',use_container_width=True):
+                    try:st.session_state[f'{prefix}_editable_{doc_id}']=drive_bytes(f['editable']['file_id'])
+                    except Exception as exc:st.error(str(exc))
+                data=st.session_state.get(f'{prefix}_editable_{doc_id}')
+                if data:
+                    st.download_button('⬇ Descargar editable',data,file_name=f['editable']['filename'],
+                        key=f'{prefix}_download_{doc_id}',use_container_width=True)
+            else:
+                st.download_button('⬇ Descargar editable',legacy_edit[1],file_name=legacy_edit[0],
+                    key=f'{prefix}_legacy_download_{doc_id}',use_container_width=True)
+        elif allow_download:st.caption('Sin archivo editable')
+    if st.session_state.get(f'{prefix}_open_{doc_id}') and ('pdf' in f or legacy_pdf):
+        try:
+            pdf=drive_bytes(f['pdf']['file_id']) if 'pdf' in f else legacy_pdf[1]
+            filename=f['pdf']['filename'] if 'pdf' in f else legacy_pdf[0]
+            if not pdf.startswith(b'%PDF-'):raise ValueError('El PDF no es válido.')
+            internal_pdf_preview(pdf)
+            if allow_download:
+                st.download_button('⬇ Descargar PDF',pdf,file_name=filename,
+                    mime='application/pdf',key=f'{prefix}_dlpdf_{doc_id}',use_container_width=True)
+        except Exception as exc:st.error(f'No se pudo visualizar el PDF: {exc}')
+
+
 def next_version(code,current=None):
     """No reutiliza números de versiones eliminadas; registra el máximo histórico."""
     versions=[str(current)] if current else []
@@ -765,106 +965,55 @@ def next_version(code,current=None):
 
 
 def client_portal():
-    """Un cliente únicamente accede a sus proyectos y entregables autorizados."""
+    # Cliente: únicamente documentos de la versión vigente de entregables aprobados/autorizados.
     if st.session_state.get('role')!='Cliente':
         st.error('Acceso restringido.');st.stop()
     with connection() as con:
-        rows=[dict(x) for x in con.execute('''SELECT d.id,d.code,d.project_code,d.drawing_code,d.name,d.version,
-            d.specialty,d.status,d.file_path,p.name AS project_name
+        records=[dict(r) for r in con.execute('''SELECT d.id,d.code,d.project_code,d.name,d.version,
+            d.specialty,d.status,p.name AS project_name
             FROM deliverables d JOIN client_access a ON a.delivery_id=d.id
             LEFT JOIN projects p ON p.code=d.project_code
             WHERE a.user_id=? AND d.status IN ('Aprobado','Entregado')
-            ORDER BY d.project_code,d.name''',(st.session_state['user_id'],)).fetchall()]
-    if not rows:
+            ORDER BY d.project_code,d.name''',(st.session_state['user_id'],))]
+    if not records:
         st.title('📁 Mis proyectos')
-        st.info('ALTIVIA todavía no ha autorizado documentos aprobados para tu cuenta.');return
-    projects={r['project_code']:r['project_name'] or r['project_code'] for r in rows}
-    project_codes=sorted(projects)
-    # Selector limitado en el servidor al conjunto de proyectos permitidos.
-    clientcol,projectcol,countcol=st.columns([1.2,2,1.2],gap='small')
-    with clientcol:
+        st.info('Todavía no tienes entregables aprobados autorizados.');return
+    projects={r['project_code']:r['project_name'] or r['project_code'] for r in records}
+    cols=st.columns([1.2,2,1.2],gap='small')
+    with cols[0]:
         st.caption('01 · CLIENTE')
         st.markdown('**'+escape(str(st.session_state.get('full_name') or 'Cliente'))+'**')
-    with projectcol:
+    with cols[1]:
         st.caption('02 · PROYECTO')
-        chosen=st.selectbox('Proyecto autorizado',project_codes,
-            format_func=lambda x:f'{x} – {projects[x]}',label_visibility='collapsed',key='client_project_choice')
-    filtered=[r for r in rows if r['project_code']==chosen]
-    with countcol:
+        chosen=st.selectbox('Proyecto autorizado',sorted(projects),
+            format_func=lambda c:f'{c} – {projects[c]}',label_visibility='collapsed',key='client_project_choice')
+    visible=[r for r in records if r['project_code']==chosen]
+    with cols[2]:
         st.caption('03 · ENTREGABLES AUTORIZADOS')
-        st.metric('Disponibles',len(filtered),label_visibility='collapsed')
+        st.metric('Disponibles',len(visible),label_visibility='collapsed')
     st.title('📁 '+projects[chosen])
-    st.caption('Documentos aprobados y autorizados por ALTIVIA · Acceso de solo lectura')
-    query=st.text_input('🔎 Buscar en los entregables autorizados',key='client_search').strip().casefold()
-    if query:
-        filtered=[r for r in filtered if query in ' '.join(str(r.get(k) or '') for k in ('code','drawing_code','name','specialty','version')).casefold()]
-    st.caption(f'{len(filtered)} documento(s) disponibles en este proyecto')
-    st.markdown('''<style>
-      .altivia-client-card{background:#101318;border:1px solid #343b47;border-radius:13px;
-      padding:18px 19px;margin:8px 0 14px;color:#f8fafc;box-shadow:0 4px 18px #00000016}
-      .altivia-client-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-      .altivia-client-title{font-weight:750;font-size:1.06rem;color:white}
-      .altivia-client-badge{background:#104a2f;color:#55e697;font-size:.78rem;font-weight:650;padding:4px 10px;border-radius:18px}
-      .altivia-client-sub{font-size:.84rem;color:#aab7cf;margin-top:9px;line-height:1.5}
-      @media(max-width:640px){.altivia-client-card{padding:15px;margin-bottom:9px}}
-    </style>''',unsafe_allow_html=True)
-    for r in filtered:
-        title=escape(str(r['code']))+' – '+escape(str(r['name'] or 'Documento'))
-        sub=escape(str(r['project_code'] or ''))+' · Versión '+escape(str(r['version'] or '—'))+' · '+escape(str(r['specialty'] or ''))
-        st.markdown(f'<div class="altivia-client-card"><div class="altivia-client-head"><span class="altivia-client-title">{title}</span><span class="altivia-client-badge">{escape(r["status"])}</span></div><div class="altivia-client-sub">{sub}</div></div>',unsafe_allow_html=True)
-        version=str(r['version'] or 'V01')
-        reference=str(r['file_path'] or '').strip()
-        google_docs=drive_file_info(r['id'],version)
-        attached=file_info(r['id'],version)
-        if google_docs:
-            left,right=st.columns(2,gap='small')
-            with left:
-                if 'pdf' in google_docs and st.button('👁 Visualizar PDF aquí',key=f'drive_view_{r["id"]}',use_container_width=True):
-                    st.session_state['drive_preview']=None if st.session_state.get('drive_preview')==r['id'] else r['id']
-            with right:
-                if 'editable' in google_docs:
-                    if st.button('⬇ Preparar archivo editable',key=f'drive_prep_{r["id"]}',use_container_width=True):
-                        try:st.session_state[f'drive_download_{r["id"]}']=drive_bytes(google_docs['editable']['file_id'])
-                        except Exception as exc:st.error(str(exc))
-                    content=st.session_state.get(f'drive_download_{r["id"]}')
-                    if content:
-                        st.download_button('⬇ Descargar editable',content,file_name=google_docs['editable']['filename'],
-                            mime='application/octet-stream',key=f'drive_dl_{r["id"]}',use_container_width=True)
-            if st.session_state.get('drive_preview')==r['id'] and 'pdf' in google_docs:
-                try:
-                    content=drive_bytes(google_docs['pdf']['file_id'])
-                    if not content.startswith(b'%PDF-'):raise ValueError('El archivo almacenado no es un PDF válido.')
-                    internal_pdf_preview(content)
-                    st.download_button('⬇ Descargar PDF',content,file_name=google_docs['pdf']['filename'],
-                        mime='application/pdf',key=f'drive_pdf_dl_{r["id"]}',use_container_width=True)
-                except Exception as exc:st.error(str(exc))
-        elif attached:
-            st.warning('Hay adjuntos antiguos en SQLite. Migra estos archivos a Drive antes de utilizar esta cuenta en producción.')
-            left,right=st.columns(2,gap='small')
-            with left:
-                if 'pdf' in attached and st.button('👁 Visualizar PDF aquí',key=f'client_pdf_{r["id"]}',use_container_width=True):
-                    st.session_state['client_view_pdf']=r['id'] if st.session_state.get('client_view_pdf')!=r['id'] else None
-            with right:
-                if 'editable' in attached:
-                    editable_file=file_bytes(r['id'],version,'editable')
-                    if editable_file:
-                        st.download_button('⬇ Descargar archivo editable',editable_file[1],file_name=editable_file[0],
-                            mime='application/octet-stream',key=f'client_edit_{r["id"]}',use_container_width=True)
-            if st.session_state.get('client_view_pdf')==r['id'] and 'pdf' in attached:
-                pdf_file=file_bytes(r['id'],version,'pdf')
-                if pdf_file:
-                    internal_pdf_preview(pdf_file[1])
-                    st.download_button('⬇ Descargar PDF',pdf_file[1],file_name=pdf_file[0],mime='application/pdf',
-                        key=f'client_download_pdf_{r["id"]}',use_container_width=True)
-        elif reference.startswith('https://'):
-            left,right=st.columns(2,gap='small')
-            with left:st.link_button('👁 Visualizar documento',reference,use_container_width=True)
-            with right:st.link_button('⬇ Descargar / abrir archivo',reference,use_container_width=True)
-            st.caption('Depende de los permisos de Google Drive, OneDrive o SharePoint.')
-        else:
-            st.caption('Archivo pendiente de vincular. Contacta a ALTIVIA.')
-        st.divider()
-
+    st.caption('Planos y documentos aprobados · Acceso de solo lectura')
+    query=st.text_input('🔎 Buscar entregable o documento',key='client_search').strip().casefold()
+    visible_docs=0
+    for item in visible:
+        docs=docs_for_version(item['id'],item['version'])
+        if query:
+            matches_delivery=query in ' '.join(str(item.get(k) or '') for k in ('code','name','specialty','version')).casefold()
+            if not matches_delivery:
+                docs=[d for d in docs if query in (d['doc_no']+' '+d['title']).casefold()]
+            if not matches_delivery and not docs:continue
+        with st.container(border=True):
+            st.markdown(f'### {escape(item["code"])} – {escape(item["name"])}')
+            st.caption(f'{item["specialty"] or ""} · {item["version"]} · {len(docs)} documento(s)')
+            st.success(item['status'],icon='✅')
+            if not docs:
+                st.caption('Este entregable aún no tiene documentos disponibles.')
+            for document in docs:
+                visible_docs+=1
+                with st.container(border=True):
+                    st.markdown(f'**📄 {escape(document["doc_no"])} — {escape(document["title"])}**')
+                    document_preview_ui(document,allow_download=True,prefix='client')
+    if not visible_docs:st.info('No hay documentos que coincidan con la búsqueda.')
 
 def my_account():
     st.title('👤 Mi cuenta')
@@ -988,9 +1137,13 @@ def update_project_sync(values,record_id):
         old_code,old_name=old['code'],old['name'] or ''
         clash=con.execute('SELECT id FROM projects WHERE code=? AND id<>?',(new_code,record_id)).fetchone()
         if clash:raise ValueError('El código nuevo pertenece a otro proyecto.')
-        remote=[dict(x) for x in con.execute('''SELECT f.file_id,f.filename,f.version,f.kind,d.code AS delivery_code
+        remote=[dict(x) for x in con.execute('''SELECT f.file_id,f.filename,doc.version,doc.doc_no,d.code AS delivery_code
+            FROM document_files f JOIN delivery_documents doc ON f.document_id=doc.id
+            JOIN deliverables d ON doc.delivery_id=d.id WHERE d.project_code=?''',(old_code,)).fetchall()]
+        known_remote={r['file_id'] for r in remote}
+        remote += [dict(x) for x in con.execute('''SELECT f.file_id,f.filename,f.version,'D01' AS doc_no,d.code AS delivery_code
             FROM drive_files f JOIN deliverables d ON f.delivery_id=d.id
-            WHERE d.project_code=?''',(old_code,)).fetchall()]
+            WHERE d.project_code=?''',(old_code,)).fetchall() if x['file_id'] not in known_remote]
     to_rename=[];token=None
     project_old_folder=drive_safe_folder_name(old_code + (' - '+old_name.strip() if old_name.strip() else ''))
     project_new_folder=drive_safe_folder_name(new_code + (' - '+new_name if new_name else ''))
@@ -1014,7 +1167,7 @@ def update_project_sync(values,record_id):
                 for f in remote:
                     ext=f['filename'].rsplit('.',1)[-1].lower() if '.' in f['filename'] else 'bin'
                     safe_delivery=re.sub(r'[^A-Za-z0-9_-]','_',f['delivery_code'])
-                    target=f'{safe_delivery}_{f["version"]}.{ext}'
+                    target=f'{safe_delivery}_{f["version"]}_{f["doc_no"]}.{ext}'
                     if target!=f['filename']:
                         to_rename.append((f['file_id'],f['filename'],target))
     changes=[]
@@ -1031,6 +1184,7 @@ def update_project_sync(values,record_id):
                     con.execute(f'UPDATE {table} SET project_code=? WHERE project_code=?',(new_code,old_code))
             for file_id,old_filename,new_filename in to_rename:
                 con.execute('UPDATE drive_files SET filename=? WHERE file_id=?',(new_filename,file_id))
+                con.execute('UPDATE document_files SET filename=? WHERE file_id=?',(new_filename,file_id))
             con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
                 ('Proyectos',new_code,'Proyecto modificado (código anterior: '+old_code+')'))
     except Exception as exc:
@@ -1236,7 +1390,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','tasks','deliverables','deliverable_catalog','projects','people','audit'):
+                for table in ('document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','tasks','deliverables','deliverable_catalog','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -1314,95 +1468,104 @@ def card_browser(module, frame, allow_version_edit=True):
 
 
 def versions_for_delivery(code,allow_edit=False):
-    """Historial por tarjetas; permisos: Admin gestiona, Consulta solo visualiza PDF."""
+    """Historial visual: cada versión incluye D01, D02... con PDF/checklist independientes."""
     with connection() as con:
-        delivery=con.execute('SELECT id,version,name FROM deliverables WHERE code=?',(code,)).fetchone()
-        rows=[dict(r) for r in con.execute('SELECT id,version,registered_at,notes FROM versions WHERE delivery_code=? ORDER BY id DESC',(code,)).fetchall()]
-    if not delivery:
-        st.info('Entregable no disponible.');return
+        delivery=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
+        versions=[dict(v) for v in con.execute(
+            'SELECT id,version,registered_at,notes FROM versions WHERE delivery_code=? ORDER BY id DESC',(code,))]
+    if not delivery:st.warning('Entregable no disponible.');return
     did=int(delivery['id'])
-    st.markdown('**📚 Versiones del entregable**')
-    if not rows:
-        st.caption('Aún no hay versiones registradas.');return
-    is_admin=allow_edit and can_edit()
-    for v in rows:
-        ver=str(v['version']); vid=int(v['id'])
-        docs=drive_file_info(did,ver)
+    is_admin=bool(allow_edit and can_edit())
+    st.markdown('**📚 Versiones y documentos**')
+    for ver in versions:
+        version=ver['version'];vid=ver['id']
+        docs=docs_for_version(did,version)
         with st.container(border=True):
-            col1,col2=st.columns([4,1])
-            with col1:st.markdown(f'**📄 {escape(ver)}** · {escape(str(v["registered_at"]))}')
-            with col2:
-                if ver==delivery['version']:st.caption('Versión vigente')
-            if is_admin:
-                st.caption(v['notes'] or 'Sin descripción')
-            pdf=docs.get('pdf')
-            if pdf:
-                if st.button('👁 Visualizar PDF',key=f'v_pdf_{did}_{vid}'):
-                    key=f'version_pdf_open_{did}'
-                    st.session_state[key]=None if st.session_state.get(key)==vid else vid
-                if st.session_state.get(f'version_pdf_open_{did}')==vid:
-                    try:
-                        payload=drive_bytes(pdf['file_id'])
-                        if not payload.startswith(b'%PDF-'):raise ValueError('El archivo no es un PDF válido.')
-                        internal_pdf_preview(payload)
-                        if is_admin:
-                            st.download_button('⬇ Descargar PDF',payload,file_name=pdf['filename'],mime='application/pdf',key=f'v_pdf_dl_{vid}')
-                    except Exception as exc:st.error(f'No se pudo visualizar el PDF: {exc}')
-            else:st.caption('Esta versión aún no tiene PDF.')
-            if not is_admin:continue
-            with st.expander(f'✏️ Administrar {ver}',expanded=False):
-                with st.form(f'ver_edit_{did}_{vid}'):
-                    new_note=st.text_area('Descripción de la revisión',value=v['notes'] or '',key=f'ver_note_{vid}')
-                    new_pdf=st.file_uploader('Sustituir o añadir PDF',type=['pdf'],key=f'ver_pdf_upload_{vid}')
-                    new_edit=st.file_uploader('Sustituir o añadir DWG / Word',type=['dwg','doc','docx'],key=f'ver_edit_upload_{vid}')
-                    if 'editable' in docs:st.caption('Editable actual: '+docs['editable']['filename'])
-                    if st.form_submit_button('💾 Guardar cambios de esta versión'):
-                        try:
-                            if (new_pdf or new_edit) and not drive_ready():raise ValueError('Google Drive no está autorizado.')
-                            for kind,item in (('pdf',new_pdf),('editable',new_edit)):
-                                if item:drive_upload(item,did,code,ver,kind)
-                            with connection() as con:
-                                con.execute('UPDATE versions SET notes=? WHERE id=? AND delivery_code=?',(new_note,vid,code))
-                                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Actualización de '+ver))
-                            st.success('Versión actualizada.');st.rerun()
-                        except Exception as exc:st.error(f'No se guardó completamente: {exc}')
-                st.divider()
-                st.markdown('**Eliminar archivos de esta versión**')
-                for kind,label in [('pdf','PDF'),('editable','Archivo editable')]:
-                    if kind in docs:
-                        if st.button('🗑 Eliminar '+label,key=f'ver_rm_{vid}_{kind}'):
-                            st.session_state[f'ver_confirm_file_{vid}_{kind}']=True
-                        if st.session_state.get(f'ver_confirm_file_{vid}_{kind}'):
-                            st.warning('Esta acción elimina el archivo de Google Drive. No se puede deshacer.')
-                            if st.button('Confirmar eliminación de '+label,key=f'ver_confirm_rm_{vid}_{kind}'):
-                                try:
-                                    drive_delete_document(docs[kind]['file_id'])
+            st.markdown(f'**{escape(version)}** · {escape(str(ver["registered_at"]))}' +
+                (' · **Vigente**' if version==delivery['version'] else ''))
+            st.caption((ver['notes'] or 'Sin descripción') if is_admin else f'{len(docs)} documento(s)')
+            for d in docs:
+                with st.container(border=True):
+                    st.markdown(f'**📄 {escape(d["doc_no"])} — {escape(d["title"])}**')
+                    document_preview_ui(d,allow_download=is_admin,prefix=f'version_{vid}')
+                    if is_admin:
+                        with st.expander(f'✏️ Administrar {d["doc_no"]}',expanded=False):
+                            with st.form(f'doc_edit_{d["id"]}'):
+                                title=st.text_input('Nombre descriptivo',value=d['title'])
+                                pdf=st.file_uploader('Reemplazar PDF',type=['pdf'],key=f'doc_pdf_{d["id"]}')
+                                editable=st.file_uploader('Reemplazar editable',type=['dwg','doc','docx','xlsx','xls','ifc','rvt'],key=f'doc_edit_{d["id"]}')
+                                if st.form_submit_button('💾 Guardar documento'):
+                                    try:
+                                        if not title.strip():raise ValueError('Indica el nombre del documento.')
+                                        if (pdf or editable) and not drive_ready():raise ValueError('Conecta Google Drive primero.')
+                                        if pdf:upload_document_file(pdf,d['id'],'pdf')
+                                        if editable:upload_document_file(editable,d['id'],'editable')
+                                        with connection() as con:
+                                            con.execute('UPDATE delivery_documents SET title=? WHERE id=?',(title.strip(),d['id']))
+                                            con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                                                ('Documentos',code,f'{version}/{d["doc_no"]} editado'))
+                                        st.success('Documento actualizado');st.rerun()
+                                    except Exception as exc:st.error(str(exc))
+                            if st.button('🗑 Eliminar documento '+d['doc_no'],key=f'doc_rm_{d["id"]}'):
+                                st.session_state[f'doc_confirm_{d["id"]}']=True
+                            if st.session_state.get(f'doc_confirm_{d["id"]}'):
+                                st.warning('Se retirará el documento y su checklist de ALTIVIA. Los archivos físicos permanecerán en Google Drive como respaldo.')
+                                if st.button('Confirmar eliminación de '+d['doc_no'],key=f'doc_delete_yes_{d["id"]}'):
                                     with connection() as con:
-                                        con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=? AND kind=?',(did,ver,kind))
-                                        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,f'Eliminado {kind} de {ver}'))
-                                    st.session_state.pop(f'ver_confirm_file_{vid}_{kind}',None)
+                                        con.execute('DELETE FROM delivery_documents WHERE id=?',(d['id'],))
+                                        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                                            ('Documentos',code,'Retirado '+version+'/'+d['doc_no']+' (archivos en Drive conservados)'))
+                                    st.session_state.pop(f'doc_confirm_{d["id"]}',None)
                                     st.rerun()
-                                except Exception as exc:st.error(f'No se pudo eliminar: {exc}')
-                if st.button('🗑 Eliminar versión '+ver,key=f'ver_delete_{vid}'):
-                    st.session_state[f'ver_confirm_{vid}']=True
-                if st.session_state.get(f'ver_confirm_{vid}'):
-                    st.error('Se eliminará la versión y sus archivos. Esta acción no se puede deshacer.')
-                    if st.button('Confirmar eliminación definitiva de '+ver,key=f'ver_del_confirm_{vid}'):
-                        try:
-                            # Se conservan las demás versiones; si es la vigente se activa la más reciente restante.
-                            for document in docs.values():drive_delete_document(document['file_id'])
-                            with connection() as con:
-                                con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=?',(did,ver))
-                                con.execute('DELETE FROM delivery_files WHERE delivery_id=? AND version=?',(did,ver))
-                                con.execute('DELETE FROM versions WHERE id=? AND delivery_code=?',(vid,code))
-                                remaining=con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC LIMIT 1',(code,)).fetchone()
-                                if delivery['version']==ver:
-                                    con.execute('UPDATE deliverables SET version=? WHERE id=?',(remaining['version'] if remaining else '',did))
-                                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',('Versiones',code,'Eliminación de '+ver))
-                            st.session_state.pop(f'ver_confirm_{vid}',None)
-                            st.rerun()
-                        except Exception as exc:st.error(f'No se pudo eliminar la versión: {exc}')
-
+            if not docs:st.caption('Esta versión aún no tiene documentos.')
+            if not is_admin:continue
+            with st.expander('➕ Agregar documentos a '+version):
+                how_many=st.number_input('Cantidad de documentos nuevos',min_value=1,max_value=10,value=1,
+                    key=f'add_doc_count_{vid}')
+                with st.form(f'add_doc_form_{vid}'):
+                    entries=[]
+                    for i in range(how_many):
+                        st.markdown(f'**Documento adicional {i+1}**')
+                        title=st.text_input('Nombre',key=f'add_doc_name_{vid}_{i}')
+                        pdf=st.file_uploader('PDF',type=['pdf'],key=f'add_doc_pdf_{vid}_{i}')
+                        ed=st.file_uploader('Editable',type=['dwg','doc','docx','xlsx','xls','ifc','rvt'],key=f'add_doc_edit_{vid}_{i}')
+                        entries.append((title,pdf,ed))
+                    submitted=st.form_submit_button('💾 Añadir documentos')
+                if submitted:
+                    try:
+                        if any(not title.strip() for title,_,_ in entries):raise ValueError('Asigna un nombre a cada documento.')
+                        if any((p or e) for _,p,e in entries) and not drive_ready():raise ValueError('Conecta Google Drive.')
+                        numbers=attach_new_documents(did,version,entries)
+                        st.success('Añadidos: '+', '.join(numbers));st.rerun()
+                    except Exception as exc:st.error('No se completó la carga: '+str(exc))
+            with st.expander('✏️ Editar descripción de la versión'):
+                with st.form(f'version_note_{vid}'):
+                    note=st.text_area('Descripción de revisión',value=ver['notes'] or '')
+                    if st.form_submit_button('Guardar descripción'):
+                        with connection() as con:
+                            con.execute('UPDATE versions SET notes=? WHERE id=?',(note,vid))
+                        st.rerun()
+            if st.button('🗑 Eliminar versión '+version,key=f'version_delete_{vid}'):
+                st.session_state[f'version_confirm_{vid}']=True
+            if st.session_state.get(f'version_confirm_{vid}'):
+                st.error('Se eliminará toda la versión y sus documentos. Los archivos vinculados se eliminarán también de Google Drive.')
+                if st.button('Confirmar eliminación de versión '+version,key=f'version_yes_{vid}'):
+                    try:
+                        ids={f['file_id'] for d in docs for f in d['files'].values()}
+                        with connection() as con:
+                            ids.update(r['file_id'] for r in con.execute('SELECT file_id FROM drive_files WHERE delivery_id=? AND version=?',(did,version)))
+                        for fileid in ids:drive_delete_document(fileid)
+                        with connection() as con:
+                            con.execute('DELETE FROM delivery_documents WHERE delivery_id=? AND version=?',(did,version))
+                            con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=?',(did,version))
+                            con.execute('DELETE FROM delivery_files WHERE delivery_id=? AND version=?',(did,version))
+                            con.execute('DELETE FROM versions WHERE id=? AND delivery_code=?',(vid,code))
+                            remaining=con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC LIMIT 1',(code,)).fetchone()
+                            if delivery['version']==version:
+                                con.execute('UPDATE deliverables SET version=? WHERE id=?',(remaining['version'] if remaining else '',did))
+                        st.session_state.pop(f'version_confirm_{vid}',None)
+                        st.rerun()
+                    except Exception as exc:st.error('No se pudo eliminar completamente: '+str(exc))
 
 def drive_delete_document(file_id):
     """Borrado remoto solo para archivos previamente vinculados al entregable."""
@@ -1492,7 +1655,7 @@ def catalog_update(catalog_id,project_code,code,name,specialty,final_date):
             raise ValueError('El código ya está reservado para otro entregable.')
         if con.execute('SELECT id FROM deliverables WHERE code=? AND code<>?',(code,previous['code'])).fetchone():
             raise ValueError('El código coincide con un entregable registrado.')
-        remote=con.execute('SELECT COUNT(*) FROM drive_files WHERE delivery_id=?',(current['id'],)).fetchone()[0] if current else 0
+        remote=con.execute('''SELECT COUNT(*) FROM document_files f JOIN delivery_documents d ON d.id=f.document_id WHERE d.delivery_id=?''',(current['id'],)).fetchone()[0] if current else 0
         project=con.execute('SELECT name FROM projects WHERE code=?',(previous['project_code'],)).fetchone()
     change_folder=None
     if current and remote and previous['name']!=name:
@@ -1697,21 +1860,19 @@ def delivery_editor(data):
         card_browser('Entregables',data['Entregables'],allow_version_edit=False);return
     st.subheader('Registrar entrega' if role=='Consulta' else 'Crear o editar una entrega')
     if role=='Consulta':
-        st.info('Solo puedes registrar un entregable programado y pendiente. '
-                'Una vez guardado, únicamente el administrador podrá modificarlo.')
+        st.info('Puedes registrar un entregable programado con varios documentos. Una vez guardado no podrás editarlo.')
     projects=connection_project_rows()
     if not projects:
-        st.warning('Todavía no hay proyectos.');return
+        st.warning('No hay proyectos registrados.');return
     pn={p['code']:p['name'] for p in projects}
-    project=st.selectbox('01 · ID Proyecto',list(pn),format_func=lambda c:f'{c} — {pn[c]}',key='new_delivery_project')
+    project=st.selectbox('01 · ID Proyecto',list(pn),
+        format_func=lambda code:f'{code} — {pn[code]}',key='new_delivery_project')
     cat=[r for r in catalog_rows() if r['project_code']==project]
     with connection() as con:
         used={r['code']:dict(r) for r in con.execute('SELECT * FROM deliverables WHERE project_code=?',(project,))}
-    if role=='Consulta':
-        cat=[r for r in cat if r['code'] not in used]
+    if role=='Consulta':cat=[r for r in cat if r['code'] not in used]
     if not cat:
-        st.info('No hay entregables pendientes de registrar en este proyecto. '
-                + ('Regístralos con el botón «Registrar entregables».' if admin else 'Solicita su programación al Administrador.'))
+        st.info('No hay entregables programados pendientes en este proyecto.')
         card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
         return
     by_code={r['code']:r for r in cat}
@@ -1723,14 +1884,16 @@ def delivery_editor(data):
     action='Nuevo registro'
     if admin and rid:
         action=st.radio('Acción',['Editar registro actual','Registrar nueva versión'],horizontal=True,
-                        key=f'delivery_action_{code}')
+            key=f'delivery_action_{code}')
     current=existing or {}
-    if existing and action=='Editar registro actual':
-        version=current.get('version') or 'V01'
-    else:
-        version=next_version(code,current.get('version'))
-    st.caption('Nombre, especialidad y fecha final definidos por el Administrador.')
+    version=(current.get('version') or 'V01') if existing and action=='Editar registro actual' else next_version(code,current.get('version'))
+    st.caption('ID, especialidad y fecha final definidos por Administrador.')
     form_key=f'delivery_editor_{code}_{action}'
+    if action=='Editar registro actual' and rid:
+        st.info('Para reemplazar documentos existentes usa «Ver detalles y versiones». Aquí puedes agregar más documentos.')
+    optional_docs=bool(rid and action=='Editar registro actual')
+    how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
+        max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
     with st.form(f'{form_key}_form'):
         st.text_input('Nombre del entregable',value=catalog['name'],disabled=True)
         st.text_input('Especialidad',value=catalog['specialty'] or 'No asignada',disabled=True)
@@ -1749,55 +1912,61 @@ def delivery_editor(data):
               'specialty':catalog['specialty'] or '','version':version,'due_date':due.isoformat(),
               'actual_date':delivery_date,'file_path':current.get('file_path') or ''}
         for key,label,kind,required,opt in SPECS['Entregables'][1]:
-            if key in ('project_code','code','name','specialty','version','due_date','actual_date'):
-                continue
-            if key=='file_path':continue
+            if key in ('project_code','code','name','specialty','version','due_date','actual_date','file_path'):continue
             if key=='status' and role=='Consulta':
-                vals[key]='Pendiente'
-                continue
+                vals[key]='Pendiente';continue
             old=current.get(key)
             if old is not None and pd.isna(old):old=None
             if key=='status' and action=='Registrar nueva versión':old='Pendiente'
             if key in ('review_date','correction_date','approval_date') and action=='Registrar nueva versión':old=None
             vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,old,form_key)
-        st.markdown('#### 📎 Documentos del entregable')
-        st.caption('Los archivos se subirán a Google Drive, dentro de Proyecto / Entregable / Versión.')
-        pdf_file=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'{form_key}_pdf')
-        edit_file=st.file_uploader('Archivo editable para descargar (DWG, DOC o DOCX)',
-                                    type=['dwg','doc','docx'],key=f'{form_key}_editable')
-        if not drive_ready():st.warning('Google Drive no está conectado. No podrás adjuntar archivos hasta configurarlo.')
+        st.markdown('#### 📎 Documentos de '+version)
+        st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
+        entries=[]
+        for i in range(how_many):
+            with st.container(border=True):
+                st.markdown(f'**Documento {i+1}**')
+                title=st.text_input('Nombre del documento *',key=f'{form_key}_title_{i}',
+                    placeholder='Ej.: Planta del primer piso')
+                pdf=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'{form_key}_pdf_{i}')
+                editable=st.file_uploader('Editable (DWG, Word, Excel, IFC o RVT)',
+                    type=['dwg','doc','docx','xls','xlsx','ifc','rvt'],key=f'{form_key}_editable_{i}')
+                entries.append((title,pdf,editable))
+        if not drive_ready():st.warning('Google Drive no está autorizado; no podrás cargar archivos.')
         submitted=st.form_submit_button('💾 Registrar entrega' if not rid else '💾 Guardar cambios',type='primary')
     if submitted:
         try:
-            vals={k:(v.isoformat() if isinstance(v,date) else v) for k,v in vals.items()}
-            uploads=[(k,f) for k,f in (('pdf',pdf_file),('editable',edit_file)) if f is not None]
-            if uploads and not drive_ready():raise ValueError('Google Drive no está conectado. No se guardaron datos.')
-            # Validar todos los adjuntos ANTES del registro; evita errores comunes de guardados parciales.
-            for kind,f in uploads:
-                raw=f.getvalue()
-                ext=f.name.rsplit('.',1)[-1].lower() if '.' in f.name else ''
-                if not raw or len(raw)>DRIVE_LIMIT:raise ValueError(f'{f.name}: vacío o mayor de 25 MB.')
-                if kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-')):
-                    raise ValueError('El PDF seleccionado no es válido.')
-                if kind=='editable' and ext not in ('dwg','doc','docx'):
-                    raise ValueError('Editable no admitido: utiliza DWG, DOC o DOCX.')
+            if any(not name.strip() for name,_,_ in entries):raise ValueError('Escribe el nombre de cada documento.')
+            if any((pdf or editable) for _,pdf,editable in entries) and not drive_ready():
+                raise ValueError('Google Drive no está conectado. No se guardó el formulario.')
+            # Validación anterior al guardado para reducir operaciones parciales.
+            for _,pdf,editable in entries:
+                for kind,f in (('pdf',pdf),('editable',editable)):
+                    if f is None:continue
+                    raw=f.getvalue();ext=f.name.rsplit('.',1)[-1].lower() if '.' in f.name else ''
+                    if not raw or len(raw)>DRIVE_LIMIT:raise ValueError(f'{f.name}: vacío o mayor de 25 MB.')
+                    if kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-')):
+                        raise ValueError(f'{f.name}: PDF no válido.')
+                    if kind=='editable' and ext not in ('dwg','doc','docx','xls','xlsx','ifc','rvt'):
+                        raise ValueError(f'{f.name}: formato editable no admitido.')
+            if role=='Consulta':vals['status']='Pendiente'
+            # Revalidar en BD para evitar duplicados si dos usuarios envían simultáneamente.
             if role=='Consulta':
-                vals['status']='Pendiente'
-            save_record('Entregables',vals,rid)
-            for kind,f in uploads:
                 with connection() as con:
-                    stored=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
-                drive_upload(f,int(stored['id']),code,stored['version'],kind,
-                    allow_new_consulta=(role=='Consulta' and rid is None))
-            st.success('Entrega registrada correctamente.');st.rerun()
+                    if con.execute('SELECT 1 FROM deliverables WHERE code=?',(code,)).fetchone():
+                        raise ValueError('Otro usuario ya registró este entregable. Actualiza la pantalla.')
+            save_record('Entregables',vals,rid)
+            with connection() as con:
+                stored=con.execute('SELECT id FROM deliverables WHERE code=?',(code,)).fetchone()
+            numbers=attach_new_documents(int(stored['id']),version,entries,consulta=(role=='Consulta' and rid is None))
+            st.success('Entrega registrada. Documentos: '+', '.join(numbers));st.rerun()
         except (ValueError,PermissionError,sqlite3.IntegrityError,requests.RequestException) as exc:
             st.error(f'No se completó la operación: {exc}')
-            st.caption('Si Google Drive falló después de guardar el registro, no vuelvas a usar otro código: '
-                       'un administrador debe revisar el registro y sus archivos.')
+            st.caption('Si Google Drive falló durante la subida, el registro puede haberse creado parcialmente. '
+                       'No repitas la carga sin revisar el historial; pide al Administrador completar los archivos faltantes.')
     st.divider()
     card_browser('Entregables',data['Entregables'],allow_version_edit=admin)
     if admin:bulk_delete_ui('Entregables',data)
-
 
 def edit_module(module,data):
     if module=='Proyectos':
@@ -1960,82 +2129,80 @@ CHECK_GROUPS={
 
 
 def checklist_page():
-    st.title('✅ Control de calidad de planos')
-    st.caption('Lista de verificación multidisciplinaria · Revisión documental por entregable')
+    st.title('✅ Checklist de calidad por documento')
+    st.caption('Cada documento tiene su propio checklist; los resultados no se mezclan entre D01, D02 y otras versiones.')
     deliveries=df('deliverables')
-    if deliveries.empty:st.info('Primero registra un entregable.');return
-    find=st.text_input('🔎 Buscar entregable',key='checklist_search').strip().casefold()
-    if find:
-        deliveries=deliveries[deliveries.astype(str).apply(lambda col:col.str.contains(find,case=False,regex=False)).any(axis=1)]
-    if deliveries.empty:st.info('No se encontraron entregables.');return
-    dc=st.selectbox('Entregable',deliveries.code.tolist(),
-        format_func=lambda code:f'{code} — {deliveries.loc[deliveries.code==code,"name"].iloc[0]}',key='checklist_delivery')
+    if deliveries.empty:st.info('Registra primero un entregable.');return
+    query=st.text_input('🔎 Buscar entregable',key='ck_search_doc')
+    if query:
+        deliveries=deliveries[deliveries.astype(str).apply(lambda x:x.str.contains(query,case=False,regex=False)).any(axis=1)]
+    if deliveries.empty:st.info('No hay coincidencias.');return
+    code=st.selectbox('Entregable',deliveries.code.tolist(),key='ck_delivery',
+        format_func=lambda c:f'{c} — {deliveries.loc[deliveries.code==c,"name"].iloc[0]}')
     with connection() as con:
-        existing={r['criterion']:dict(r) for r in con.execute('SELECT * FROM checklist WHERE delivery_code=?',(dc,))}
+        record=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
+        versions=[v[0] for v in con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC',(code,))]
+    if not versions:st.info('Sin versiones para este entregable.');return
+    selected_version=st.selectbox('Versión',versions,index=0,key=f'ck_ver_{code}')
+    docs=docs_for_version(record['id'],selected_version)
+    if not docs:
+        st.info('Esta versión todavía no tiene documentos. Agrega D01 desde Entregables.');return
+    doc_ids=[d['id'] for d in docs]
+    doc_id=st.selectbox('Documento',doc_ids,format_func=lambda i:next(f'{d["doc_no"]} — {d["title"]}' for d in docs if d['id']==i),
+        key=f'ck_doc_{code}_{selected_version}')
+    doc=next(d for d in docs if d['id']==doc_id)
+    with connection() as con:
+        existing={r['criterion']:dict(r) for r in con.execute('SELECT criterion,result,notes FROM document_checklist WHERE document_id=?',(doc_id,))}
     results={c:existing.get(c,{}).get('result','PENDIENTE') for c in CHECKS}
-    counts={status:sum(1 for value in results.values() if value==status) for status in ('OK','PENDIENTE','NO APLICA')}
+    counts={v:sum(1 for result in results.values() if result==v) for v in ('OK','PENDIENTE','NO APLICA')}
     applicable=counts['OK']+counts['PENDIENTE']
     pct=100*counts['OK']/applicable if applicable else 100
     with st.container(border=True):
-        st.markdown(f'### 📋 {escape(dc)}')
-        cols=st.columns(4,gap='small')
-        for col,title,val in zip(cols,['Cumplimiento','Conformes','Pendientes','No aplica'],
-                                 [f'{pct:.0f}%',counts['OK'],counts['PENDIENTE'],counts['NO APLICA']]):
-            with col:st.metric(title,val)
-        st.progress(min(1,max(0,pct/100)))
-        if counts['PENDIENTE']:
-            st.warning(f'{counts["PENDIENTE"]} puntos requieren revisión antes de aprobar el plano.')
-        else:st.success('No hay criterios aplicables pendientes.')
-    filtered=st.segmented_control('Mostrar criterios',options=['Todos','Pendientes','Conformes','No aplica'],
-        default='Todos',key='checklist_filter')
-    matches={'Todos':None,'Pendientes':'PENDIENTE','Conformes':'OK','No aplica':'NO APLICA'}
-    wanted=matches.get(filtered)
-    st.caption('Los cambios de resultado y observación se guardan al pulsar «Guardar checklist».')
+        st.markdown(f'### 📄 {escape(doc["doc_no"])} – {escape(doc["title"])}')
+        cols=st.columns(4)
+        for col,label,num in zip(cols,['Cumplimiento','Conformes','Pendientes','No aplica'],
+                                  [f'{pct:.0f}%',counts['OK'],counts['PENDIENTE'],counts['NO APLICA']]):
+            with col:st.metric(label,num)
+        st.progress(pct/100)
+    filter_option=st.segmented_control('Filtrar criterios',options=['Todos','Pendientes','Conformes','No aplica'],
+        default='Todos',key=f'ck_filter_{doc_id}')
+    wanted={'Todos':None,'Pendientes':'PENDIENTE','Conformes':'OK','No aplica':'NO APLICA'}[filter_option]
     if can_edit():
-        with st.form(f'checklist_form_{dc}'):
+        with st.form(f'document_checklist_{doc_id}'):
             entered=[]
             for group,criteria in CHECK_GROUPS.items():
-                subset=[criterion for criterion in criteria if wanted is None or results[criterion]==wanted]
+                subset=[c for c in criteria if wanted is None or results[c]==wanted]
                 if not subset:continue
-                with st.expander(f'{group} · {sum(results[c]=="OK" for c in criteria)}/{sum(results[c]!="NO APLICA" for c in criteria)} conformes',
-                                 expanded=True):
-                    for pos,criterion in enumerate(subset):
-                        prev=existing.get(criterion,{})
-                        status_now=results[criterion]
+                with st.expander(group,expanded=True):
+                    for c in subset:
                         with st.container(border=True):
-                            st.markdown('**'+escape(criterion)+'**')
-                            left,right=st.columns([1,2],gap='small')
-                            with left:
-                                status=st.selectbox('Resultado', ['PENDIENTE','OK','NO APLICA'],
-                                    index=['PENDIENTE','OK','NO APLICA'].index(status_now),
-                                    key=f'chk_{dc}_{criterion}')
-                            with right:
-                                note=st.text_input('Observación',value=prev.get('notes') or '',
-                                    placeholder='Anota la observación o corrección',key=f'chk_note_{dc}_{criterion}')
-                            entered.append((criterion,status,note))
-            if st.form_submit_button('💾 Guardar checklist',type='primary'):
+                            st.markdown('**'+escape(c)+'**')
+                            left,right=st.columns([1,2])
+                            opts=['PENDIENTE','OK','NO APLICA']
+                            with left:status=st.selectbox('Resultado',opts,index=opts.index(results[c]),key=f'dck_stat_{doc_id}_{c}')
+                            with right:note=st.text_input('Observación',value=existing.get(c,{}).get('notes') or '',key=f'dck_note_{doc_id}_{c}')
+                            entered.append((c,status,note))
+            if st.form_submit_button('💾 Guardar checklist'):
                 with connection() as con:
                     for criterion,status,note in entered:
-                        con.execute('''INSERT INTO checklist(delivery_code,criterion,result,notes) VALUES(?,?,?,?)
-                            ON CONFLICT(delivery_code,criterion) DO UPDATE SET result=excluded.result,notes=excluded.notes''',
-                            (dc,criterion,status,note))
+                        con.execute('''INSERT INTO document_checklist(document_id,criterion,result,notes) VALUES(?,?,?,?)
+                            ON CONFLICT(document_id,criterion) DO UPDATE SET result=excluded.result,notes=excluded.notes''',
+                            (doc_id,criterion,status,note))
                     con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
-                        ('Checklist',dc,f'{len(entered)} criterios actualizados'))
-                st.success('Checklist actualizado.');st.rerun()
+                        ('Checklist',code,f'{selected_version}/{doc["doc_no"]}: {len(entered)} criterios'))
+                st.success('Checklist guardado');st.rerun()
     else:
-        st.info('Consulta: verificación de solo lectura.')
+        st.info('Consulta: acceso de solo lectura al checklist.')
         for group,criteria in CHECK_GROUPS.items():
-            subset=[criterion for criterion in criteria if wanted is None or results[criterion]==wanted]
+            subset=[c for c in criteria if wanted is None or results[c]==wanted]
             if not subset:continue
             with st.expander(group,expanded=True):
                 for criterion in subset:
-                    current=results[criterion]
-                    symbol={'OK':'🟢','PENDIENTE':'🟡','NO APLICA':'⚪'}[current]
-                    with st.container(border=True):
-                        st.markdown(f'{symbol} **{escape(criterion)}** · {current}')
-                        note=existing.get(criterion,{}).get('notes')
-                        if note:st.caption(note)
-
+                    state=results[criterion]
+                    icon={'OK':'🟢','PENDIENTE':'🟡','NO APLICA':'⚪'}[state]
+                    st.markdown(f'{icon} **{escape(criterion)}** · {state}')
+                    note=existing.get(criterion,{}).get('notes')
+                    if note:st.caption(note)
 
 def versions_page():
     st.title('📚 Historial de versiones')
@@ -2063,7 +2230,7 @@ def export_xlsx(data):
             from openpyxl.utils import get_column_letter
             for cell in sh[1]:cell.fill=PatternFill('solid',fgColor='17365D');cell.font=Font(color='FFFFFF',bold=True)
             for i,col in enumerate(frame.columns,1):sh.column_dimensions[get_column_letter(i)].width=min(42,max(14,len(str(col))+3))
-        for table,label in [('versions','VERSIONES'),('checklist','CHECKLIST'),('audit','AUDITORIA')]:
+        for table,label in [('versions','VERSIONES'),('delivery_documents','DOCUMENTOS'),('document_files','ARCHIVOS_DRIVE'),('document_checklist','CHECKLIST_DOC'),('checklist','CHECKLIST_ANT'),('audit','AUDITORIA')]:
             frame=df(table).drop(columns=['id'],errors='ignore');frame.to_excel(writer,sheet_name=label,index=False)
     dest.seek(0);return dest
 
@@ -2120,14 +2287,17 @@ def main():
         if st.button('Cerrar sesión'):
             end_login_session()
             st.rerun()
-        pages=['Mis documentos','Mi cuenta'] if st.session_state.get('role')=='Cliente' else ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta']
+        pages=(['Mis documentos','Mi cuenta'] if st.session_state.get('role')=='Cliente' else
+               ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Checklist planos','Versiones','Mi cuenta']
+               if st.session_state.get('role')=='Consulta' else
+               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta'])
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
         page=st.radio('Navegación',pages)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
     data=decorate()
     if page=='Mis documentos':client_portal()
-    elif page=='Dashboard':dashboard(data)
-    elif page in SPECS and st.session_state.get('role')!='Cliente':edit_module(page,data)
+    elif page=='Dashboard' and can_edit():dashboard(data)
+    elif page in SPECS and st.session_state.get('role')!='Cliente' and (page!='Personal' or can_edit()):edit_module(page,data)
     elif page=='Checklist planos' and st.session_state.get('role')!='Cliente':checklist_page()
     elif page=='Versiones' and st.session_state.get('role')!='Cliente':versions_page()
     elif page=='Mi cuenta':my_account()
