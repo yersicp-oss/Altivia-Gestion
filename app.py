@@ -229,6 +229,18 @@ def initialize():
                     con.execute('INSERT OR IGNORE INTO task_people(task_id,person_id,assignment_role) VALUES(?,?,?)',
                         (old['id'],person['id'],role))
             con.execute('INSERT OR IGNORE INTO task_people_migration(task_id) VALUES(?)',(old['id'],))
+        # Secuencia T001, T002... independiente por proyecto. No se reduce al borrar
+        # una tarea. Detecta tareas heredadas que ya utilicen el formato nuevo.
+        con.execute('''CREATE TABLE IF NOT EXISTS task_counters (
+            project_code TEXT PRIMARY KEY,
+            highest INTEGER NOT NULL DEFAULT 0)''')
+        for old_task in con.execute('SELECT project_code,code FROM tasks WHERE project_code IS NOT NULL').fetchall():
+            project_code=str(old_task['project_code'] or '').strip()
+            match=re.fullmatch(re.escape(project_code)+r'_T(\d+)',str(old_task['code'] or ''),re.IGNORECASE)
+            if match:
+                con.execute('''INSERT INTO task_counters(project_code,highest) VALUES(?,?)
+                    ON CONFLICT(project_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
+                    (project_code,int(match.group(1))))
         con.execute('CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_code)')
         con.execute('CREATE INDEX IF NOT EXISTS idx_deliveries_project ON deliverables(project_code)')
 
@@ -346,6 +358,14 @@ def initialize_auth():
             expires_at TEXT NOT NULL
         )""")
         con.execute('CREATE INDEX IF NOT EXISTS idx_remembered_user ON remembered_sessions(user_id)')
+        # Autorizaciones de VISUALIZACIÓN de proyectos para usuarios Consulta.
+        # Se asocian a los ID internos (no al código), resistentes a renombrados.
+        con.execute('''CREATE TABLE IF NOT EXISTS consulta_project_access (
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            granted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(user_id, project_id))''')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_consulta_project_access_project ON consulta_project_access(project_id)')
         users=con.execute('SELECT COUNT(*) FROM users').fetchone()[0]
         if users==0:
             password=os.getenv('ALTIVIA_ADMIN_PASSWORD','')
@@ -551,7 +571,7 @@ def normalized_username(raw):
     return username
 
 
-def update_user_by_admin(target_id,username,full_name,role,active,new_password=''):
+def update_user_by_admin(target_id,username,full_name,role,active,new_password='',project_ids=None):
     """Edita una cuenta por su ID; conserva permisos de cliente y las referencias."""
     require_admin()
     target_id=int(target_id)
@@ -584,6 +604,8 @@ def update_user_by_admin(target_id,username,full_name,role,active,new_password='
             con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(target_id,))
         if role=='Consulta':
             ensure_consulta_person(con,target_id,full_name,username)
+        if project_ids is not None or role!='Consulta':
+            set_consulta_project_access(con,target_id,project_ids or [])
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Usuarios',username,f'Perfil editado por Administrador ID {actor}'))
     if target_id==actor:
@@ -622,6 +644,50 @@ def update_own_profile(username,full_name,current_password):
     return username
 
 
+def consulta_project_ids(user_id):
+    """IDs de proyectos que un usuario Consulta puede ver en Proyectos."""
+    with connection() as con:
+        return {int(r[0]) for r in con.execute(
+            'SELECT project_id FROM consulta_project_access WHERE user_id=?', (int(user_id),))}
+
+
+def set_consulta_project_access(con, user_id, project_ids):
+    """Actualiza solo accesos de un usuario, validando rol e IDs en el servidor."""
+    require_admin()
+    user_id=int(user_id)
+    ids={int(i) for i in project_ids}
+    account=con.execute('SELECT role FROM users WHERE id=?',(user_id,)).fetchone()
+    if not account:raise ValueError('El usuario seleccionado no existe.')
+    if account['role']!='Consulta':
+        # Los roles Cliente y Administrador no usan este permiso.
+        con.execute('DELETE FROM consulta_project_access WHERE user_id=?',(user_id,))
+        return
+    if ids:
+        placeholders=','.join('?' for _ in ids)
+        existing={int(r[0]) for r in con.execute(
+            f'SELECT id FROM projects WHERE id IN ({placeholders})', tuple(ids))}
+        if existing!=ids:raise ValueError('Uno o más proyectos ya no existen; actualiza la selección.')
+    con.execute('DELETE FROM consulta_project_access WHERE user_id=?',(user_id,))
+    con.executemany('INSERT INTO consulta_project_access(user_id,project_id) VALUES(?,?)',
+                    [(user_id,i) for i in sorted(ids)])
+    con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                ('Usuarios',str(user_id),f'Proyectos visibles Consulta actualizados: {len(ids)}'))
+
+
+def project_permission_options():
+    """Retorna el catálogo de proyectos para el formulario del Administrador."""
+    with connection() as con:
+        return [dict(r) for r in con.execute(
+            'SELECT id,code,name,client FROM projects ORDER BY code')]
+
+
+def visible_project_rows(frame,user_id):
+    """Filtra los proyectos antes de construir la vista de Consulta."""
+    if frame.empty:return frame.copy()
+    allowed=consulta_project_ids(user_id)
+    return frame[frame['id'].isin(allowed)].copy()
+
+
 def user_management():
     require_admin()
     st.title('🔐 Administración de usuarios')
@@ -632,12 +698,18 @@ def user_management():
             'role':'Rol','active':'Activo','created_at':'Fecha de creación'})
         st.dataframe(display[['Usuario','Nombre completo','Rol','Activo','Fecha de creación']],
                      hide_index=True,use_container_width=True)
+    available_projects=project_permission_options()
+    project_ids=[int(p['id']) for p in available_projects]
+    project_labels={int(p['id']):f"{p['code']} · {p['name']}" + (f" · {p['client']}" if p.get('client') else '') for p in available_projects}
     with st.expander('➕ Crear usuario',expanded=users.empty):
         with st.form('new_user'):
             username=st.text_input('Usuario nuevo').strip().lower()
             name=st.text_input('Nombre completo').strip()
             role=st.selectbox('Rol',['Consulta','Cliente','Administrador'])
             password=st.text_input('Contraseña inicial (mínimo 6 caracteres)',type='password')
+            initial_projects=st.multiselect('Proyectos visibles (aplica solo a Consulta)',project_ids,
+                format_func=lambda i:project_labels[i],key='new_consulta_project_grants',
+                help='Selecciona uno o varios proyectos. Si no seleccionas ninguno, Consulta no verá proyectos en ese apartado.')
             if st.form_submit_button('Crear usuario',type='primary'):
                 try:
                     username=normalized_username(username)
@@ -648,6 +720,7 @@ def user_management():
                                     (username,name,hash_password(password),role))
                         if role=='Consulta':
                             ensure_consulta_person(con,cursor.lastrowid,name,username)
+                        set_consulta_project_access(con,cursor.lastrowid,initial_projects)
                     st.success('Usuario creado.');st.rerun()
                 except sqlite3.IntegrityError:st.error('El nombre de usuario ya existe.')
                 except ValueError as exc:st.error(str(exc))
@@ -662,6 +735,7 @@ def user_management():
                     format_func=lambda i: f"{users.loc[users.id==i,'full_name'].iloc[0]} · {users.loc[users.id==i,'username'].iloc[0]}",
                     key='user_edit_select')
                 r=users.loc[users.id==selected].iloc[0]
+                selected_projects=consulta_project_ids(selected)
                 with st.form(f'edit_user_form_{selected}'):
                     new_username=st.text_input('Nombre de usuario',value=str(r['username']))
                     new_full_name=st.text_input('Nombre completo',value=str(r['full_name']))
@@ -669,10 +743,15 @@ def user_management():
                     new_role=st.selectbox('Rol',allowed_roles,index=allowed_roles.index(str(r['role'])))
                     active=st.checkbox('Cuenta activa',value=bool(r['active']))
                     reset=st.text_input('Nueva contraseña (opcional; dejar vacío para conservar)',type='password')
+                    edited_projects=st.multiselect('Proyectos que este usuario Consulta puede visualizar',project_ids,
+                        default=[i for i in project_ids if i in selected_projects],
+                        format_func=lambda i:project_labels[i],key=f'edit_consulta_project_grants_{selected}',
+                        help='Solo aplica si el rol es Consulta. Sin proyectos asignados, el apartado Proyectos estará vacío.')
                     save=st.form_submit_button('💾 Guardar cambios',type='primary')
                 if save:
                     try:
-                        updated=update_user_by_admin(selected,new_username,new_full_name,new_role,active,reset)
+                        updated=update_user_by_admin(selected,new_username,new_full_name,new_role,active,reset,
+                                                     project_ids=edited_projects)
                         st.success(f'Usuario {updated} actualizado.');st.rerun()
                     except (ValueError,PermissionError,sqlite3.Error) as exc:st.error(str(exc))
         st.divider()
@@ -1350,6 +1429,9 @@ def update_project_sync(values,record_id):
             sets=', '.join(f'"{k}"=?' for k in vals)
             con.execute(f'UPDATE projects SET {sets} WHERE id=?',list(vals.values())+[record_id])
             if old_code!=new_code:
+                # Las tareas existentes conservan su ID (clave histórica). La serie
+                # para tareas nuevas sí sigue el código nuevo del proyecto.
+                con.execute('UPDATE task_counters SET project_code=? WHERE project_code=?',(new_code,old_code))
                 for table in ('tasks','deliverables','changes','meetings','deliverable_catalog'):
                     con.execute(f'UPDATE {table} SET project_code=? WHERE project_code=?',(new_code,old_code))
             for file_id,old_filename,new_filename in to_rename:
@@ -1367,6 +1449,25 @@ def update_project_sync(values,record_id):
         raise
 
 
+def task_code_for_project(project_code,con):
+    """Siguiente código disponible sin avanzar contador (para previsualización)."""
+    project_code=str(project_code or '').strip()
+    if not project_code:
+        return ''
+    row=con.execute('SELECT highest FROM task_counters WHERE project_code=?',(project_code,)).fetchone()
+    highest=int(row['highest']) if row else 0
+    while True:
+        highest+=1
+        code=f'{project_code}_T{highest:03d}'
+        if con.execute('SELECT 1 FROM tasks WHERE code=?',(code,)).fetchone() is None:
+            return code
+
+
+def preview_task_code(project_code):
+    with connection() as con:
+        return task_code_for_project(project_code,con)
+
+
 def save_record(module,values,record_id=None,task_assignees=None):
     '''Guarda datos; en entregables el catálogo controla IDs y fecha final.
 
@@ -1381,6 +1482,18 @@ def save_record(module,values,record_id=None,task_assignees=None):
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
     if module=='Plan de trabajo':
+        # Se valida en el servidor: el ID nunca se acepta desde el navegador.
+        # Se conserva el código antiguo en ediciones para proteger las referencias.
+        if record_id is not None:
+            with connection() as con:
+                original=con.execute('SELECT code,project_code FROM tasks WHERE id=?',(int(record_id),)).fetchone()
+            if not original:
+                raise ValueError('La tarea ya no existe. Actualiza la pantalla.')
+            if str(values.get('project_code') or '')!=str(original['project_code'] or ''):
+                raise ValueError('No es posible cambiar el proyecto de una tarea existente. Crea otra tarea en el proyecto correspondiente.')
+            values['code']=original['code']
+        else:
+            values['code']='POR_ASIGNAR'  # Marcador interno; se sustituye en transacción.
         if task_assignees is not None:
             owners,reviewers=task_assignees
             owners=set(map(int,owners));reviewers=set(map(int,reviewers))
@@ -1483,6 +1596,17 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 _refresh_task_display(con,[r[0] for r in con.execute(
                     'SELECT DISTINCT task_id FROM task_people WHERE person_id=?',(record_id,))])
         else:
+            if module=='Plan de trabajo':
+                # Bloqueo de escritura ANTES de leer el contador: dos administradores
+                # no pueden obtener el mismo código si guardan al mismo tiempo.
+                con.execute('BEGIN IMMEDIATE')
+                project_code=str(values['project_code']).strip()
+                generated=task_code_for_project(project_code,con)
+                values['code']=generated
+                serial=int(generated.rsplit('_T',1)[1])
+                con.execute('''INSERT INTO task_counters(project_code,highest) VALUES(?,?)
+                    ON CONFLICT(project_code) DO UPDATE SET highest=MAX(highest,excluded.highest)''',
+                    (project_code,serial))
             keys=','.join(values.keys());placeholders=','.join('?' for _ in values)
             inserted=con.execute(f'INSERT INTO {table} ({keys}) VALUES ({placeholders})',list(values.values()))
             if module=='Plan de trabajo':record_id=inserted.lastrowid
@@ -1534,6 +1658,7 @@ def delete_selected(module,ids):
                                  'Primero reasigna las tareas o elimina la cuenta y desvincula las tareas.')
         if module=='Proyectos' and codes:
             pm=','.join('?' for _ in codes)
+            con.execute(f'DELETE FROM task_counters WHERE project_code IN ({pm})',codes)
             dc=[r[0] for r in con.execute(f'SELECT code FROM deliverables WHERE project_code IN ({pm})',codes)]
             if dc:
                 dm=','.join('?' for _ in dc)
@@ -1596,7 +1721,7 @@ def reset_database_ui():
         ['Limpiar datos operativos (conservar todos los usuarios)',
          'Restablecimiento general (borrar datos y otros usuarios; conservar mi cuenta administradora)'],
          key='reset_mode')
-    st.caption('Se borrarán proyectos, tareas, entregables, versiones, checklists, cambios, reuniones, personal y bitácora. La segunda opción también borra todas las cuentas excepto el administrador que ejecuta el procedimiento.')
+    st.caption('Se borrarán proyectos, sus autorizaciones de visualización, tareas, entregables, versiones, checklists, cambios, reuniones, personal y bitácora. La segunda opción también borra todas las cuentas excepto el administrador que ejecuta el procedimiento.')
     with st.form('reset_form'):
         typed=st.text_input('Escriba RESTABLECER ALTIVIA')
         password=st.text_input('Su contraseña de administrador',type='password')
@@ -1613,7 +1738,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','task_people','task_people_migration','tasks','deliverables','deliverable_catalog','projects','people','audit'):
+                for table in ('task_counters','document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','task_people','task_people_migration','tasks','deliverables','deliverable_catalog','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -1622,6 +1747,87 @@ def reset_database_ui():
             st.success(f'Información restablecida. Respaldo guardado: {path}')
             st.rerun()
         except Exception as exc:st.error(f'El restablecimiento falló: {exc}')
+
+
+def open_task_editor(task_id=None):
+    """Solo el administrador puede abrir la edición (también desde callbacks)."""
+    require_admin()
+    st.session_state['task_editor_id']=int(task_id) if task_id is not None else None
+    st.session_state['task_editor_open']=True
+
+
+def close_task_editor():
+    st.session_state['task_editor_id']=None
+    st.session_state['task_editor_open']=False
+
+
+def task_cards(frame):
+    """Fichas específicas de Plan de trabajo; filtradas por permisos antes de entrar."""
+    st.markdown('### 📂 Registros')
+    if frame.empty:
+        st.info('Todavía no hay actividades disponibles.');return
+    query=st.text_input('🔎 Buscar tarea, actividad o integrante',key='cards_search_tasks')
+    a,b=st.columns(2)
+    with a:
+        states=sorted(str(x) for x in frame['status'].dropna().unique())
+        state=st.selectbox('Estado',['Todos']+states,key='cards_state_tasks')
+    with b:
+        projects=sorted(str(x) for x in frame['project_code'].dropna().unique())
+        project=st.selectbox('Proyecto',['Todos']+projects,key='cards_proj_tasks') if projects else 'Todos'
+    if query:
+        frame=frame[frame.astype(str).apply(lambda ser:ser.str.contains(query,case=False,regex=False)).any(axis=1)]
+    if state!='Todos':frame=frame[frame['status'].astype(str)==state]
+    if project!='Todos':frame=frame[frame['project_code'].astype(str)==project]
+    st.caption(f'{len(frame)} tarea(s) encontradas')
+    # Descripción del proyecto / cliente se recupera de Proyectos, no del ID.
+    with connection() as con:
+        project_names={str(p['code']):(str(p['name'] or ''),str(p['client'] or ''))
+            for p in con.execute('SELECT code,name,client FROM projects')}
+    page_size=10
+    max_page=max(1,(len(frame)+page_size-1)//page_size)
+    page=st.number_input('Página',min_value=1,max_value=max_page,value=1,step=1,key='cards_page_tasks')
+    for _,r in frame.iloc[(page-1)*page_size:page*page_size].iterrows():
+        code=escape(str(r.get('code') or ''))
+        activity=escape(str(r.get('activity') or 'Actividad sin nombre'))
+        status=escape(str(r.get('status') or 'Sin estado'))
+        owners=escape(str(r.get('owner') or 'Sin asignar'))
+        reviewers=escape(str(r.get('reviewer') or 'Sin asignar'))
+        start=escape(str(r.get('start_date') or '—'))
+        due=escape(str(r.get('due_date') or '—'))
+        with st.container(border=True):
+            # 1. Actividad destacada: 1.2rem = 20% más que el texto base.
+            st.markdown(f'<div style="font-size:1.2rem;font-weight:750;line-height:1.35;overflow-wrap:anywhere">{activity}</div>',
+                        unsafe_allow_html=True)
+            # 2. Código de tarea: segunda línea, sin especialidad.
+            st.caption(f'ID Tarea: {code}')
+            project_name,client_name=project_names.get(str(r.get('project_code') or ''),('',''))
+            project_info=' · '.join(s for s in (project_name, f'Cliente: {client_name}' if client_name else '') if s)
+            if project_info:
+                st.caption('🏗️ '+project_info)
+            st.markdown(f'**Estado:** {status}')
+            cols=st.columns(2)
+            with cols[0]:
+                st.markdown('**Responsables**')
+                st.write(owners)
+            with cols[1]:
+                st.markdown('**Revisores**')
+                st.write(reviewers)
+            dates=st.columns(2)
+            with dates[0]:st.caption(f'Fecha de inicio: {start}')
+            with dates[1]:st.caption(f'Fecha de término: {due}')
+            with st.expander('Ver detalles'):
+                details=[('ID Proyecto','project_code'),('Entregable relacionado','delivery_code'),
+                         ('Especialidad','specialty'),('Avance (%)','progress'),
+                         ('Prioridad','priority'),('Fecha actualización','updated_at'),
+                         ('Observaciones','notes')]
+                for label,key in details:
+                    value=r.get(key)
+                    if value is not None and pd.notna(value) and str(value).strip():
+                        st.markdown(f'**{label}:** {escape(str(value))}')
+            if can_edit():
+                st.button('✏️ Editar',key=f'edit_task_card_{int(r["id"])}',
+                          on_click=open_task_editor,args=(int(r['id']),),
+                          use_container_width=True)
 
 
 def card_browser(module, frame, allow_version_edit=True):
@@ -1654,7 +1860,7 @@ def card_browser(module, frame, allow_version_edit=True):
         status_text=str(r.get('status') or 'Sin estado')
         code=str(r.get('code') or '')
         subtitle=' · '.join(str(r.get(k)) for k in ('project_code','specialty','version') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip())
-        with st.container(border=True):
+        with st.container(border=True,key=f'gp_project_card_{int(r["id"])}') if module=='Proyectos' else st.container(border=True):
             st.markdown(f'**{escape(title)}**')
             st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
             if module!='Entregables' or can_edit():
@@ -1820,7 +2026,11 @@ def project_editor(data):
                             st.session_state['show_project_create']=False
                             st.success('Proyecto creado correctamente.');st.rerun()
                         except (ValueError,sqlite3.IntegrityError) as exc:st.error(str(exc))
-    card_browser('Proyectos',data['Proyectos'])
+    projects=data['Proyectos'] if can_edit() else visible_project_rows(
+        data['Proyectos'],st.session_state['user_id'])
+    if not can_edit():
+        st.caption('Solo se muestran los proyectos autorizados por el Administrador.')
+    card_browser('Proyectos',projects)
     if can_edit():bulk_delete_ui('Proyectos',data)
 
 
@@ -2208,88 +2418,104 @@ def delivery_editor(data):
     if admin:bulk_delete_ui('Entregables',data)
 
 def task_editor(data):
-    """Plan de trabajo con selección reactiva de entregable y especialidad."""
+    """Crea tareas con código automático y edita desde cada ficha de Registros."""
     st.title('Plan de trabajo')
     admin=can_edit()
-    table,fields=SPECS['Plan de trabajo']
+    _,fields=SPECS['Plan de trabajo']
     if admin:
-        with st.expander('✏️ Crear o editar registro'):
+        st.button('➕ Crear tarea',type='primary',on_click=open_task_editor,args=(None,),key='create_task_button')
+        if st.session_state.get('task_editor_open'):
+            rid=st.session_state.get('task_editor_id')
             existing=data['Plan de trabajo']
-            choices=['➕ Nuevo registro'] + [
-                f'{r["code"]} — {r.get("activity", "")}' for _,r in existing.iterrows()]
-            picked=st.selectbox('Registro a editar',choices,key='pick_tasks')
-            rid=None; row={}
-            if picked!='➕ Nuevo registro':
-                row=existing.iloc[choices.index(picked)-1].to_dict()
-                rid=int(row['id'])
-            form_key='form_tasks_'+str(rid if rid is not None else 'nuevo')
-            vals={};project=None
-            for key,label,kind,required,opt in fields:
-                raw=row.get(key)
-                if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):
-                    raw=None
-                if key=='project_code':
-                    vals[key]=form_input(key,label+' *',kind,required,opt,raw,form_key)
-                    project=vals[key]
-                    continue
-                if key=='delivery_code':
-                    # El control está FUERA de st.form. Streamlit reruns al cambiarlo.
-                    vals[key]=form_input(key,label,kind,required,opt,raw,form_key,
-                                         project_code=project)
-                    continue
-                if key=='specialty' and vals.get('delivery_code'):
-                    auto=programmed_delivery_specialty(project,vals['delivery_code'])
-                    vals[key]=auto
-                    st.text_input('Especialidad (automática)',
-                        value=auto or 'Sin especialidad asignada en el catálogo',
-                        disabled=True,
-                        key=f'task_auto_spec_{rid}_{project}_{vals["delivery_code"]}_{auto}')
-                    st.caption('Esta especialidad se obtiene del entregable programado por el Administrador. '
-                               'Para cambiarla, edita el catálogo de entregables.')
-                    continue
-                if key in ('owner','reviewer'):
-                    continue  # Se editan juntos, mediante selectores múltiples.
-                if key=='specialty' and raw and raw not in SPECIALTIES:
-                    st.caption(f'Especialidad anterior: {raw}. Selecciona una especialidad '
-                               'vigente si esta tarea no tiene entregable relacionado.')
-                vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,raw,
-                                     form_key,project_code=project)
-            st.markdown('#### Asignación de equipo')
-            roster=people_for_assignment()
-            labels={int(person['id']):person for person in roster}
-            all_person_ids=list(labels)
+            row={}
             if rid is not None:
-                default_owners,default_reviewers=task_assigned_people(rid)
-            else:
-                default_owners,default_reviewers=set(),set()
-            def person_label(pid):
-                person=labels[pid]
-                account=' · Usuario Consulta' if person.get('account_role')=='Consulta' else ''
-                return str(person['name'])+account
-            owner_ids=st.multiselect('Responsables * (uno o varios)',all_person_ids,
-                default=[i for i in all_person_ids if i in default_owners],
-                format_func=person_label,key=f'task_owners_{rid}')
-            reviewer_ids=st.multiselect('Revisores (uno o varios)',all_person_ids,
-                default=[i for i in all_person_ids if i in default_reviewers],
-                format_func=person_label,key=f'task_reviewers_{rid}')
-            if not all_person_ids:
-                st.warning('No hay integrantes en Personal. Crea un usuario Consulta o agrega Personal antes de asignar tareas.')
-            st.caption('Las tareas de cada usuario Consulta se filtran por su ficha de Personal; puede participar como responsable o revisor.')
-            if st.button('💾 Guardar cambios',type='primary',key=f'save_task_{rid}'):
-                converted={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v)
-                           for k,v in vals.items()}
-                try:
-                    save_record('Plan de trabajo',converted,rid,task_assignees=(owner_ids,reviewer_ids))
-                    st.success('Tarea guardada con la especialidad correspondiente al entregable.')
-                    st.rerun()
-                except (ValueError,sqlite3.IntegrityError,requests.RequestException,PermissionError) as exc:
-                    st.error(str(exc))
+                matches=existing[existing['id']==rid]
+                if matches.empty:
+                    st.warning('La tarea seleccionada ya no existe.');close_task_editor();st.rerun()
+                row=matches.iloc[0].to_dict()
+            heading=('✏️ Editar tarea · '+str(row.get('code'))) if rid is not None else '➕ Crear tarea'
+            with st.container(border=True):
+                st.markdown('#### '+heading)
+                st.caption('El ID de la tarea se asigna automáticamente al guardar y es independiente por proyecto.')
+                project_codes=selectors('project')
+                if not project_codes:
+                    st.warning('Registra primero un proyecto.')
+                else:
+                    if rid is not None:
+                        project=str(row.get('project_code') or '')
+                        st.text_input('ID Proyecto *',value=project,disabled=True,key=f'task_edit_project_{rid}')
+                        code=str(row['code'])
+                    else:
+                        project=st.selectbox('ID Proyecto *',project_codes,key='task_project_create')
+                        code=preview_task_code(project)
+                    st.text_input('ID Tarea (automático)',value=code,disabled=True,
+                                  key=f'task_code_readonly_{rid}_{project}_{code}')
+                    form_key=f'task_fields_{rid if rid is not None else "nuevo"}_{project}'
+                    vals={'project_code':project,'code':code}
+                    for key,label,kind,required,opt in fields:
+                        if key in ('code','project_code','owner','reviewer'):
+                            continue
+                        raw=row.get(key)
+                        if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):raw=None
+                        if key=='delivery_code':
+                            vals[key]=form_input(key,label,kind,required,opt,raw,form_key,project_code=project)
+                            continue
+                        if key=='specialty' and vals.get('delivery_code'):
+                            auto=programmed_delivery_specialty(project,vals['delivery_code'])
+                            vals[key]=auto
+                            st.text_input('Especialidad (automática)',
+                                value=auto or 'Sin especialidad en el catálogo',disabled=True,
+                                key=f'task_auto_spec_{rid}_{project}_{vals["delivery_code"]}_{auto}')
+                            st.caption('La especialidad se obtiene del entregable programado.')
+                            continue
+                        if key=='specialty' and raw and raw not in SPECIALTIES:
+                            st.caption(f'Especialidad anterior: {raw}. Selecciona una vigente si no hay entregable relacionado.')
+                        vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,
+                                             raw,form_key,project_code=project)
+                    st.markdown('#### Asignación de equipo')
+                    roster=people_for_assignment()
+                    labels={int(person['id']):person for person in roster}
+                    all_person_ids=list(labels)
+                    if rid is not None:
+                        default_owners,default_reviewers=task_assigned_people(rid)
+                    else:
+                        default_owners,default_reviewers=set(),set()
+                    def person_label(pid):
+                        person=labels[pid]
+                        account=' · Usuario Consulta' if person.get('account_role')=='Consulta' else ''
+                        return str(person['name'])+account
+                    owner_ids=st.multiselect('Responsables * (uno o varios)',all_person_ids,
+                        default=[i for i in all_person_ids if i in default_owners],
+                        format_func=person_label,key=f'task_owners_{rid}_{project}')
+                    reviewer_ids=st.multiselect('Revisores (uno o varios)',all_person_ids,
+                        default=[i for i in all_person_ids if i in default_reviewers],
+                        format_func=person_label,key=f'task_reviewers_{rid}_{project}')
+                    if not all_person_ids:
+                        st.warning('Agrega Personal o crea un usuario Consulta para asignar tareas.')
+                    st.caption('Los usuarios Consulta solo verán actividades donde son responsables o revisores.')
+                    save,cancel=st.columns([2,1])
+                    with save:
+                        saving=st.button('💾 Guardar tarea' if rid is None else '💾 Guardar cambios',
+                            type='primary',key=f'save_task_{rid}_{project}',use_container_width=True)
+                    with cancel:
+                        st.button('Cancelar',key=f'cancel_task_{rid}_{project}',
+                                  on_click=close_task_editor,use_container_width=True)
+                    if saving:
+                        converted={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v)
+                                   for k,v in vals.items()}
+                        try:
+                            save_record('Plan de trabajo',converted,rid,task_assignees=(owner_ids,reviewer_ids))
+                            close_task_editor()
+                            st.success('Tarea guardada correctamente.')
+                            st.rerun()
+                        except (ValueError,sqlite3.IntegrityError,requests.RequestException,PermissionError) as exc:
+                            st.error(str(exc))
         bulk_delete_ui('Plan de trabajo',data)
     else:
         st.info('Mis actividades: únicamente se muestran las tareas donde figuras como responsable o revisor.')
     visible_tasks=(data['Plan de trabajo'] if admin else
         visible_consulta_tasks(data['Plan de trabajo'],st.session_state['user_id']))
-    card_browser('Plan de trabajo',visible_tasks,allow_version_edit=admin)
+    task_cards(visible_tasks)
 
 
 def edit_module(module,data):
@@ -2597,6 +2823,19 @@ def setup_style():
       border-radius:11px;padding:12px 13px;min-width:0;min-height:97px;box-sizing:border-box}
     .altivia-kpi-label{font-size:0.84rem;line-height:1.3;font-weight:600;color:#334d67!important;overflow-wrap:anywhere}
     .altivia-kpi-value{font-size:1.75rem;line-height:1.2;font-weight:700;margin-top:9px;color:#102b48!important}
+    /* Tarjetas de proyectos: azul pizarra suave, contraste adecuado en tema claro/oscuro. */
+    [class*="st-key-gp_project_card_"]{
+      background:rgba(62,126,191,.105)!important;
+      border:1px solid rgba(93,153,212,.35)!important;
+      border-left:4px solid #3b80b9!important;
+      border-radius:13px!important;
+      box-shadow:0 3px 12px rgba(18,53,83,.075);
+      padding:10px 12px!important;
+    }
+    [class*="st-key-gp_project_card_"]:hover{
+      background:rgba(62,126,191,.16)!important;
+      border-color:rgba(93,153,212,.52)!important;
+    }
     .block-container{padding-top:1.5rem}
     @media(max-width:900px){
       .altivia-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
@@ -2633,17 +2872,18 @@ def main():
             end_login_session()
             st.rerun()
         pages=(['Mis documentos','Mi cuenta'] if st.session_state.get('role')=='Cliente' else
-               ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Checklist planos','Versiones','Mi cuenta']
+               ['Proyectos','Plan de trabajo','Entregables','Checklist','Versiones','Mi cuenta']
                if st.session_state.get('role')=='Consulta' else
-               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist planos','Versiones','Mi cuenta'])
+               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
         page=st.radio('Navegación',pages)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
     data=decorate()
     if page=='Mis documentos':client_portal()
     elif page=='Dashboard' and can_edit():dashboard(data)
-    elif page in SPECS and st.session_state.get('role')!='Cliente' and (page!='Personal' or can_edit()):edit_module(page,data)
-    elif page=='Checklist planos' and st.session_state.get('role')!='Cliente':checklist_page()
+    elif page in SPECS and st.session_state.get('role')!='Cliente' and (page not in ('Personal','Control de cambios') or can_edit()):
+        edit_module(page,data)
+    elif page=='Checklist' and st.session_state.get('role')!='Cliente':checklist_page()
     elif page=='Versiones' and st.session_state.get('role')!='Cliente':versions_page()
     elif page=='Mi cuenta':my_account()
     elif page=='Administrar usuarios':user_management()
