@@ -1176,7 +1176,7 @@ def upload_delivery_files(delivery_id,code,version):
     st.markdown('**📎 Archivos de esta versión**')
     existing=file_info(delivery_id,version)
     pdf=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'pdf_{delivery_id}_{version}')
-    editable=st.file_uploader('Archivo editable para descargar (DWG, DOC o DOCX)',type=['dwg','doc','docx'],key=f'edit_{delivery_id}_{version}')
+    editable=st.file_uploader('Archivo editable para descargar (incluye ETABS, SAP2000 y SAFE)',type=EDITABLE_EXTENSIONS,key=f'edit_{delivery_id}_{version}')
     st.caption(f'Máximo {MAX_UPLOAD_MB} MB por archivo. Se guardan en la base de datos local; no subas documentos confidenciales a Streamlit Community Cloud.')
     for kind,title in [('pdf','PDF'),('editable','Editable')]:
         if kind in existing:st.caption(f'{title} actual: {existing[kind]["filename"]} · {existing[kind]["size"] / 1048576:.1f} MB')
@@ -1190,7 +1190,7 @@ def upload_delivery_files(delivery_id,code,version):
             if kind=='pdf' and not raw.startswith(b'%PDF-'):
                 st.error('El PDF no tiene una cabecera válida.');return
             ext=f.name.rsplit('.',1)[-1].lower() if '.' in f.name else ''
-            if (kind=='pdf' and ext!='pdf') or (kind=='editable' and ext not in ('dwg','doc','docx')):
+            if (kind=='pdf' and ext!='pdf') or (kind=='editable' and ext not in EDITABLE_EXTENSIONS):
                 st.error('Formato no permitido.');return
             pending.append((kind,f.name,raw))
         if not pending:st.info('Selecciona al menos un archivo para guardar.');return
@@ -1205,6 +1205,8 @@ def upload_delivery_files(delivery_id,code,version):
 # Los documentos se guardan exclusivamente en Drive, no como BLOB local.
 DRIVE_FOLDER_ID = '19sEVR8-vrm9m_8adHJVU_l1gYCYIz4Sq'
 DRIVE_LIMIT = 25 * 1024 * 1024
+EDITABLE_EXTENSIONS = ('dwg','doc','docx','xls','xlsx','ifc','rvt','edb','sdb','fdb')
+EDITABLE_DESCRIPTION = 'DWG, DOC, DOCX, XLS, XLSX, IFC, RVT, EDB (ETABS), SDB (SAP2000), FDB (SAFE)'
 
 def drive_credentials():
     try:
@@ -1300,7 +1302,7 @@ def drive_upload(upload,delivery_id,code,version,kind,allow_new_consulta=False):
     raw=upload.getvalue()
     if not raw or len(raw)>DRIVE_LIMIT:raise ValueError('El archivo está vacío o supera los 25 MB.')
     ext=upload.name.rsplit('.',1)[-1].lower() if '.' in upload.name else ''
-    if (kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-'))) or (kind=='editable' and ext not in ('dwg','doc','docx')):
+    if (kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-'))) or (kind=='editable' and ext not in EDITABLE_EXTENSIONS):
         raise ValueError('Formato de archivo no permitido.')
     mime= 'application/pdf' if kind=='pdf' else 'application/octet-stream'
     safe_code=re.sub(r'[^A-Za-z0-9_-]','_',code)
@@ -1463,8 +1465,8 @@ def upload_document_file(upload, document_id, kind, allow_consulta=False):
     if not raw or len(raw)>DRIVE_LIMIT:raise ValueError('Archivo vacío o mayor de 25 MB.')
     if kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-')):
         raise ValueError('Selecciona un PDF válido.')
-    if kind=='editable' and ext not in ('dwg','doc','docx','xlsx','xls','ifc','rvt'):
-        raise ValueError('Editable no admitido. Usa DWG, DOC, DOCX, XLSX, XLS, IFC o RVT.')
+    if kind=='editable' and ext not in EDITABLE_EXTENSIONS:
+        raise ValueError('Editable no admitido. Formatos permitidos: '+EDITABLE_DESCRIPTION+'.')
     safe=re.sub(r'[^A-Za-z0-9_-]','_',row['code'])
     filename=f'{safe}_{row["version"]}_{row["doc_no"]}.{ext}'
     folder=drive_delivery_folder(drive_token(),row['delivery_id'],row['code'],row['version'])
@@ -2668,7 +2670,8 @@ def versions_for_delivery(code,allow_edit=False):
                             with st.form(f'doc_edit_{d["id"]}'):
                                 title=st.text_input('Nombre descriptivo',value=d['title'])
                                 pdf=st.file_uploader('Reemplazar PDF',type=['pdf'],key=f'doc_pdf_{d["id"]}')
-                                editable=st.file_uploader('Reemplazar editable',type=['dwg','doc','docx','xlsx','xls','ifc','rvt'],key=f'doc_edit_{d["id"]}')
+                                editable=st.file_uploader('Reemplazar editable (incluye EDB, SDB y FDB)',type=EDITABLE_EXTENSIONS,key=f'doc_edit_{d["id"]}')
+                                st.caption('Máximo 25 MB por archivo editable guardado en Google Drive.')
                                 if st.form_submit_button('💾 Guardar documento'):
                                     try:
                                         if not title.strip():raise ValueError('Indica el nombre del documento.')
@@ -2703,7 +2706,7 @@ def versions_for_delivery(code,allow_edit=False):
                         st.markdown(f'**Documento adicional {i+1}**')
                         title=st.text_input('Nombre',key=f'add_doc_name_{vid}_{i}')
                         pdf=st.file_uploader('PDF',type=['pdf'],key=f'add_doc_pdf_{vid}_{i}')
-                        ed=st.file_uploader('Editable',type=['dwg','doc','docx','xlsx','xls','ifc','rvt'],key=f'add_doc_edit_{vid}_{i}')
+                        ed=st.file_uploader('Editable',type=EDITABLE_EXTENSIONS,key=f'add_doc_edit_{vid}_{i}')
                         entries.append((title,pdf,ed))
                     submitted=st.form_submit_button('💾 Añadir documentos')
                 if submitted:
@@ -3336,6 +3339,7 @@ def delivery_editor(data):
             st.warning('No hay tareas vinculadas disponibles. Vincula una tarea a este entregable desde Plan de trabajo.')
     st.markdown('#### 📎 Documentos de '+version)
     st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
+    st.caption('Editables admitidos: DWG, DOC, DOCX, XLS/XLSX, IFC, RVT, EDB (ETABS), SDB (SAP2000), FDB (SAFE). Límite actual de Google Drive en GP Altivia: 25 MB por archivo.')
     # El número permanece fuera del formulario para mostrar nuevos campos al instante.
     how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
         max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
@@ -3370,8 +3374,8 @@ def delivery_editor(data):
                 title=st.text_input('Nombre del documento *',key=f'{form_key}_title_{i}',
                     placeholder='Ej.: Planta del primer piso')
                 pdf=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'{form_key}_pdf_{i}')
-                editable=st.file_uploader('Editable (DWG, Word, Excel, IFC o RVT)',
-                    type=['dwg','doc','docx','xls','xlsx','ifc','rvt'],key=f'{form_key}_editable_{i}')
+                editable=st.file_uploader('Editable (DWG, Word, Excel, IFC, RVT, ETABS, SAP2000 y SAFE)',
+                    type=EDITABLE_EXTENSIONS,key=f'{form_key}_editable_{i}')
                 entries.append((title,pdf,editable))
         if not drive_ready():st.warning('Google Drive no está autorizado; no podrás cargar archivos.')
         submitted=st.form_submit_button(
@@ -3392,7 +3396,7 @@ def delivery_editor(data):
                     if not raw or len(raw)>DRIVE_LIMIT:raise ValueError(f'{f.name}: vacío o mayor de 25 MB.')
                     if kind=='pdf' and (ext!='pdf' or not raw.startswith(b'%PDF-')):
                         raise ValueError(f'{f.name}: PDF no válido.')
-                    if kind=='editable' and ext not in ('dwg','doc','docx','xls','xlsx','ifc','rvt'):
+                    if kind=='editable' and ext not in EDITABLE_EXTENSIONS:
                         raise ValueError(f'{f.name}: formato editable no admitido.')
             # El servidor también vuelve a calcular el estado automáticamente.
             # Revalidación de permisos y versión vigente dentro de save_record.
@@ -3647,7 +3651,7 @@ def edit_module(module,data):
                     st.markdown('#### 📎 Documentos del entregable')
                     st.caption('Los archivos se cargarán a Google Drive; no se almacenan como BLOB en SQLite.')
                     pdf_file=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'main_pdf_{rid}_{version_choice}')
-                    edit_file=st.file_uploader('Editable para descargar (DWG, DOC o DOCX)',type=['dwg','doc','docx'],
+                    edit_file=st.file_uploader('Editable para descargar (incluye ETABS, SAP2000 y SAFE)',type=EDITABLE_EXTENSIONS,
                         key=f'main_edit_{rid}_{version_choice}')
                     if not drive_ready():st.warning('Google Drive no está autorizado. Puedes guardar los datos, pero no subir archivos.')
                 if st.form_submit_button('💾 Guardar entregable' if consulta_creates else '💾 Guardar cambios',type='primary'):
