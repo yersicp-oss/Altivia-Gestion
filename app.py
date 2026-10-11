@@ -94,14 +94,54 @@ def task_card_stage(due_date, linked_version=None, today=None):
         status=linked_version.get('status') if current else None
         if status in ('Observado','Observado por cliente','Con observaciones'):
             return 'red','Observado'
-        if status in ('Aprobado internamente','Aprobado','Entregado'):
+        if status in ('Aprobado','Entregado'):
             return 'green','Completada'
+        if status=='Aprobado internamente':
+            return 'green','Aprobación interna'
         serial=re.fullmatch(r'V(\d+)',str(linked_version.get('version') or ''),re.I)
         if serial and int(serial.group(1))>1:
             return 'green','Entregado nuevamente'
         return 'green','Entrega registrada'
     color=task_signal(due_date,False,today=today)
     return color,('Fecha de término alcanzada' if color=='red' else 'En seguimiento')
+
+
+def automatic_task_progress(linked_stage=None):
+    """Porcentaje automático por la última versión realmente vinculada a la tarea.
+
+    - Sin versión: 0%; V01 presentada/observada: 50%.
+    - Versión de subsanación (V02+), incluso observada por cliente: 75%.
+    - Aprobada internamente o enviada al cliente: 90%.
+    - Aprobada o Entregada: 100%.
+
+    Solo el estado de la versión VIGENTE se usa para la aprobación, para no
+    atribuir a tareas de otras versiones una aprobación ajena.
+    """
+    if not linked_stage:
+        return 0
+    version=str(linked_stage.get('version') or '').upper()
+    matched=re.fullmatch(r'V(\d+)',version)
+    number=int(matched.group(1)) if matched else 1
+    is_current=(version==str(linked_stage.get('current_version') or '').upper())
+    status=str(linked_stage.get('status') or '').strip() if is_current else ''
+    if status in ('Aprobado','Entregado'):
+        return 100
+    if status in ('Aprobado internamente','Enviado al cliente'):
+        return 90
+    if status=='Observado por cliente':
+        return 75
+    if status in ('Observado','Con observaciones'):
+        return 75 if number>1 else 50
+    if status in ('En corrección','Corregido') or number>1:
+        return 75
+    return 50
+
+
+def effective_task_progress(automatic, manual=None):
+    """La elección manual del Administrador reemplaza temporalmente el cálculo."""
+    if manual is None or pd.isna(manual):
+        return int(automatic)
+    return max(0,min(100,int(manual)))
 
 
 def delivery_signal(status,last_modified,now=None):
@@ -186,6 +226,11 @@ def initialize():
                 cols.append(f'"{key}" {sql_type}'+(' UNIQUE' if key=='code' else ''))
             if table=='people':cols.append('name TEXT')  # columna interna para compatibilidad con datos antiguos
             con.execute(f'CREATE TABLE IF NOT EXISTS {table} ({", ".join(cols)})')
+        # Modo automático predeterminado. NULL = automático; 0..100 = ajuste manual.
+        # ALTER TABLE conserva las tareas preexistentes y sus otras columnas.
+        task_columns={r[1] for r in con.execute('PRAGMA table_info(tasks)')}
+        if 'progress_override' not in task_columns:
+            con.execute('ALTER TABLE tasks ADD COLUMN progress_override INTEGER DEFAULT NULL')
         # Catálogo de entregables: alta y modificaciones reservadas al administrador.
         # La tabla 'deliverables' sigue siendo el registro de la entrega y de su versión vigente.
         # Vinculo permanente cuenta Consulta -> ficha en Personal.
@@ -1677,7 +1722,7 @@ def df(table):
     with connection() as con: return pd.read_sql_query(f'SELECT * FROM {table} ORDER BY id DESC',con)
 
 def datespan(value):
-    try: return (date.fromisoformat(str(value)[:10])-date.today()).days
+    try: return (date.fromisoformat(str(value)[:10])-today_peru()).days
     except (ValueError,TypeError): return None
 
 def _person_task_ids(person_id):
@@ -1687,24 +1732,41 @@ def _person_task_ids(person_id):
 
 
 def decorate():
+    """Indicadores calculados en cada render según entregas y revisiones vigentes."""
     data={x:df(t) for x,(t,_) in SPECS.items()}
     p,t,e,c,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal']]
     if not t.empty:
+        stages=task_delivery_stages()
+        t['Avance automático (%)']=t['id'].apply(lambda tid: automatic_task_progress(stages.get(int(tid))))
+        if 'progress_override' not in t.columns:
+            t['progress_override']=None  # protección adicional para bases sin migrar
+        t['Modo de avance']=t['progress_override'].apply(
+            lambda v:'Manual' if v is not None and not pd.isna(v) else 'Automático')
+        # Todos los reportes existentes leen ``progress``: usar aquí el valor
+        # efectivo evita que Proyectos/Dashboard/Riesgos muestren el valor antiguo.
+        t['progress']=t.apply(lambda r:effective_task_progress(r['Avance automático (%)'],r['progress_override']),axis=1)
         t['Días restantes']=t.due_date.map(datespan)
-        t['Días atraso']=t.apply(lambda r:max(0,-r['Días restantes']) if pd.notna(r['Días restantes']) and r.status not in FINISHED_TASK and int(r.progress or 0)<100 else 0,axis=1)
-        t['Semáforo']=t.apply(lambda r:'🟢 Terminada' if r.status in FINISHED_TASK or r.progress==100 else '🔴 ATRASADA' if r['Días atraso']>0 else '🟡 Vence pronto' if pd.notna(r['Días restantes']) and r['Días restantes']<=2 else '🔵 Revisión' if r.status=='En revisión' else '⚪ No iniciada' if r.status=='No iniciado' else '🟢 En plazo',axis=1)
+        t['Días atraso']=t.apply(
+            lambda r:max(0,-r['Días restantes']) if pd.notna(r['Días restantes'])
+            and int(r.progress or 0)<100 else 0,axis=1)
+        t['Semáforo']=t.apply(
+            lambda r:'🟢 Terminada' if r.status in FINISHED_TASK or r.progress==100
+            else '🔴 ATRASADA' if r['Días atraso']>0
+            else '🟡 Vence pronto' if pd.notna(r['Días restantes']) and r['Días restantes']<=2
+            else '🔵 Revisión' if r.status=='En revisión'
+            else '⚪ No iniciada' if r.status=='No iniciado' else '🟢 En plazo',axis=1)
     if not e.empty:
         e['Días restantes']=e.due_date.map(datespan)
         e['Alerta']=e.apply(lambda r:'🔴 ATRASADO' if pd.notna(r['Días restantes']) and r['Días restantes']<0 and r.status not in FINISHED_DELIVERY else '🟡 Próximo' if pd.notna(r['Días restantes']) and 0<=r['Días restantes']<=3 and r.status not in FINISHED_DELIVERY else '🔵 En revisión' if 'revisión' in r.status.lower() else '🟢 Cerrado' if r.status in FINISHED_DELIVERY else '',axis=1)
     if not p.empty:
         p['Días restantes']=p.due_date.map(datespan)
-        progresses=[]; risks=[]; sem=[]
+        progresses=[];risks=[];sem=[]
         for _,r in p.iterrows():
             pt=t[t.project_code==r.code] if not t.empty else pd.DataFrame()
             progress=round(float(pt.progress.fillna(0).mean()),1) if len(pt) else 0
             progresses.append(progress)
             blocked=False
-            late=(not pt.empty and bool((pt['Días atraso']>0).any())) or (datespan(r.due_date) is not None and datespan(r.due_date)<0 and r.status not in ('Terminado',))
+            late=(not pt.empty and bool((pt['Días atraso']>0).any())) or (datespan(r.due_date) is not None and datespan(r.due_date)<0 and r.status not in ('Terminado',) and progress<100)
             risk='Alto' if late or blocked else 'Medio' if (datespan(r.due_date) is not None and datespan(r.due_date)<=7 and progress<100 and r.status!='Terminado') else 'Bajo'
             risks.append(risk)
             sem.append('🔴 Atrasado' if late else '🟠 Bloqueado' if blocked else '🟡 En riesgo' if risk in ('Medio','Alto','Crítico') else '🟢 En plazo')
@@ -1713,7 +1775,7 @@ def decorate():
         work=[];projects=[];load=[]
         for _,r in pe.iterrows():
             assigned=(t[t['id'].isin([x[0] for x in _person_task_ids(int(r['id']))]) &
-                (~t.status.isin(FINISHED_TASK))] if not t.empty else pd.DataFrame())
+                (~t.status.isin(FINISHED_TASK)) & (t.progress<100)] if not t.empty else pd.DataFrame())
             n=len(assigned)
             work.append(n)
             projects.append(assigned.project_code.nunique() if not assigned.empty else 0)
@@ -1953,7 +2015,7 @@ def linked_delivery_tasks(project_code,delivery_code,user_id=None,actor_role='Co
     return rows
 
 
-def save_record(module,values,record_id=None,task_assignees=None):
+def save_record(module,values,record_id=None,task_assignees=None,progress_override=None):
     '''Guarda datos; en entregables el catálogo controla IDs y fecha final.
 
     El servidor aplica las mismas reglas aunque un usuario altere widgets locales.
@@ -1971,6 +2033,10 @@ def save_record(module,values,record_id=None,task_assignees=None):
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
     if module=='Plan de trabajo':
+        # Solo el Administrador puede fijar un porcentaje; NULL activa el cálculo.
+        if progress_override is not None:
+            if isinstance(progress_override,bool) or not isinstance(progress_override,int) or not 0<=progress_override<=100:
+                raise ValueError('El avance manual debe ser un entero entre 0 y 100 %.')
         # Se valida en el servidor: el ID nunca se acepta desde el navegador.
         # Se conserva el código antiguo en ediciones para proteger las referencias.
         if record_id is not None:
@@ -2146,6 +2212,9 @@ def save_record(module,values,record_id=None,task_assignees=None):
             keys=','.join(values.keys());placeholders=','.join('?' for _ in values)
             inserted=con.execute(f'INSERT INTO {table} ({keys}) VALUES ({placeholders})',list(values.values()))
             if module=='Plan de trabajo':record_id=inserted.lastrowid
+        if module=='Plan de trabajo':
+            con.execute('UPDATE tasks SET progress_override=? WHERE id=?',
+                        (progress_override,int(record_id)))
         if module=='Plan de trabajo' and task_assignees is not None:
             owners,reviewers=task_assignees
             con.execute('DELETE FROM task_people WHERE task_id=?',(record_id,))
@@ -2379,7 +2448,7 @@ def task_cards(frame):
         frame=frame[frame.astype(str).apply(lambda ser:ser.str.contains(query,case=False,regex=False)).any(axis=1)]
     if state!='Todos':frame=frame[frame['status'].astype(str)==state]
     if project!='Todos':frame=frame[frame['project_code'].astype(str)==project]
-    st.caption(f'{len(frame)} tarea(s) encontradas')
+    st.caption(f'{len(frame)} tarea(s) encontradas · Avance calculado con versiones/revisiones, salvo ajuste manual del Administrador.')
     # Descripción del proyecto / cliente se recupera de Proyectos, no del ID.
     with connection() as con:
         project_names={str(p['code']):(str(p['name'] or ''),str(p['client'] or ''))
@@ -2422,6 +2491,8 @@ def task_cards(frame):
             with st.expander('Ver detalles'):
                 details=[('ID Proyecto','project_code'),('Entregable relacionado','delivery_code'),
                          ('Especialidad','specialty'),('Avance (%)','progress'),
+                         ('Cálculo de avance','Modo de avance'),
+                         ('Avance automático de referencia (%)','Avance automático (%)'),
                          ('Prioridad','priority'),('Fecha actualización','updated_at'),
                          ('Observaciones','notes')]
                 for label,key in details:
@@ -3642,6 +3713,7 @@ def task_editor(data):
                                   key=f'task_code_readonly_{rid}_{project}_{code}')
                     form_key=f'task_fields_{rid if rid is not None else "nuevo"}_{project}'
                     vals={'project_code':project,'code':code}
+                    manual_progress=None
                     for key,label,kind,required,opt in fields:
                         if key in ('code','project_code','owner','reviewer'):
                             continue
@@ -3649,6 +3721,25 @@ def task_editor(data):
                         if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):raw=None
                         if key=='delivery_code':
                             vals[key]=form_input(key,label,kind,required,opt,raw,form_key,project_code=project)
+                            continue
+                        if key=='progress':
+                            previous=row.get('progress_override') if row else None
+                            is_manual=(previous is not None and not pd.isna(previous))
+                            automatic=int(row.get('Avance automático (%)') or 0) if row else 0
+                            vals['progress']=int(row.get('progress') or 0) if row else 0
+                            st.markdown('**Avance de la tarea**')
+                            st.caption(f'Calculado según entregas y revisiones: {automatic} %. '
+                                       'Sin entregas: 0 % · V01: 50 % · Corrección: 75 % · '
+                                       'Aprobación interna: 90 % · Aprobado/Entregado: 100 %.')
+                            enabled=st.checkbox('Ajustar avance manualmente (solo Administrador)',
+                                value=is_manual,key=f'task_manual_enabled_{rid}_{project}')
+                            if enabled:
+                                initial=int(previous) if is_manual else int(row.get('progress') or 0) if row else 0
+                                manual_progress=int(st.number_input('Avance manual (%)',min_value=0,max_value=100,
+                                    value=initial,step=1,key=f'task_manual_value_{rid}_{project}'))
+                                st.caption('El avance del proyecto utilizará este valor hasta que desactives el ajuste manual.')
+                            else:
+                                st.caption(f'Modo automático activo · {automatic} %')
                             continue
                         if key=='specialty' and vals.get('delivery_code'):
                             auto=programmed_delivery_specialty(project,vals['delivery_code'])
@@ -3694,7 +3785,8 @@ def task_editor(data):
                         converted={k:(v.isoformat() if isinstance(v,date) else int(v) if isinstance(v,bool) else v)
                                    for k,v in vals.items()}
                         try:
-                            save_record('Plan de trabajo',converted,rid,task_assignees=(owner_ids,reviewer_ids))
+                            save_record('Plan de trabajo',converted,rid,
+                                task_assignees=(owner_ids,reviewer_ids),progress_override=manual_progress)
                             close_task_editor()
                             st.success('Tarea guardada correctamente.')
                             st.rerun()
