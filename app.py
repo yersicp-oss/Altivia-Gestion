@@ -2540,8 +2540,65 @@ def clear_consulta_task_submission():
     st.session_state.pop('consulta_submission_error',None)
 
 
+def toggle_task_project_group(project_code):
+    """Abre/cierra un grupo de tareas sin desplegables anidados de Streamlit."""
+    key='task_project_open_'+str(project_code)
+    st.session_state[key]=not bool(st.session_state.get(key,False))
+
+
+def render_task_card(r,project_names,linked_stages):
+    """Una tarea: cabecera compacta y equipo/fechas dentro de Ver detalles."""
+    code=escape(str(r.get('code') or ''))
+    activity=escape(str(r.get('activity') or 'Actividad sin nombre'))
+    owners=escape(str(r.get('owner') or 'Sin asignar'))
+    reviewers=escape(str(r.get('reviewer') or 'Sin asignar'))
+    start=escape(str(r.get('start_date') or '—'))
+    due=escape(str(r.get('due_date') or '—'))
+    signal,signal_label=task_card_stage(r.get('due_date'),linked_stages.get(int(r['id'])))
+    with st.container(border=True,key=f'gp_task_{signal}_card_{int(r["id"])}'):
+        st.caption('● '+signal_label)
+        # El nombre de la actividad conserva el tamaño destacado y el semáforo.
+        st.markdown(f'<div style="font-size:1.2rem;font-weight:750;line-height:1.35;overflow-wrap:anywhere">{activity}</div>',
+                    unsafe_allow_html=True)
+        st.caption(f'ID Tarea: {code}')
+        project_name,client_name=project_names.get(str(r.get('project_code') or ''),('',''))
+        project_info=' · '.join(x for x in (project_name,f'Cliente: {client_name}' if client_name else '') if x)
+        if project_info:
+            st.caption('🏗️ '+escape(project_info))
+        # Los responsables, revisores y fechas ya NO ocupan espacio en la tarjeta.
+        with st.expander('Ver detalles'):
+            people_cols=st.columns(2)
+            with people_cols[0]:
+                st.markdown('**Responsables**')
+                st.write(owners)
+            with people_cols[1]:
+                st.markdown('**Revisores**')
+                st.write(reviewers)
+            dates=st.columns(2)
+            with dates[0]:st.caption(f'Fecha de inicio: {start}')
+            with dates[1]:st.caption(f'Fecha de término: {due}')
+            st.divider()
+            details=[('ID Proyecto','project_code'),('Entregable relacionado','delivery_code'),
+                     ('Especialidad','specialty'),('Avance (%)','progress')]
+            for label,key in details:
+                value=r.get(key)
+                if value is not None and pd.notna(value) and str(value).strip():
+                    st.markdown(f'**{label}:** {escape(str(value))}')
+        if st.session_state.get('role')=='Consulta':
+            permitted=consulta_submission_task(int(r['id']),st.session_state.get('user_id'))
+            st.button('📤 Enviar tarea',key=f'submit_task_card_{int(r["id"])}',
+                on_click=open_consulta_task_submission,args=(int(r['id']),),
+                disabled=permitted is None,use_container_width=True,
+                help=('Abre Registrar entregable con proyecto, entregable y tarea precargados.'
+                      if permitted else 'Solo un responsable puede enviar tareas con entregable programado y proyecto autorizado.'))
+        if can_edit():
+            st.button('✏️ Editar',key=f'edit_task_card_{int(r["id"])}',
+                      on_click=open_task_editor,args=(int(r['id']),),
+                      use_container_width=True)
+
+
 def task_cards(frame):
-    """Fichas específicas de Plan de trabajo; filtradas por permisos antes de entrar."""
+    """Tareas agrupadas por proyecto, con un botón para desplegar cada grupo."""
     st.markdown('### 📂 Registros')
     if frame.empty:
         st.info('Todavía no hay actividades disponibles.');return
@@ -2560,67 +2617,44 @@ def task_cards(frame):
         frame=frame[frame.astype(str).apply(lambda ser:ser.str.contains(query,case=False,regex=False)).any(axis=1)]
     if state!='Todos':frame=frame[frame['status'].astype(str)==state]
     if project!='Todos':frame=frame[frame['project_code'].astype(str)==project]
-    st.caption(f'{len(frame)} tarea(s) encontradas · Avance calculado con versiones/revisiones, salvo ajuste manual del Administrador.')
-    # Descripción del proyecto / cliente se recupera de Proyectos, no del ID.
+    if frame.empty:
+        st.info('No se encontraron tareas con los filtros seleccionados.');return
     with connection() as con:
         project_names={str(p['code']):(str(p['name'] or ''),str(p['client'] or ''))
             for p in con.execute('SELECT code,name,client FROM projects')}
     linked_stages=task_delivery_stages()
-    page_size=10
-    max_page=max(1,(len(frame)+page_size-1)//page_size)
-    page=st.number_input('Página',min_value=1,max_value=max_page,value=1,step=1,key='cards_page_tasks')
-    for _,r in frame.iloc[(page-1)*page_size:page*page_size].iterrows():
-        code=escape(str(r.get('code') or ''))
-        activity=escape(str(r.get('activity') or 'Actividad sin nombre'))
-        status=escape(str(r.get('status') or 'Sin estado'))
-        owners=escape(str(r.get('owner') or 'Sin asignar'))
-        reviewers=escape(str(r.get('reviewer') or 'Sin asignar'))
-        start=escape(str(r.get('start_date') or '—'))
-        due=escape(str(r.get('due_date') or '—'))
-        signal,signal_label=task_card_stage(r.get('due_date'),linked_stages.get(int(r['id'])))
-        with st.container(border=True,key=f'gp_task_{signal}_card_{int(r["id"])}'):
-            st.caption('● '+signal_label)
-            # 1. Actividad destacada: 1.2rem = 20% más que el texto base.
-            st.markdown(f'<div style="font-size:1.2rem;font-weight:750;line-height:1.35;overflow-wrap:anywhere">{activity}</div>',
-                        unsafe_allow_html=True)
-            # 2. Código de tarea: segunda línea, sin especialidad.
-            st.caption(f'ID Tarea: {code}')
-            project_name,client_name=project_names.get(str(r.get('project_code') or ''),('',''))
-            project_info=' · '.join(s for s in (project_name, f'Cliente: {client_name}' if client_name else '') if s)
-            if project_info:
-                st.caption('🏗️ '+project_info)
-            # El estado administrativo de la tarea se conserva en SQLite,
-            # pero en la tarjeta basta con el semáforo de seguimiento superior.
-            cols=st.columns(2)
-            with cols[0]:
-                st.markdown('**Responsables**')
-                st.write(owners)
-            with cols[1]:
-                st.markdown('**Revisores**')
-                st.write(reviewers)
-            dates=st.columns(2)
-            with dates[0]:st.caption(f'Fecha de inicio: {start}')
-            with dates[1]:st.caption(f'Fecha de término: {due}')
-            with st.expander('Ver detalles'):
-                # Resumen limpio: el modo de cálculo sigue operando internamente.
-                details=[('ID Proyecto','project_code'),('Entregable relacionado','delivery_code'),
-                         ('Especialidad','specialty'),('Avance (%)','progress')]
-                for label,key in details:
-                    value=r.get(key)
-                    if value is not None and pd.notna(value) and str(value).strip():
-                        st.markdown(f'**{label}:** {escape(str(value))}')
-            if st.session_state.get('role')=='Consulta':
-                permitted=consulta_submission_task(int(r['id']),st.session_state.get('user_id'))
-                st.button('📤 Enviar tarea',key=f'submit_task_card_{int(r["id"])}',
-                    on_click=open_consulta_task_submission,args=(int(r['id']),),
-                    disabled=permitted is None,use_container_width=True,
-                    help=('Abre Registrar entregable con proyecto, entregable y tarea precargados.'
-                          if permitted else 'Solo un responsable puede enviar tareas con entregable programado y proyecto autorizado.'))
-            if can_edit():
-                st.button('✏️ Editar',key=f'edit_task_card_{int(r["id"])}',
-                          on_click=open_task_editor,args=(int(r['id']),),
-                          use_container_width=True)
-
+    groups=[(str(code),group.sort_values(['due_date','code'],kind='stable'))
+            for code,group in frame.groupby('project_code',sort=True)]
+    st.caption(f'{len(frame)} tarea(s) en {len(groups)} proyecto(s) · '
+               'Abre un proyecto para consultar sus actividades.')
+    # Paginación por proyecto: ninguna tarea se separa artificialmente de su grupo.
+    projects_per_page=8
+    total_pages=max(1,(len(groups)+projects_per_page-1)//projects_per_page)
+    project_page=(st.number_input('Página de proyectos',min_value=1,max_value=total_pages,
+                  value=1,step=1,key='cards_page_project_groups') if total_pages>1 else 1)
+    for code,group in groups[(project_page-1)*projects_per_page:project_page*projects_per_page]:
+        pname,client=project_names.get(code,('',''))
+        title=code + (' — '+pname if pname else '')
+        opened=bool(st.session_state.get('task_project_open_'+code,False))
+        arrow='▾' if opened else '▸'
+        group_label=f'{arrow}  {title}  ·  {len(group)} tarea(s)'
+        # Un botón y no st.expander, porque cada tarjeta ya tiene Ver detalles.
+        st.button(group_label,key='task_project_toggle_'+code,
+                  on_click=toggle_task_project_group,args=(code,),use_container_width=True)
+        if not opened:
+            continue
+        with st.container(border=True,key=f'gp_task_project_group_{code}'):
+            if client:
+                st.caption('Cliente: '+escape(client))
+            # Paginación interna solo si un proyecto tiene más de 10 tareas.
+            tasks_per_page=10
+            task_pages=max(1,(len(group)+tasks_per_page-1)//tasks_per_page)
+            task_page=(st.number_input('Página de tareas de '+title,
+                       min_value=1,max_value=task_pages,value=1,step=1,
+                       key='task_project_page_'+code) if task_pages>1 else 1)
+            shown=group.iloc[(task_page-1)*tasks_per_page:task_page*tasks_per_page]
+            for _,r in shown.iterrows():
+                render_task_card(r,project_names,linked_stages)
 
 
 def reviewer_can_change_status(delivery_id, user_id=None, con=None):
@@ -3495,153 +3529,154 @@ def delivery_catalog_admin_ui():
         if term and term not in (item['code']+' '+item['name']+' '+(item['project_name'] or '')).casefold():continue
         with st.container(border=True):
             st.markdown(f"**{escape(item['code'])} — {escape(item['name'])}**")
-            st.caption(f"{escape(item['project_code'])} · Fecha final: {escape(item['final_due_date'])} · "
-                       + ('Entrega registrada' if item['registered'] else 'Pendiente de registrar'))
-            # Reparación para instalaciones anteriores: al borrar una entrega,
-            # se vaciaba tasks.delivery_code. El Admin elige el vínculo correcto.
-            with st.expander('🔗 Recuperar tarea desvinculada',expanded=False):
-                with connection() as con:
-                    orphan=[dict(t) for t in con.execute('''SELECT id,code,activity
-                        FROM tasks WHERE project_code=?
-                          AND (delivery_code IS NULL OR trim(delivery_code)='')
-                        ORDER BY code''',(item['project_code'],))]
-                if not orphan:
-                    st.caption('No hay tareas sin entregable relacionado en este proyecto.')
-                else:
-                    st.caption('Si eliminaste una entrega en una versión anterior de GP Altivia, '
-                               'puedes recuperar aquí el vínculo perdido. Solo selecciona una tarea '
-                               'que realmente corresponda a este entregable; no se creará una versión.')
-                    selected_orphan=st.selectbox('Tarea sin entregable vinculado',
-                        [t['id'] for t in orphan],
-                        format_func=lambda tid:next(
-                            t['code']+' — '+t['activity'] for t in orphan if t['id']==tid),
-                        key=f'restore_task_choice_{item["id"]}')
-                    if st.button('🔗 Vincular tarea seleccionada',
-                        key=f'restore_task_btn_{item["id"]}'):
-                        try:
-                            restored_task,restored_catalog=restore_unlinked_task(
-                                item['id'],selected_orphan)
-                            st.success(f'Tarea {restored_task} vinculada a {restored_catalog}. '
-                                       'Ya podrás volver a seleccionar la tarea al registrar la entrega.')
-                            st.rerun()
-                        except (ValueError,sqlite3.Error) as exc:
-                            st.error(f'No se pudo recuperar la relación: {exc}')
-            with st.expander('✏️ Editar entregable programado'):
-                with st.form(f'catalog_edit_{item["id"]}'):
-                    pr2=st.selectbox('ID Proyecto',list(project_names),
-                        index=list(project_names).index(item['project_code']),
-                        disabled=bool(item['registered']),key=f'cat_pr_{item["id"]}')
-                    code2=st.text_input('ID Entregable',value=item['code'],
-                        disabled=bool(item['registered']),key=f'cat_code_{item["id"]}').strip()
-                    name2=st.text_input('Nombre del entregable',value=item['name'],key=f'cat_name_{item["id"]}').strip()
-                    sp_list=['']+SPECIALTIES
-                    old_sp=item['specialty'] or ''
-                    if old_sp and old_sp not in sp_list:
-                        st.caption(f'Especialidad anterior: {old_sp}. Ya no está en el listado; '
-                                   'selecciona una especialidad vigente al guardar.')
-                    sp=st.selectbox('Especialidad',sp_list,
-                                    index=sp_list.index(old_sp) if old_sp in sp_list else 0,
-                                    key=f'cat_spec_{item["id"]}')
-                    due2=st.date_input('Fecha de Presentación Final',
-                        value=date.fromisoformat(item['final_due_date']),format='DD/MM/YYYY',key=f'cat_due_{item["id"]}')
-                    if item['registered']:
-                        st.caption('El ID y el proyecto permanecen bloqueados porque ya existe una entrega. '
-                                   'Sí puedes cambiar nombre, especialidad y fecha final.')
-                    if st.form_submit_button('💾 Guardar cambios'):
-                        try:
-                            catalog_update(item['id'],pr2,code2,name2,sp,due2.isoformat())
-                            st.success('Catálogo actualizado.');st.rerun()
-                        except (ValueError,sqlite3.IntegrityError,requests.RequestException) as exc:
-                            st.error(str(exc))
-            # Botón independiente de Eliminar entregable: resetea solo el
-            # contador de versiones eliminadas y jamás borra el catálogo.
-            with connection() as con:
-                highest_row=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',
-                                        (item['code'],)).fetchone()
-                has_versions=bool(con.execute('SELECT 1 FROM versions WHERE delivery_code=?',
-                                               (item['code'],)).fetchone())
-                active_delivery=con.execute('SELECT id,version FROM deliverables WHERE code=?',
-                                            (item['code'],)).fetchone()
-                active=bool(active_delivery and str(active_delivery['version'] or '').strip())
-                has_files=False
-                if active_delivery:
-                    did=int(active_delivery['id'])
-                    has_files=any(bool(con.execute(f'SELECT 1 FROM {table} WHERE delivery_id=? LIMIT 1',
-                                                (did,)).fetchone())
-                                  for table in ('delivery_documents','drive_files','delivery_files'))
-            blocked=has_versions or active or has_files
-            last_number=int(highest_row['highest']) if highest_row else 0
-            if st.button('🔄 Restablecer versiones',key=f'cat_reset_open_{item["id"]}',
-                         disabled=blocked,help='Reiniciar a V01 solo cuando no existan versiones ni archivos asociados'):
-                st.session_state[f'catalog_reset_open_{item["id"]}']=True
-            if blocked:
-                st.caption('Restablecer versiones estará disponible cuando se hayan eliminado '
-                           'todas las versiones y archivos del entregable.')
-            if st.session_state.get(f'catalog_reset_open_{item["id"]}') and not blocked:
-                with st.container(border=True):
-                    st.warning(f'¿Restablecer {item["code"]} a V01? Contador anterior: V{last_number:02d}. '
-                               'No se eliminarán la programación ni sus tareas. Se limpiarán '
-                               'metadatos locales huérfanos de versiones eliminadas, incluidas '
-                               'observaciones antiguas. Los archivos físicos de Google Drive no se modificarán.')
-                    confirm_reset=st.checkbox(f'Confirmo reiniciar la numeración de {item["code"]}',
-                                              key=f'cat_reset_confirm_{item["id"]}')
-                    yes,no=st.columns(2)
-                    with yes:
-                        if st.button('Confirmar reinicio a V01',type='primary',
-                                     key=f'cat_reset_btn_{item["id"]}',
-                                     disabled=not confirm_reset,use_container_width=True):
+            with st.expander('⚙️ Ver opciones y gestionar', expanded=False):
+                st.caption(f"{escape(item['project_code'])} · Fecha final: {escape(item['final_due_date'])} · "
+                           + ('Entrega registrada' if item['registered'] else 'Pendiente de registrar'))
+                # Reparación para instalaciones anteriores: al borrar una entrega,
+                # se vaciaba tasks.delivery_code. El Admin elige el vínculo correcto.
+                if st.toggle('🔗 Recuperar tarea desvinculada', key=f'catalog_restore_show_{item["id"]}'):
+                    with connection() as con:
+                        orphan=[dict(t) for t in con.execute('''SELECT id,code,activity
+                            FROM tasks WHERE project_code=?
+                              AND (delivery_code IS NULL OR trim(delivery_code)='')
+                            ORDER BY code''',(item['project_code'],))]
+                    if not orphan:
+                        st.caption('No hay tareas sin entregable relacionado en este proyecto.')
+                    else:
+                        st.caption('Si eliminaste una entrega en una versión anterior de GP Altivia, '
+                                   'puedes recuperar aquí el vínculo perdido. Solo selecciona una tarea '
+                                   'que realmente corresponda a este entregable; no se creará una versión.')
+                        selected_orphan=st.selectbox('Tarea sin entregable vinculado',
+                            [t['id'] for t in orphan],
+                            format_func=lambda tid:next(
+                                t['code']+' — '+t['activity'] for t in orphan if t['id']==tid),
+                            key=f'restore_task_choice_{item["id"]}')
+                        if st.button('🔗 Vincular tarea seleccionada',
+                            key=f'restore_task_btn_{item["id"]}'):
                             try:
-                                backup=backup_database()
-                                code_reset,old_reset=reset_catalog_version_counter(item['id'])
-                                st.session_state.pop(f'catalog_reset_open_{item["id"]}',None)
-                                st.success(f'{code_reset}: la próxima versión será V01 '
-                                           f'(contador anterior V{old_reset:02d}). '
-                                           f'Respaldo: {os.path.basename(backup)}')
+                                restored_task,restored_catalog=restore_unlinked_task(
+                                    item['id'],selected_orphan)
+                                st.success(f'Tarea {restored_task} vinculada a {restored_catalog}. '
+                                           'Ya podrás volver a seleccionar la tarea al registrar la entrega.')
                                 st.rerun()
-                            except (ValueError,PermissionError,sqlite3.Error,OSError) as exc:
-                                st.error(f'No se pudo restablecer el contador: {exc}')
-                    with no:
-                        if st.button('Cancelar',key=f'cat_reset_cancel_{item["id"]}',
-                                     use_container_width=True):
-                            st.session_state.pop(f'catalog_reset_open_{item["id"]}',None)
-                            st.rerun()
-            # Botón visible dentro de cada tarjeta. Confirmación en dos pasos.
-            # Los documentos/archivos de Google Drive nunca se eliminan desde aquí.
-            if item['registered']:
-                st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}',disabled=True)
-                st.caption('Elimina primero la entrega activa en Registros. Las versiones históricas ya eliminadas no bloquearán el catálogo.')
-            else:
-                if st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}'):
-                    st.session_state[f'catalog_delete_open_{item["id"]}']=True
-                if st.session_state.get(f'catalog_delete_open_{item["id"]}'):
+                            except (ValueError,sqlite3.Error) as exc:
+                                st.error(f'No se pudo recuperar la relación: {exc}')
+                if st.toggle('✏️ Editar entregable programado', key=f'catalog_edit_show_{item["id"]}'):
+                    with st.form(f'catalog_edit_{item["id"]}'):
+                        pr2=st.selectbox('ID Proyecto',list(project_names),
+                            index=list(project_names).index(item['project_code']),
+                            disabled=bool(item['registered']),key=f'cat_pr_{item["id"]}')
+                        code2=st.text_input('ID Entregable',value=item['code'],
+                            disabled=bool(item['registered']),key=f'cat_code_{item["id"]}').strip()
+                        name2=st.text_input('Nombre del entregable',value=item['name'],key=f'cat_name_{item["id"]}').strip()
+                        sp_list=['']+SPECIALTIES
+                        old_sp=item['specialty'] or ''
+                        if old_sp and old_sp not in sp_list:
+                            st.caption(f'Especialidad anterior: {old_sp}. Ya no está en el listado; '
+                                       'selecciona una especialidad vigente al guardar.')
+                        sp=st.selectbox('Especialidad',sp_list,
+                                        index=sp_list.index(old_sp) if old_sp in sp_list else 0,
+                                        key=f'cat_spec_{item["id"]}')
+                        due2=st.date_input('Fecha de Presentación Final',
+                            value=date.fromisoformat(item['final_due_date']),format='DD/MM/YYYY',key=f'cat_due_{item["id"]}')
+                        if item['registered']:
+                            st.caption('El ID y el proyecto permanecen bloqueados porque ya existe una entrega. '
+                                       'Sí puedes cambiar nombre, especialidad y fecha final.')
+                        if st.form_submit_button('💾 Guardar cambios'):
+                            try:
+                                catalog_update(item['id'],pr2,code2,name2,sp,due2.isoformat())
+                                st.success('Catálogo actualizado.');st.rerun()
+                            except (ValueError,sqlite3.IntegrityError,requests.RequestException) as exc:
+                                st.error(str(exc))
+                # Botón independiente de Eliminar entregable: resetea solo el
+                # contador de versiones eliminadas y jamás borra el catálogo.
+                with connection() as con:
+                    highest_row=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',
+                                            (item['code'],)).fetchone()
+                    has_versions=bool(con.execute('SELECT 1 FROM versions WHERE delivery_code=?',
+                                                   (item['code'],)).fetchone())
+                    active_delivery=con.execute('SELECT id,version FROM deliverables WHERE code=?',
+                                                (item['code'],)).fetchone()
+                    active=bool(active_delivery and str(active_delivery['version'] or '').strip())
+                    has_files=False
+                    if active_delivery:
+                        did=int(active_delivery['id'])
+                        has_files=any(bool(con.execute(f'SELECT 1 FROM {table} WHERE delivery_id=? LIMIT 1',
+                                                    (did,)).fetchone())
+                                      for table in ('delivery_documents','drive_files','delivery_files'))
+                blocked=has_versions or active or has_files
+                last_number=int(highest_row['highest']) if highest_row else 0
+                if st.button('🔄 Restablecer versiones',key=f'cat_reset_open_{item["id"]}',
+                             disabled=blocked,help='Reiniciar a V01 solo cuando no existan versiones ni archivos asociados'):
+                    st.session_state[f'catalog_reset_open_{item["id"]}']=True
+                if blocked:
+                    st.caption('Restablecer versiones estará disponible cuando se hayan eliminado '
+                               'todas las versiones y archivos del entregable.')
+                if st.session_state.get(f'catalog_reset_open_{item["id"]}') and not blocked:
                     with st.container(border=True):
-                        st.warning(f'¿Eliminar la programación {item["code"]} del proyecto {item["project_code"]}? '
-                                   'No se borrarán archivos de Google Drive ni otros entregables. '
-                                   'Se reiniciará el contador histórico de este ID, pero no el de los demás. '
-                                   'Si luego reutilizas el mismo ID, revisa o archiva sus archivos antiguos en Drive '
-                                   'para evitar documentos con nombres duplicados.')
-                        confirm=st.checkbox(
-                            f'Confirmo eliminar el entregable {item["code"]}',
-                            key=f'catalog_del_confirm_{item["id"]}')
-                        accept,cancel=st.columns(2)
-                        with accept:
-                            if st.button('Confirmar eliminación',type='primary',
-                                         key=f'catalog_del_confirm_btn_{item["id"]}',
-                                         disabled=not confirm,use_container_width=True):
+                        st.warning(f'¿Restablecer {item["code"]} a V01? Contador anterior: V{last_number:02d}. '
+                                   'No se eliminarán la programación ni sus tareas. Se limpiarán '
+                                   'metadatos locales huérfanos de versiones eliminadas, incluidas '
+                                   'observaciones antiguas. Los archivos físicos de Google Drive no se modificarán.')
+                        confirm_reset=st.checkbox(f'Confirmo reiniciar la numeración de {item["code"]}',
+                                                  key=f'cat_reset_confirm_{item["id"]}')
+                        yes,no=st.columns(2)
+                        with yes:
+                            if st.button('Confirmar reinicio a V01',type='primary',
+                                         key=f'cat_reset_btn_{item["id"]}',
+                                         disabled=not confirm_reset,use_container_width=True):
                                 try:
                                     backup=backup_database()
-                                    deleted=catalog_delete(item['id'])
-                                    st.session_state.pop(f'catalog_delete_open_{item["id"]}',None)
-                                    st.success(f'Entregable {deleted} eliminado del catálogo. '
+                                    code_reset,old_reset=reset_catalog_version_counter(item['id'])
+                                    st.session_state.pop(f'catalog_reset_open_{item["id"]}',None)
+                                    st.success(f'{code_reset}: la próxima versión será V01 '
+                                               f'(contador anterior V{old_reset:02d}). '
                                                f'Respaldo: {os.path.basename(backup)}')
                                     st.rerun()
-                                except (ValueError,sqlite3.Error,OSError) as exc:
-                                    st.error(f'No se pudo eliminar: {exc}')
-                        with cancel:
-                            if st.button('Cancelar',key=f'catalog_del_cancel_{item["id"]}',
+                                except (ValueError,PermissionError,sqlite3.Error,OSError) as exc:
+                                    st.error(f'No se pudo restablecer el contador: {exc}')
+                        with no:
+                            if st.button('Cancelar',key=f'cat_reset_cancel_{item["id"]}',
                                          use_container_width=True):
-                                st.session_state.pop(f'catalog_delete_open_{item["id"]}',None)
+                                st.session_state.pop(f'catalog_reset_open_{item["id"]}',None)
                                 st.rerun()
+                # Botón visible dentro de cada tarjeta. Confirmación en dos pasos.
+                # Los documentos/archivos de Google Drive nunca se eliminan desde aquí.
+                if item['registered']:
+                    st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}',disabled=True)
+                    st.caption('Elimina primero la entrega activa en Registro de entregables. Las versiones históricas ya eliminadas no bloquearán el catálogo.')
+                else:
+                    if st.button('🗑️ Eliminar entregable',key=f'catalog_del_{item["id"]}'):
+                        st.session_state[f'catalog_delete_open_{item["id"]}']=True
+                    if st.session_state.get(f'catalog_delete_open_{item["id"]}'):
+                        with st.container(border=True):
+                            st.warning(f'¿Eliminar la programación {item["code"]} del proyecto {item["project_code"]}? '
+                                       'No se borrarán archivos de Google Drive ni otros entregables. '
+                                       'Se reiniciará el contador histórico de este ID, pero no el de los demás. '
+                                       'Si luego reutilizas el mismo ID, revisa o archiva sus archivos antiguos en Drive '
+                                       'para evitar documentos con nombres duplicados.')
+                            confirm=st.checkbox(
+                                f'Confirmo eliminar el entregable {item["code"]}',
+                                key=f'catalog_del_confirm_{item["id"]}')
+                            accept,cancel=st.columns(2)
+                            with accept:
+                                if st.button('Confirmar eliminación',type='primary',
+                                             key=f'catalog_del_confirm_btn_{item["id"]}',
+                                             disabled=not confirm,use_container_width=True):
+                                    try:
+                                        backup=backup_database()
+                                        deleted=catalog_delete(item['id'])
+                                        st.session_state.pop(f'catalog_delete_open_{item["id"]}',None)
+                                        st.success(f'Entregable {deleted} eliminado del catálogo. '
+                                                   f'Respaldo: {os.path.basename(backup)}')
+                                        st.rerun()
+                                    except (ValueError,sqlite3.Error,OSError) as exc:
+                                        st.error(f'No se pudo eliminar: {exc}')
+                            with cancel:
+                                if st.button('Cancelar',key=f'catalog_del_cancel_{item["id"]}',
+                                             use_container_width=True):
+                                    st.session_state.pop(f'catalog_delete_open_{item["id"]}',None)
+                                    st.rerun()
 
 
 
@@ -3939,13 +3974,25 @@ def delivery_editor(data):
             st.error(f'No se completó la operación: {exc}')
             st.caption('Si Google Drive falló durante la subida, el registro puede haberse creado parcialmente. '
                        'No repitas la carga sin revisar el historial; pide al Administrador completar los archivos faltantes.')
-    st.divider()
-    visible=data['Entregables']
-    if role=='Consulta':
-        visible=visible[visible['code'].isin(consulta_delivery_codes(st.session_state['user_id']))]
-    if role!='Consulta':
-        card_browser('Entregables',visible,allow_version_edit=admin)
-    if admin:bulk_delete_ui('Entregables',data)
+    # Los registros administrativos viven en una página independiente.
+    # Global conserva su consulta general dentro de Entregables; Consulta
+    # utiliza el apartado «Mis entregables» existente.
+    if role=='Global':
+        st.divider()
+        card_browser('Entregables',data['Entregables'],allow_version_edit=False)
+
+
+def admin_delivery_registers(data):
+    """Historial de entregas registradas. Exclusivo de Administrador.
+
+    Reutiliza las tarjetas, evaluaciones, versiones y acciones originales;
+    no duplica ni mueve registros en SQLite/Google Drive.
+    """
+    require_admin()
+    st.title('📂 Registro de entregables')
+    card_browser('Entregables',data['Entregables'],allow_version_edit=True,show_heading=False)
+    bulk_delete_ui('Entregables',data)
+
 
 def task_editor(data):
     """Crea tareas con código automático y edita desde cada ficha de Registros."""
@@ -4592,7 +4639,7 @@ def main():
                if role=='Consulta' else
                ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Versiones','Mi cuenta']
                if role=='Global' else
-               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
+               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Registro de entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
         remaining=task_badge_count(st.session_state['user_id'],role) if role!='Cliente' else 0
         def nav_label(option):
@@ -4612,6 +4659,7 @@ def main():
     elif page=='Mis entregables' and st.session_state.get('role')=='Consulta':
         consulta_my_deliverables(data)
     elif page=='Dashboard' and st.session_state.get('role') in ('Administrador','Global'):dashboard(data)
+    elif page=='Registro de entregables' and can_edit():admin_delivery_registers(data)
     elif page in SPECS and st.session_state.get('role')!='Cliente' and (
             page!='Control de cambios' or can_edit()) and (
             page!='Personal' or st.session_state.get('role') in ('Administrador','Global')):
