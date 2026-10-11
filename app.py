@@ -655,6 +655,8 @@ def end_login_session():
     for key in ('user_id','role','username','full_name','client_preview',
                 '_remember_token','_remembered_login'):
         st.session_state.pop(key,None)
+    st.session_state.pop('consulta_quick_task_id',None)
+    st.session_state.pop('altivia_navigation',None)
     st.session_state['_remember_checked']=True
 
 
@@ -2312,6 +2314,51 @@ def close_task_editor():
     st.session_state['task_editor_open']=False
 
 
+def consulta_submission_task(task_id, user_id):
+    """Tarea presentable por Consulta: responsable activo, catálogo y proyecto autorizado.
+
+    Se valida desde SQLite, nunca mediante códigos remitidos por el navegador.
+    """
+    try:
+        task_id=int(task_id)
+        user_id=int(user_id)
+    except (TypeError,ValueError):
+        return None
+    with connection() as con:
+        task=con.execute("""SELECT t.id,t.code,t.project_code,t.delivery_code,
+            c.name AS delivery_name
+            FROM tasks t
+            JOIN deliverable_catalog c
+                ON c.project_code=t.project_code AND c.code=t.delivery_code
+            JOIN projects pr ON pr.code=t.project_code
+            JOIN consulta_project_access pa
+                ON pa.project_id=pr.id AND pa.user_id=?
+            JOIN task_people tp ON tp.task_id=t.id AND tp.assignment_role='Responsable'
+            JOIN people pe ON pe.id=tp.person_id AND pe.user_id=?
+            JOIN users u ON u.id=pe.user_id AND u.active=1 AND u.role='Consulta'
+            WHERE t.id=? LIMIT 1""",(user_id,user_id,task_id)).fetchone()
+    return dict(task) if task else None
+
+
+def open_consulta_task_submission(task_id):
+    """Callback de Streamlit: se ejecuta ANTES de instanciar el radio de navegación."""
+    if st.session_state.get('role')!='Consulta':
+        raise PermissionError('La opción Enviar tarea pertenece al usuario Consulta.')
+    task=consulta_submission_task(task_id,st.session_state.get('user_id'))
+    if not task:
+        st.session_state['consulta_submission_error']='La tarea ya no puede enviarse. Comprueba que seas responsable y que tenga un entregable vinculado.'
+        return
+    st.session_state.pop('consulta_submission_error',None)
+    st.session_state['consulta_quick_task_id']=int(task['id'])
+    st.session_state['altivia_navigation']='Entregables'
+
+
+def clear_consulta_task_submission():
+    """Al navegar normalmente deja de estar fijada la tarea del acceso directo."""
+    st.session_state.pop('consulta_quick_task_id',None)
+    st.session_state.pop('consulta_submission_error',None)
+
+
 def task_cards(frame):
     """Fichas específicas de Plan de trabajo; filtradas por permisos antes de entrar."""
     st.markdown('### 📂 Registros')
@@ -2381,6 +2428,13 @@ def task_cards(frame):
                     value=r.get(key)
                     if value is not None and pd.notna(value) and str(value).strip():
                         st.markdown(f'**{label}:** {escape(str(value))}')
+            if st.session_state.get('role')=='Consulta':
+                permitted=consulta_submission_task(int(r['id']),st.session_state.get('user_id'))
+                st.button('📤 Enviar tarea',key=f'submit_task_card_{int(r["id"])}',
+                    on_click=open_consulta_task_submission,args=(int(r['id']),),
+                    disabled=permitted is None,use_container_width=True,
+                    help=('Abre Registrar entregable con proyecto, entregable y tarea precargados.'
+                          if permitted else 'Solo un responsable puede enviar tareas con entregable programado y proyecto autorizado.'))
             if can_edit():
                 st.button('✏️ Editar',key=f'edit_task_card_{int(r["id"])}',
                           on_click=open_task_editor,args=(int(r['id']),),
@@ -3208,9 +3262,9 @@ def connection_project_rows():
 
 
 def delivery_editor(data):
-    st.title('📑 Entregables')
-    admin=can_edit()
     role=st.session_state.get('role')
+    st.title('📑 Registrar entregable' if role=='Consulta' else '📑 Entregables')
+    admin=can_edit()
     if admin:
         if st.button('📋 Registrar entregables',type='primary',key='toggle_delivery_catalog'):
             st.session_state['catalog_visible']=not st.session_state.get('catalog_visible',False)
@@ -3231,9 +3285,18 @@ def delivery_editor(data):
             else:st.info('No hay entregables programados todavía.')
     if not (admin or role in ('Consulta','Global')):
         st.error('Acceso restringido a Entregables.');return
-    st.subheader('Registrar entrega' if role in ('Consulta','Global') else 'Crear o editar una entrega')
-    if role in ('Consulta','Global'):
-        st.info('Puedes registrar V01 y después V02, V03… para los entregables asignados. Cada versión anterior se conserva y no puede editarse desde Consulta.')
+    if role!='Consulta':
+        st.subheader('Registrar entrega' if role=='Global' else 'Crear o editar una entrega')
+        if role=='Global':
+            st.info('Puedes registrar nuevas versiones solo de entregables cuyas tareas tienes asignadas como Responsable.')
+    quick_task=None
+    if role=='Consulta' and st.session_state.get('consulta_quick_task_id') is not None:
+        quick_task=consulta_submission_task(st.session_state['consulta_quick_task_id'],st.session_state['user_id'])
+        if quick_task is None:
+            clear_consulta_task_submission()
+            st.warning('La tarea seleccionada ya no está disponible para enviarse. Revisa las asignaciones e inténtalo nuevamente.')
+        else:
+            st.button('← Volver a Tareas',on_click=lambda: (clear_consulta_task_submission(),st.session_state.update({'altivia_navigation':'Plan de trabajo'})),key='quick_back_tasks')
     projects=connection_project_rows()
     if role in ('Consulta','Global'):
         allowed_codes=user_delivery_submission_codes(st.session_state['user_id'],role)
@@ -3257,8 +3320,14 @@ def delivery_editor(data):
             st.warning('No hay proyectos autorizados con entregables para presentar.')
         return
     pn={p['code']:p['name'] for p in projects}
-    project=st.selectbox('01 · ID Proyecto',list(pn),
-        format_func=lambda code:f'{code} — {pn[code]}',key='new_delivery_project')
+    if quick_task and quick_task['project_code'] not in pn:
+        clear_consulta_task_submission()
+        st.error('El proyecto de esta tarea ya no está autorizado.');return
+    project=st.selectbox('01 · ID Proyecto',
+        [quick_task['project_code']] if quick_task else list(pn),
+        format_func=lambda code:f'{code} — {pn[code]}',
+        key=(f'quick_project_{quick_task["id"]}' if quick_task else 'new_delivery_project'),
+        disabled=bool(quick_task))
     cat=[r for r in catalog_rows() if r['project_code']==project]
     if role in ('Consulta','Global'):
         cat=[r for r in cat if r['code'] in allowed_codes]
@@ -3268,11 +3337,18 @@ def delivery_editor(data):
         st.info('No hay entregables asignados mediante tareas en este proyecto, o no tienes permiso de acceso.')
         visible=data['Entregables']
         if role=='Consulta':visible=visible[visible['code'].isin(consulta_delivery_codes(st.session_state['user_id']))]
-        card_browser('Entregables',visible,allow_version_edit=admin)
+        if role!='Consulta':
+            card_browser('Entregables',visible,allow_version_edit=admin)
         return
     by_code={r['code']:r for r in cat}
-    code=st.selectbox('02 · ID Entregable',list(by_code),
-        format_func=lambda c:f'{c} — {by_code[c]["name"]}',key=f'new_delivery_code_{project}')
+    if quick_task and quick_task['delivery_code'] not in by_code:
+        clear_consulta_task_submission()
+        st.error('El entregable ya no está vinculado a esta tarea.');return
+    code=st.selectbox('02 · ID Entregable',
+        [quick_task['delivery_code']] if quick_task else list(by_code),
+        format_func=lambda c:f'{c} — {by_code[c]["name"]}',
+        key=(f'quick_delivery_{quick_task["id"]}' if quick_task else f'new_delivery_code_{project}'),
+        disabled=bool(quick_task))
     catalog=by_code[code]
     existing=used.get(code)
     rid=existing['id'] if existing else None
@@ -3286,16 +3362,20 @@ def delivery_editor(data):
             key=f'delivery_action_{code}')
     current=existing or {}
     version=(current.get('version') or 'V01') if existing and action=='Editar registro actual' else next_version(code,current.get('version'))
-    st.caption('ID, especialidad y fecha final definidos por Administrador.')
+    if role!='Consulta':
+        st.caption('ID, especialidad y fecha final definidos por Administrador.')
     form_key=f'delivery_editor_{code}_{action}_{version}'
+    if quick_task:
+        form_key+=f'_task_{int(quick_task["id"])}'  # Evita reutilizar archivos seleccionados en otra tarea.
     if action=='Editar registro actual' and rid:
         st.info('Para reemplazar documentos existentes usa «Ver detalles y versiones». Aquí puedes agregar más documentos.')
     optional_docs=bool(rid and action=='Editar registro actual')
     # Fuera de st.form para que las asignaciones se actualicen al elegir tarea.
-    st.text_input('Nombre del entregable',value=catalog['name'],disabled=True,
-                  key=f'{form_key}_delivery_name')
-    st.text_input('Especialidad',value=catalog['specialty'] or 'No asignada',disabled=True,
-                  key=f'{form_key}_delivery_specialty')
+    if role!='Consulta':
+        st.text_input('Nombre del entregable',value=catalog['name'],disabled=True,
+                      key=f'{form_key}_delivery_name')
+        st.text_input('Especialidad',value=catalog['specialty'] or 'No asignada',disabled=True,
+                      key=f'{form_key}_delivery_specialty')
     st.text_input('Versión',value=version,disabled=True,key=f'{form_key}_delivery_version')
     due=date.fromisoformat(catalog['final_due_date'])
     st.date_input('Fecha de Presentación Final',value=due,disabled=True,
@@ -3320,26 +3400,34 @@ def delivery_editor(data):
     current_task_id=int(saved_task) if saved_task and not pd.isna(saved_task) else None
     default_task=current_task_id if current_task_id in choices else None
     options=[None]+list(choices)
+    if quick_task:
+        if int(quick_task['id']) not in choices:
+            clear_consulta_task_submission()
+            st.error('Ya no puedes presentar documentos vinculados a esta tarea.');return
+        options=[int(quick_task['id'])]
+        default_task=int(quick_task['id'])
     task_id=st.selectbox('ID Tarea vinculada al entregable',options,
         index=options.index(default_task) if default_task in options else 0,
         format_func=lambda tid:choices[tid]['code'] if tid is not None else '— Seleccionar tarea —',
-        key=f'{form_key}_linked_task',
+        key=f'{form_key}_linked_task',disabled=bool(quick_task),
         help='Solo muestra tareas asignadas a este entregable y al proyecto seleccionado.')
     chosen=choices.get(task_id)
     if chosen:
         st.markdown('**Actividad:** '+escape(str(chosen['activity'] or 'Sin actividad')))
-        cols=st.columns(2)
-        with cols[0]:st.text_area('Responsables (automático)',value=chosen['owners'] or 'Sin asignar',
-                                 disabled=True,key=f'{form_key}_owners_auto_{task_id}',height=75)
-        with cols[1]:st.text_area('Revisores (automático)',value=chosen['reviewers'] or 'Sin asignar',
-                                 disabled=True,key=f'{form_key}_reviewers_auto_{task_id}',height=75)
+        if role!='Consulta':
+            cols=st.columns(2)
+            with cols[0]:st.text_area('Responsables (automático)',value=chosen['owners'] or 'Sin asignar',
+                                     disabled=True,key=f'{form_key}_owners_auto_{task_id}',height=75)
+            with cols[1]:st.text_area('Revisores (automático)',value=chosen['reviewers'] or 'Sin asignar',
+                                     disabled=True,key=f'{form_key}_reviewers_auto_{task_id}',height=75)
     else:
         st.info('Selecciona un ID Tarea para completar automáticamente la actividad, responsables y revisores.')
         if not linked:
             st.warning('No hay tareas vinculadas disponibles. Vincula una tarea a este entregable desde Plan de trabajo.')
     st.markdown('#### 📎 Documentos de '+version)
-    st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
-    st.caption('Editables admitidos: DWG, DOC, DOCX, XLS/XLSX, IFC, RVT, EDB (ETABS), SDB (SAP2000), FDB (SAFE). Límite actual de Google Drive en GP Altivia: 25 MB por archivo.')
+    if role!='Consulta':
+        st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
+        st.caption('Editables admitidos: DWG, DOC, DOCX, XLS/XLSX, IFC, RVT, EDB (ETABS), SDB (SAP2000), FDB (SAFE). Límite actual de Google Drive en GP Altivia: 25 MB por archivo.')
     # El número permanece fuera del formulario para mostrar nuevos campos al instante.
     how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
         max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
@@ -3363,6 +3451,9 @@ def delivery_editor(data):
                 # desde Administración: Consulta no debe completar estas fechas.
                 vals[key]=None
                 continue
+            if role=='Consulta' and key=='notes':
+                vals[key]=None
+                continue
             old=current.get(key)
             if old is not None and pd.isna(old):old=None
             # Fechas históricas de revisión nunca se reinician con una versión nueva.
@@ -3371,8 +3462,12 @@ def delivery_editor(data):
         for i in range(how_many):
             with st.container(border=True):
                 st.markdown(f'**Documento {i+1}**')
-                title=st.text_input('Nombre del documento *',key=f'{form_key}_title_{i}',
-                    placeholder='Ej.: Planta del primer piso')
+                if role=='Consulta' and how_many==1:
+                    # Solo un documento: se nombra automáticamente con el entregable programado.
+                    title=str(catalog['name'] or code).strip()
+                else:
+                    title=st.text_input('Nombre del documento *',key=f'{form_key}_title_{i}',
+                        placeholder='Ej.: Planta del primer piso')
                 pdf=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'{form_key}_pdf_{i}')
                 editable=st.file_uploader('Editable (DWG, Word, Excel, IFC, RVT, ETABS, SAP2000 y SAFE)',
                     type=EDITABLE_EXTENSIONS,key=f'{form_key}_editable_{i}')
@@ -3416,7 +3511,8 @@ def delivery_editor(data):
     visible=data['Entregables']
     if role=='Consulta':
         visible=visible[visible['code'].isin(consulta_delivery_codes(st.session_state['user_id']))]
-    card_browser('Entregables',visible,allow_version_edit=admin)
+    if role!='Consulta':
+        card_browser('Entregables',visible,allow_version_edit=admin)
     if admin:bulk_delete_ui('Entregables',data)
 
 def task_editor(data):
@@ -4035,10 +4131,16 @@ def main():
         remaining=task_badge_count(st.session_state['user_id'],role) if role!='Cliente' else 0
         def nav_label(option):
             if option=='Plan de trabajo':return 'Tareas  '+badge_number(remaining)
-            if option=='Entregables' and role=='Consulta':return 'Registrar entrega'
+            if option=='Entregables' and role=='Consulta':return 'Registrar entregable'
             return option
-        page=st.radio('Navegación',pages,format_func=nav_label)
+        if st.session_state.get('altivia_navigation') not in pages:
+            st.session_state['altivia_navigation']=pages[0]
+            clear_consulta_task_submission()
+        page=st.radio('Navegación',pages,format_func=nav_label,
+            key='altivia_navigation',on_change=clear_consulta_task_submission)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
+    if page=='Plan de trabajo' and st.session_state.get('consulta_submission_error'):
+        st.warning(st.session_state.pop('consulta_submission_error'))
     data=decorate()
     if page=='Mis documentos':client_portal()
     elif page=='Dashboard' and st.session_state.get('role') in ('Administrador','Global'):dashboard(data)
