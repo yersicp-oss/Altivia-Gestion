@@ -1713,6 +1713,47 @@ def programmed_delivery_specialty(project_code, delivery_code):
     return (row['specialty'] or '') if row else ''
 
 
+def project_display_names():
+    """Labels descriptivos sin alterar los IDs persistidos en SQLite."""
+    with connection() as con:
+        return {str(r['code']):str(r['name'] or '').strip()
+                for r in con.execute('SELECT code,name FROM projects')}
+
+
+def project_label(code,names):
+    name=str(names.get(str(code),'')).strip()
+    return f'{code} – {name}' if code and name else str(code)
+
+
+def reset_project_task_counter(project_code):
+    """Reinicia SOLO el contador de un proyecto sin tareas activas.
+
+    Atómico: el mismo bloqueo que el alta de tareas impide duplicar T001.
+    No borra tareas, entregas, versiones ni sus archivos.
+    """
+    require_admin()
+    project_code=str(project_code or '').strip()
+    if not project_code:
+        raise ValueError('Selecciona un proyecto.')
+    with connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        if not con.execute('SELECT 1 FROM projects WHERE code=?',(project_code,)).fetchone():
+            raise ValueError('El proyecto ya no existe.')
+        if con.execute('SELECT 1 FROM tasks WHERE project_code=? LIMIT 1',(project_code,)).fetchone():
+            raise ValueError('Este proyecto todavía tiene tareas. Elimínalas primero para volver a T001.')
+        # También evita choque con IDs heredados mal asociados a otro proyecto.
+        if con.execute('SELECT 1 FROM tasks WHERE code=?',(f'{project_code}_T001',)).fetchone():
+            raise ValueError('El ID T001 ya está siendo utilizado por otra tarea.')
+        old=con.execute('SELECT highest FROM task_counters WHERE project_code=?',(project_code,)).fetchone()
+        previous=int(old['highest']) if old else 0
+        con.execute('DELETE FROM task_counters WHERE project_code=?',(project_code,))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Plan de trabajo',project_code,
+                     f'Contador de tareas restablecido por Administrador (antes T{previous:03d}); '
+                     'próxima tarea T001'))
+    return previous
+
+
 def selectors(kind,current=None,project_code=None):
     if kind=='project': return df('projects').code.dropna().tolist()
     if kind=='delivery': return ['']+list(programmed_deliveries(project_code))
@@ -1737,7 +1778,12 @@ def form_input(key,label,kind,required,choice,value,form_key,project_code=None):
             return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,
                 format_func=lambda c:(f'{c} — {names[c]}' if c else '— Sin entregable relacionado —'),
                 key=tag+'_'+str(project_code)+'_'+str(value))
-        return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,key=tag+'_'+str(value))
+        if kind=='project':
+            project_names=project_display_names()
+            return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,
+                format_func=lambda c:project_label(c,project_names),key=tag+'_'+str(value))
+        return st.selectbox(label,vals,index=vals.index(value) if value in vals else 0,
+                            key=tag+'_'+str(value))
     if kind=='version': return st.text_input(label,value=value or 'V01',key=tag,help='Formato recomendado: V01, V02, V03…')
     if kind=='date':
         val=date.fromisoformat(str(value)[:10]) if value and str(value)!='nan' else None
@@ -2240,7 +2286,10 @@ def task_cards(frame):
         state=st.selectbox('Estado',['Todos']+states,key='cards_state_tasks')
     with b:
         projects=sorted(str(x) for x in frame['project_code'].dropna().unique())
-        project=st.selectbox('Proyecto',['Todos']+projects,key='cards_proj_tasks') if projects else 'Todos'
+        names=project_display_names()
+        project=st.selectbox('ID Proyecto',['Todos']+projects,
+            format_func=lambda c:project_label(c,names) if c!='Todos' else 'Todos',
+            key='cards_proj_tasks') if projects else 'Todos'
     if query:
         frame=frame[frame.astype(str).apply(lambda ser:ser.str.contains(query,case=False,regex=False)).any(axis=1)]
     if state!='Todos':frame=frame[frame['status'].astype(str)==state]
@@ -2409,9 +2458,10 @@ def update_delivery_status(delivery_id, new_status, observation=''):
 
 
 
-def card_browser(module, frame, allow_version_edit=True):
+def card_browser(module, frame, allow_version_edit=True, show_heading=True):
     """Visualizador responsive sin exponer campos técnicos."""
-    st.markdown('### 📂 Registros')
+    if show_heading:
+        st.markdown('### 📂 Registros')
     if frame.empty:
         st.info('Todavía no hay registros en este módulo.')
         return
@@ -2675,7 +2725,8 @@ def drive_delete_document(file_id):
 def project_editor(data):
     """Proyecto: creación en la cabecera; edición junto a su tarjeta."""
     st.title('📁 Proyectos')
-    st.caption('Seguimiento general, avance y riesgo calculado desde el plan de trabajo.')
+    if can_edit():
+        st.caption('Seguimiento general, avance y riesgo calculado desde el plan de trabajo.')
     if can_edit():
         if st.button('➕ Crear proyecto',type='primary',key='project_create_toggle'):
             st.session_state['show_project_create']=not st.session_state.get('show_project_create',False)
@@ -2695,11 +2746,8 @@ def project_editor(data):
                         except (ValueError,sqlite3.IntegrityError) as exc:st.error(str(exc))
     projects=(data['Proyectos'] if can_edit() or st.session_state.get('role')=='Global'
               else visible_project_rows(data['Proyectos'],st.session_state['user_id']))
-    if st.session_state.get('role')=='Consulta':
-        st.caption('Solo se muestran los proyectos autorizados por el Administrador.')
-    elif st.session_state.get('role')=='Global':
-        st.caption('Global: todos los proyectos de ALTIVIA, en modo de solo lectura.')
-    card_browser('Proyectos',projects)
+    # Para Consulta y Global, vista limpia: título, búsqueda/filtros y tarjetas.
+    card_browser('Proyectos',projects,show_heading=can_edit())
     if can_edit():bulk_delete_ui('Proyectos',data)
 
 
@@ -3323,7 +3371,61 @@ def task_editor(data):
     admin=can_edit()
     _,fields=SPECS['Plan de trabajo']
     if admin:
-        st.button('➕ Crear tarea',type='primary',on_click=open_task_editor,args=(None,),key='create_task_button')
+        new_col,reset_col=st.columns(2)
+        with new_col:
+            st.button('➕ Crear tarea',type='primary',on_click=open_task_editor,
+                      args=(None,),key='create_task_button',use_container_width=True)
+        with reset_col:
+            if st.button('🔄 Restablecer ID de tareas',key='task_reset_open_button',
+                         use_container_width=True):
+                st.session_state['task_reset_open']=not st.session_state.get('task_reset_open',False)
+        if st.session_state.get('task_reset_open'):
+            with st.container(border=True):
+                st.markdown('#### Restablecer numeración de tareas')
+                st.caption('El reinicio es independiente por proyecto. Solo se permite cuando '
+                           'no quedan tareas registradas en el proyecto seleccionado.')
+                available=selectors('project')
+                if not available:
+                    st.info('Todavía no existen proyectos.')
+                else:
+                    name_map=project_display_names()
+                    selected=st.selectbox('ID Proyecto',available,
+                        format_func=lambda c:project_label(c,name_map),
+                        key='task_reset_project')
+                    with connection() as con:
+                        task_count=con.execute('SELECT COUNT(*) FROM tasks WHERE project_code=?',(selected,)).fetchone()[0]
+                        counter_row=con.execute('SELECT highest FROM task_counters WHERE project_code=?',
+                                                (selected,)).fetchone()
+                    previous=int(counter_row['highest']) if counter_row else 0
+                    if task_count:
+                        st.warning(f'Hay {task_count} tarea(s) registradas en este proyecto. '
+                                   'Para reiniciar a T001 debes eliminarlas primero. '
+                                   'Las tareas de otros proyectos no se afectan.')
+                    else:
+                        st.info(f'Último ID utilizado: T{previous:03d}. '
+                                'La próxima tarea comenzará en T001 después de restablecer.')
+                    checked=st.checkbox(f'Confirmo restablecer el contador del proyecto {selected}',
+                                        key=f'task_reset_confirm_{selected}',disabled=bool(task_count))
+                    confirm_col,cancel_col=st.columns(2)
+                    with confirm_col:
+                        if st.button('Confirmar reinicio a T001',type='primary',
+                                     disabled=bool(task_count) or not checked,
+                                     key=f'task_reset_confirm_button_{selected}',use_container_width=True):
+                            try:
+                                # Respaldo antes de la operación; sin cambiar ninguna tarea.
+                                backup=backup_database()
+                                previous=reset_project_task_counter(selected)
+                                st.session_state['task_reset_open']=False
+                                st.success(f'{selected}: contador restablecido. Próximo ID: '
+                                           f'{selected}_T001. Respaldo: {os.path.basename(backup)}')
+                                st.rerun()
+                            except (ValueError,PermissionError,sqlite3.Error,OSError) as exc:
+                                st.error(f'No se pudo reiniciar: {exc}')
+                    with cancel_col:
+                        if st.button('Cancelar',key=f'task_reset_cancel_{selected}',
+                                     use_container_width=True):
+                            st.session_state['task_reset_open']=False
+                            st.rerun()
         if st.session_state.get('task_editor_open'):
             rid=st.session_state.get('task_editor_id')
             existing=data['Plan de trabajo']
@@ -3343,10 +3445,15 @@ def task_editor(data):
                 else:
                     if rid is not None:
                         project=str(row.get('project_code') or '')
-                        st.text_input('ID Proyecto *',value=project,disabled=True,key=f'task_edit_project_{rid}')
+                        st.text_input('ID Proyecto *',
+                                      value=project_label(project,project_display_names()),
+                                      disabled=True,key=f'task_edit_project_{rid}')
                         code=str(row['code'])
                     else:
-                        project=st.selectbox('ID Proyecto *',project_codes,key='task_project_create')
+                        name_map=project_display_names()
+                        project=st.selectbox('ID Proyecto *',project_codes,
+                                             format_func=lambda c:project_label(c,name_map),
+                                             key='task_project_create')
                         code=preview_task_code(project)
                     st.text_input('ID Tarea (automático)',value=code,disabled=True,
                                   key=f'task_code_readonly_{rid}_{project}_{code}')
@@ -3602,6 +3709,7 @@ CHECK_GROUPS={
 
 
 def checklist_page():
+    require_admin()  # Consulta y Global no acceden, aunque intenten forzar la ruta.
     st.title('✅ Checklist de calidad por documento')
     st.caption('Cada documento tiene su propio checklist; los resultados no se mezclan entre D01, D02 y otras versiones.')
     deliveries=df('deliverables')
@@ -3864,9 +3972,9 @@ def main():
             st.rerun()
         role=st.session_state.get('role')
         pages=(['Mis documentos','Mi cuenta'] if role=='Cliente' else
-               ['Proyectos','Plan de trabajo','Entregables','Checklist','Versiones','Mi cuenta']
+               ['Proyectos','Plan de trabajo','Entregables','Versiones','Mi cuenta']
                if role=='Consulta' else
-               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Checklist','Versiones','Mi cuenta']
+               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Versiones','Mi cuenta']
                if role=='Global' else
                ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
@@ -3884,7 +3992,7 @@ def main():
             page!='Control de cambios' or can_edit()) and (
             page!='Personal' or st.session_state.get('role') in ('Administrador','Global')):
         edit_module(page,data)
-    elif page=='Checklist' and st.session_state.get('role')!='Cliente':checklist_page()
+    elif page=='Checklist' and can_edit():checklist_page()
     elif page=='Versiones' and st.session_state.get('role')!='Cliente':versions_page()
     elif page=='Mi cuenta':my_account()
     elif page=='Administrar usuarios':user_management()
