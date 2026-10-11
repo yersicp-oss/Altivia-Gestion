@@ -69,8 +69,9 @@ def task_ids_with_submitted_delivery():
 
 
 def delivery_signal(status,last_modified,now=None):
-    """Verde si el Admin cambió Pendiente, si no amarillo o rojo a las 72 h."""
-    if str(status or '').strip()!='Pendiente':
+    """Semáforo independiente del texto del estado: nuevo y en subsanación
+    sigue amarillo/rojo; después de una revisión formal queda verde."""
+    if str(status or '').strip() not in ('Pendiente','En desarrollo','En corrección','Corregido'):
         return 'green',None
     clock=now or datetime.now(ZoneInfo('America/Lima'))
     if last_modified:
@@ -89,7 +90,17 @@ def delivery_signal(status,last_modified,now=None):
 
 PROJECT_STATES=['No iniciado','En desarrollo','En revisión','En corrección','Terminado']
 TASK_STATES=['No iniciado','En desarrollo','En revisión','Con observaciones','Corregido','Aprobado']
-DELIVERY_STATES=['Pendiente','En desarrollo','En revisión interna','Con observaciones','En corrección','Aprobado internamente','Enviado al cliente','Observado por cliente','Corregido','Aprobado','Entregado']
+DELIVERY_STATES=['Pendiente','En desarrollo','Observado','En corrección','Aprobado internamente','Enviado al cliente','Observado por cliente','Corregido','Aprobado','Entregado']
+OBSERVATION_STATES={'Observado':'Interna','Observado por cliente':'Cliente'}
+
+def version_submitted_status(previous_status, first_version=False):
+    """La presentación es la que cambia de etapa; no se edita el estado histórico."""
+    if first_version:return 'En desarrollo'
+    previous={'Con observaciones':'Observado','En revisión interna':'En desarrollo'}.get(str(previous_status),str(previous_status))
+    if previous=='Observado':return 'En corrección'
+    if previous=='Observado por cliente':return 'Corregido'
+    return 'En desarrollo'
+
 CHANGE_STATES=['Solicitado','Aprobado','Ejecutado']
 MEETING_STATES=['Pendiente','En proceso','Completado','Atrasado','Cancelado']
 SPECIALTIES=['Arquitectura','Estructuras','Eléctricas','Sanitarias','Comunicaciones','Modelado','Metrados y Presupuesto','BIM','Coordinación','Topografía']
@@ -180,6 +191,25 @@ def initialize():
             owners TEXT,
             reviewers TEXT,
             PRIMARY KEY(delivery_id,version))''')
+        # Historial de revisiones independiente de las versiones: preserva las
+        # observaciones después de las subsanaciones V02/V03.
+        con.execute('''CREATE TABLE IF NOT EXISTS delivery_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_code TEXT NOT NULL,
+            version TEXT NOT NULL,
+            stage TEXT NOT NULL CHECK(stage IN ('Interna','Cliente')),
+            status TEXT NOT NULL,
+            observation TEXT NOT NULL,
+            author_user_id INTEGER,
+            author_name TEXT NOT NULL,
+            created_at TEXT NOT NULL)''')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_delivery_reviews_code ON delivery_reviews(delivery_code,id DESC)')
+        # Los estados antiguos se traducen sin alterar documentos ni versiones.
+        con.execute("UPDATE deliverables SET status='Observado' WHERE status='Con observaciones'")
+        con.execute("UPDATE deliverables SET status='En desarrollo' WHERE status='En revisión interna'")
+        # Un registro que ya tiene V01 no puede seguir figurando como Pendiente.
+        con.execute("UPDATE deliverables SET status='En desarrollo' WHERE status='Pendiente' AND version IS NOT NULL AND trim(version)<>''")
+
         # Backfill conservador: el campo actual_date/última versión representa la
         # última entrega; created_at representa UTC y se usa solo como respaldo.
         con.execute('''UPDATE deliverables SET last_modified_at =
@@ -763,7 +793,17 @@ def consulta_delivery_codes(user_id):
             JOIN people pers ON pers.id=tp.person_id AND pers.user_id=?
             JOIN users u ON u.id=pers.user_id AND u.role='Consulta' AND u.active=1''',
             (int(user_id),int(user_id))).fetchall()
-    return {str(row['code']) for row in rows}
+        # También es visible para quien revisa un documento individual, aunque
+        # no participe en la tarea; no le autoriza a registrar nuevas versiones.
+        docs=con.execute('''SELECT DISTINCT d.code FROM deliverables d
+            JOIN delivery_documents dd ON dd.delivery_id=d.id
+            JOIN document_people dp ON dp.document_id=dd.id AND dp.assignment_role='Revisor'
+            JOIN people pe ON pe.id=dp.person_id AND pe.user_id=?
+            JOIN projects pr ON pr.code=d.project_code
+            JOIN consulta_project_access pa ON pa.project_id=pr.id AND pa.user_id=?
+            JOIN users u ON u.id=pe.user_id AND u.active=1 AND u.role='Consulta' ''',
+            (int(user_id),int(user_id))).fetchall()
+    return {str(row['code']) for row in rows}.union(str(r['code']) for r in docs)
 
 
 def consulta_document_ids(user_id):
@@ -1511,6 +1551,7 @@ def client_portal():
             st.markdown(f'### {escape(item["code"])} – {escape(item["name"])}')
             st.caption(f'{item["specialty"] or ""} · {item["version"]} · {len(docs)} documento(s)')
             st.success(item['status'],icon='✅')
+            show_delivery_reviews(item['code'],role='Cliente')
             if not docs:
                 st.caption('Este entregable aún no tiene documentos disponibles.')
             for document in docs:
@@ -1882,10 +1923,9 @@ def save_record(module,values,record_id=None,task_assignees=None):
         if record_id is None:
             values['version']=next_version(code)
             values['actual_date']=today_peru().isoformat()
-            if is_consulta:
-                values['status']='Pendiente'
-                for f in ('review_date','correction_date','approval_date'):
-                    values[f]=None
+            values['status']=version_submitted_status(None,first_version=True)
+            for f in ('review_date','correction_date','approval_date'):
+                values[f]=None
         else:
             original_version=registered['version'] or ''
             if values.get('version')!=original_version:
@@ -1895,10 +1935,14 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 values['actual_date']=today_peru().isoformat()
             else:
                 values['actual_date']=registered['actual_date']
-            if consulta_delivery:
-                values['status']='Pendiente'
+            if values.get('version')!=original_version:
+                values['status']=version_submitted_status(registered['status'])
+                # Estas fechas no deben perderse por una reentrega: la auditoría
+                # de revisiones se almacena de modo independiente por versión.
                 for f in ('review_date','correction_date','approval_date'):
-                    values[f]=None
+                    values[f]=registered[f]
+            elif consulta_delivery:
+                raise PermissionError('Consulta no puede editar versiones existentes.')
         # task_id NO es un campo libre. Se valida nuevamente contra la BD.
         chosen_id=values.get('task_id')
         try:chosen_id=int(chosen_id) if chosen_id not in ('',None) else None
@@ -2055,18 +2099,22 @@ def delete_selected(module,ids):
             if all_counter_codes:
                 cm=','.join('?' for _ in all_counter_codes)
                 con.execute(f'DELETE FROM version_counters WHERE delivery_code IN ({cm})',all_counter_codes)
+                con.executemany('DELETE FROM delivery_reviews WHERE delivery_code=?',[(dc,) for dc in all_counter_codes])
             con.execute(f'DELETE FROM deliverable_catalog WHERE project_code IN ({pm})',codes)
             for linked in ('tasks','deliverables','changes','meetings'):
                 con.execute(f'DELETE FROM {linked} WHERE project_code IN ({pm})',codes)
         if module=='Plan de trabajo':
             con.execute(f'DELETE FROM task_people_migration WHERE task_id IN ({marks})',ids)
         if module=='Entregables' and codes:
+            con.executemany('DELETE FROM delivery_reviews WHERE delivery_code=?',[(code,) for code in codes])
             con.execute(f'DELETE FROM delivery_files WHERE delivery_id IN ({marks})',ids)
             dm=','.join('?' for _ in codes)
             con.execute(f'DELETE FROM versions WHERE delivery_code IN ({dm})',codes)
             con.execute(f'DELETE FROM checklist WHERE delivery_code IN ({dm})',codes)
-            # Las tareas no se borran: solo se elimina la relación al entregable.
-            con.execute(f"UPDATE tasks SET delivery_code='' WHERE delivery_code IN ({dm})",codes)
+            # IMPORTANTE: borrar una entrega NO cancela el entregable programado.
+            # Conservar tasks.delivery_code permite que una tarea vuelva a
+            # respaldar una nueva presentación (V02, V03...) del mismo catálogo.
+            # Tampoco se elimina version_counters: se preserva la numeración.
         con.execute(f'DELETE FROM {table} WHERE id IN ({marks})',ids)
         for code in codes:
             con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
@@ -2219,31 +2267,112 @@ def task_cards(frame):
 
 
 
-def update_delivery_status(delivery_id, new_status):
-    """Cambio rápido de estado por el Administrador, sin modificar versiones ni archivos."""
-    require_admin()
-    if new_status not in DELIVERY_STATES:
-        raise ValueError('El estado seleccionado no es válido.')
+def reviewer_can_change_status(delivery_id, user_id=None, con=None):
+    """Permiso server-side: admin o revisor real de tarea/documento.
+
+    Global puede supervisar, pero solo cambia estados si también figura como
+    revisor asignado. Consulta requiere además acceso al proyecto.
+    """
+    role=st.session_state.get('role')
+    if role=='Administrador':return True
+    if role not in ('Consulta','Global'):return False
+    uid=int(user_id if user_id is not None else st.session_state.get('user_id') or 0)
+    if not uid:return False
+    if con is None:
+        with connection() as db:
+            return reviewer_can_change_status(delivery_id,uid,db)
+    record=con.execute('''SELECT d.id,d.code,d.project_code
+        FROM deliverables d WHERE d.id=?''',(int(delivery_id),)).fetchone()
+    if not record:return False
+    valid=con.execute('SELECT 1 FROM users WHERE id=? AND active=1 AND role=?',(uid,role)).fetchone()
+    if not valid:return False
+    if role=='Consulta':
+        permit=con.execute('''SELECT 1 FROM projects p
+            JOIN consulta_project_access pa ON pa.project_id=p.id
+            WHERE p.code=? AND pa.user_id=?''',(record['project_code'],uid)).fetchone()
+        if not permit:return False
+    task_reviewer=con.execute('''SELECT 1 FROM tasks t
+        JOIN task_people tp ON tp.task_id=t.id AND tp.assignment_role='Revisor'
+        JOIN people pe ON pe.id=tp.person_id AND pe.user_id=?
+        WHERE t.project_code=? AND t.delivery_code=? LIMIT 1''',
+        (uid,record['project_code'],record['code'])).fetchone()
+    doc_reviewer=con.execute('''SELECT 1 FROM delivery_documents dd
+        JOIN document_people dp ON dp.document_id=dd.id AND dp.assignment_role='Revisor'
+        JOIN people pe ON pe.id=dp.person_id AND pe.user_id=?
+        WHERE dd.delivery_id=? LIMIT 1''',(uid,int(delivery_id))).fetchone()
+    return bool(task_reviewer or doc_reviewer)
+
+
+def delivery_review_history(delivery_code,limit=25,for_client=False):
+    with connection() as con:
+        query='''SELECT r.*,u.username FROM delivery_reviews r
+             LEFT JOIN users u ON u.id=r.author_user_id
+             WHERE r.delivery_code=?'''
+        if for_client:query+=" AND r.stage='Cliente'"
+        query+=' ORDER BY r.id DESC LIMIT ?'
+        return [dict(r) for r in con.execute(query,(str(delivery_code),int(limit)))]
+
+
+def show_delivery_reviews(code, role='Consulta'):
+    """Mostrar observaciones a participantes autorizados; las del cliente no se mezclan."""
+    history=delivery_review_history(code,limit=30,for_client=(role=='Cliente'))
+    if not history:return
+    most_recent=history[0]
+    heading=('📝 Observaciones internas' if most_recent['stage']=='Interna' else '📝 Observaciones del cliente')
+    st.warning(heading+f" · {most_recent['version']} · {most_recent['created_at'][:16]}"+
+        '\n\n'+escape(most_recent['observation']).replace('\n','  \n')+
+        '\n\nRegistradas por '+escape(str(most_recent['author_name'])))
+    if len(history)>1:
+        with st.expander('🕘 Ver historial completo de observaciones'):
+            for note in history:
+                st.markdown(f"**{escape(note['stage'])} · {escape(note['version'])}** "
+                    f"— {escape(note['created_at'][:16])} · {escape(note['author_name'])}")
+                st.markdown(escape(note['observation']).replace('\n','  \n'))
+                st.divider()
+
+
+def update_delivery_status(delivery_id, new_status, observation=''):
+    """Edición autorizada del flujo de revisión con historial de observaciones."""
+    if new_status not in DELIVERY_STATES or new_status=='Pendiente':
+        raise ValueError('Selecciona un estado válido para un entregable registrado.')
+    observation=str(observation or '').strip()
+    if new_status in OBSERVATION_STATES and not observation:
+        raise ValueError('Escribe las observaciones antes de guardar este estado.')
     with connection() as con:
         con.execute('BEGIN IMMEDIATE')
-        record=con.execute("SELECT id,code,status,review_date,approval_date,correction_date FROM deliverables WHERE id=?",(int(delivery_id),)).fetchone()
+        if not reviewer_can_change_status(delivery_id,con=con):
+            raise PermissionError('Solo el Administrador o un revisor asignado puede cambiar este estado.')
+        record=con.execute('''SELECT id,code,version,status,review_date,approval_date,correction_date
+            FROM deliverables WHERE id=?''',(int(delivery_id),)).fetchone()
         if not record:raise ValueError('El entregable ya no existe.')
-        if record['status']==new_status:return False
+        if record['status']==new_status and new_status not in OBSERVATION_STATES:
+            return False
+        if not record['version']:
+            raise ValueError('Primero debe registrarse una versión del entregable.')
         fields={'status':new_status,'last_modified_at':peru_timestamp()}
         stamp=today_peru().isoformat()
-        # Respeta la validación del módulo: estos estados requieren revisión registrada.
-        if new_status in ('Enviado al cliente','Aprobado','Entregado') and not record['review_date']:
+        if new_status in ('Observado','Aprobado internamente','Enviado al cliente','Observado por cliente','Aprobado','Entregado') and not record['review_date']:
             fields['review_date']=stamp
         if new_status in ('Aprobado','Entregado') and not record['approval_date']:
             fields['approval_date']=stamp
-        if new_status=='Corregido' and not record['correction_date']:
+        if new_status in ('En corrección','Corregido') and not record['correction_date']:
             fields['correction_date']=stamp
         assignments=', '.join(f'{k}=?' for k in fields)
         con.execute(f'UPDATE deliverables SET {assignments} WHERE id=?',
                     (*fields.values(),int(delivery_id)))
+        if new_status in OBSERVATION_STATES:
+            con.execute('''INSERT INTO delivery_reviews
+                (delivery_code,version,stage,status,observation,author_user_id,author_name,created_at)
+                VALUES(?,?,?,?,?,?,?,?)''',
+                (record['code'],record['version'],OBSERVATION_STATES[new_status],new_status,
+                 observation,int(st.session_state.get('user_id')),str(st.session_state.get('full_name') or st.session_state.get('username')),
+                 peru_timestamp()))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
-                    ('Entregables',record['code'],f'Cambio rápido de estado: {record["status"]} → {new_status}'))
+                    ('Entregables',record['code'],
+                     f'Estado ({st.session_state.get("username")}): {record["status"]} → {new_status}'+
+                     ('; observación registrada' if new_status in OBSERVATION_STATES else '')))
     return True
+
 
 
 def card_browser(module, frame, allow_version_edit=True):
@@ -2287,31 +2416,35 @@ def card_browser(module, frame, allow_version_edit=True):
             st.markdown(f'**{escape(title)}**')
             if module=='Entregables':
                 label={'yellow':'En seguimiento','red':'Sin cambios por más de 3 días',
-                       'green':'Estado actualizado por Administrador'}[signal]
-                st.caption('● '+label)
+                       'green':'En seguimiento de revisión'}[signal]
+                st.caption('● '+label+' · Estado actual: '+status_text)
             st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
-            if module!='Entregables' or can_edit():
-                st.markdown(f'**Estado:** {escape(status_text)}')
-            if module=='Entregables' and can_edit():
-                # Edición rápida directamente en la ficha, sin abrir el formulario completo.
+            st.markdown(f'**Estado actual:** {escape(status_text)}')
+            if module=='Entregables':
                 delivery_id=int(r['id'])
-                with st.form(f'quick_delivery_state_{delivery_id}'):
-                    left,right=st.columns([3,1],gap='small',vertical_alignment='bottom')
-                    with left:
-                        selected_state=st.selectbox('Cambiar estado',DELIVERY_STATES,
-                            index=DELIVERY_STATES.index(status_text) if status_text in DELIVERY_STATES else 0,
-                            key=f'quick_delivery_state_value_{delivery_id}')
-                    with right:
-                        saved=st.form_submit_button('💾 Guardar estado',use_container_width=True)
-                if saved:
-                    try:
-                        changed=update_delivery_status(delivery_id,selected_state)
-                        if changed:
-                            st.toast('Estado actualizado',icon='✅')
-                            st.rerun()
-                        else:st.info('El entregable ya tiene ese estado.')
-                    except (ValueError,PermissionError,sqlite3.Error) as exc:
-                        st.error(f'No se pudo actualizar el estado: {exc}')
+                if reviewer_can_change_status(delivery_id):
+                    st.caption('Revisión habilitada: Administrador o revisor asignado')
+                    options=[x for x in DELIVERY_STATES if x!='Pendiente']
+                    selected_state=st.selectbox('Cambiar estado',options,
+                        index=options.index(status_text) if status_text in options else 0,
+                        key=f'quick_delivery_state_value_{delivery_id}')
+                    observation=''
+                    if selected_state in OBSERVATION_STATES:
+                        observation=st.text_area(
+                            'Observaciones internas *' if selected_state=='Observado' else 'Observaciones del cliente *',
+                            placeholder='Describe qué debe corregirse; quedará disponible para los participantes autorizados.',
+                            key=f'quick_delivery_note_{delivery_id}_{selected_state}',height=105)
+                    if st.button('💾 Guardar estado',key=f'quick_delivery_save_{delivery_id}',
+                                 use_container_width=True):
+                        try:
+                            changed=update_delivery_status(delivery_id,selected_state,observation)
+                            if changed:
+                                st.toast('Estado y observaciones guardados',icon='✅')
+                                st.rerun()
+                            else:st.info('El entregable ya tiene ese estado.')
+                        except (ValueError,PermissionError,sqlite3.Error) as exc:
+                            st.error(f'No se pudo actualizar el estado: {exc}')
+                show_delivery_reviews(code,role=st.session_state.get('role'))
             cols=st.columns(2)
             details=[k for k in ('owner','reviewer','manager','due_date','actual_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
             for idx,k in enumerate(details):
@@ -2658,6 +2791,7 @@ def catalog_delete(catalog_id):
         versions_deleted=con.execute('DELETE FROM versions WHERE delivery_code=?',(code,)).rowcount
         checks_deleted=con.execute('DELETE FROM checklist WHERE delivery_code=?',(code,)).rowcount
         counter_deleted=con.execute('DELETE FROM version_counters WHERE delivery_code=?',(code,)).rowcount
+        con.execute('DELETE FROM delivery_reviews WHERE delivery_code=?',(code,))
         con.execute('DELETE FROM deliverable_catalog WHERE id=?',(int(catalog_id),))
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Catálogo entregables',code,
@@ -2665,6 +2799,32 @@ def catalog_delete(catalog_id):
                      f'; referencias históricas locales limpiadas: {versions_deleted} versiones, {checks_deleted} checks; '
                      f'contador histórico del entregable retirado: {counter_deleted}; sin cambios en Google Drive'))
     return code
+
+
+def restore_unlinked_task(catalog_id,task_id):
+    """Recupera, bajo confirmación del Admin, tareas que versiones antiguas
+    desvincularon al eliminar una entrega. No presume que tareas no vinculadas
+    pertenezcan a un entregable: exige selección explícita de catálogo y tarea.
+    """
+    require_admin()
+    with connection() as con:
+        catalog=con.execute('''SELECT code,project_code,specialty
+            FROM deliverable_catalog WHERE id=?''',(int(catalog_id),)).fetchone()
+        task=con.execute('''SELECT id,code,project_code,delivery_code
+            FROM tasks WHERE id=?''',(int(task_id),)).fetchone()
+        if not catalog or not task:
+            raise ValueError('La tarea o el entregable ya no existen. Recarga la página.')
+        if task['project_code']!=catalog['project_code']:
+            raise ValueError('La tarea pertenece a otro proyecto.')
+        if str(task['delivery_code'] or '').strip():
+            raise ValueError('Esta tarea ya está vinculada a un entregable.')
+        con.execute('''UPDATE tasks SET delivery_code=?,specialty=? WHERE id=?''',
+                    (catalog['code'],catalog['specialty'] or '',int(task_id)))
+        grant_project_for_assigned_task(con,int(task_id))
+        con.execute('''INSERT INTO audit(module,record_code,action)
+            VALUES(?,?,?)''',('Plan de trabajo',task['code'],
+            'Relación recuperada con entregable '+catalog['code']))
+        return task['code'],catalog['code']
 
 
 def delivery_catalog_admin_ui():
@@ -2718,6 +2878,35 @@ def delivery_catalog_admin_ui():
             st.markdown(f"**{escape(item['code'])} — {escape(item['name'])}**")
             st.caption(f"{escape(item['project_code'])} · Fecha final: {escape(item['final_due_date'])} · "
                        + ('Entrega registrada' if item['registered'] else 'Pendiente de registrar'))
+            # Reparación para instalaciones anteriores: al borrar una entrega,
+            # se vaciaba tasks.delivery_code. El Admin elige el vínculo correcto.
+            with st.expander('🔗 Recuperar tarea desvinculada',expanded=False):
+                with connection() as con:
+                    orphan=[dict(t) for t in con.execute('''SELECT id,code,activity
+                        FROM tasks WHERE project_code=?
+                          AND (delivery_code IS NULL OR trim(delivery_code)='')
+                        ORDER BY code''',(item['project_code'],))]
+                if not orphan:
+                    st.caption('No hay tareas sin entregable relacionado en este proyecto.')
+                else:
+                    st.caption('Si eliminaste una entrega en una versión anterior de GP Altivia, '
+                               'puedes recuperar aquí el vínculo perdido. Solo selecciona una tarea '
+                               'que realmente corresponda a este entregable; no se creará una versión.')
+                    selected_orphan=st.selectbox('Tarea sin entregable vinculado',
+                        [t['id'] for t in orphan],
+                        format_func=lambda tid:next(
+                            t['code']+' — '+t['activity'] for t in orphan if t['id']==tid),
+                        key=f'restore_task_choice_{item["id"]}')
+                    if st.button('🔗 Vincular tarea seleccionada',
+                        key=f'restore_task_btn_{item["id"]}'):
+                        try:
+                            restored_task,restored_catalog=restore_unlinked_task(
+                                item['id'],selected_orphan)
+                            st.success(f'Tarea {restored_task} vinculada a {restored_catalog}. '
+                                       'Ya podrás volver a seleccionar la tarea al registrar la entrega.')
+                            st.rerun()
+                        except (ValueError,sqlite3.Error) as exc:
+                            st.error(f'No se pudo recuperar la relación: {exc}')
             with st.expander('✏️ Editar entregable programado'):
                 with st.form(f'catalog_edit_{item["id"]}'):
                     pr2=st.selectbox('ID Proyecto',list(project_names),
@@ -2809,7 +2998,7 @@ def delivery_editor(data):
                     'ID Proyecto':r['project_code'], 'ID Entregable':r['code'],
                     'Nombre':r['name'], 'Especialidad':r['specialty'],
                     'Presentación final':r['final_due_date'],
-                    'Registro': 'Con versiones' if r['registered'] else 'Pendiente de V01'
+                    'Estado': 'En desarrollo' if r['registered'] else 'Pendiente (sin versión)'
                 } for r in rows]),hide_index=True,use_container_width=True)
             else:st.info('No hay entregables programados todavía.')
         card_browser('Entregables',data['Entregables'],allow_version_edit=False)
@@ -2846,6 +3035,10 @@ def delivery_editor(data):
     catalog=by_code[code]
     existing=used.get(code)
     rid=existing['id'] if existing else None
+    if not existing:
+        st.caption('Estado actual: Pendiente · todavía no existe una versión presentada.')
+    else:
+        st.caption('Estado actual: '+str(existing.get('status') or 'En desarrollo'))
     action='Registrar nueva versión' if (role=='Consulta' and rid) else 'Nuevo registro'
     if admin and rid:
         action=st.radio('Acción',['Editar registro actual','Registrar nueva versión'],horizontal=True,
@@ -2916,12 +3109,20 @@ def delivery_editor(data):
               'reviewer':chosen['reviewers'] if chosen else current.get('reviewer') or ''}
         for key,label,kind,required,opt in SPECS['Entregables'][1]:
             if key in ('project_code','code','name','specialty','version','due_date','actual_date','file_path','owner','reviewer'):continue
-            if key=='status' and role=='Consulta':
-                vals[key]='Pendiente';continue
+            if key=='status':
+                # El estado de las entregas nuevas depende del flujo; revisores
+                # lo modifican desde el registro después de evaluar documentos.
+                vals[key]=(current.get('status') or 'En desarrollo') if action=='Editar registro actual' else version_submitted_status(
+                    current.get('status'),first_version=(rid is None))
+                continue
+            if role=='Consulta' and key in ('review_date','correction_date','approval_date'):
+                # La revisión, subsanación y aprobación se gestionan únicamente
+                # desde Administración: Consulta no debe completar estas fechas.
+                vals[key]=None
+                continue
             old=current.get(key)
             if old is not None and pd.isna(old):old=None
-            if key=='status' and action=='Registrar nueva versión':old='Pendiente'
-            if key in ('review_date','correction_date','approval_date') and action=='Registrar nueva versión':old=None
+            # Fechas históricas de revisión nunca se reinician con una versión nueva.
             vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,old,form_key)
         entries=[]
         for i in range(how_many):
@@ -2940,6 +3141,8 @@ def delivery_editor(data):
     if submitted:
         try:
             if any(not name.strip() for name,_,_ in entries):raise ValueError('Escribe el nombre de cada documento.')
+            if role=='Consulta' and not any(pdf is not None or editable is not None for _,pdf,editable in entries):
+                raise ValueError('Para registrar una nueva versión, adjunta por lo menos un archivo PDF o editable.')
             if any((pdf or editable) for _,pdf,editable in entries) and not drive_ready():
                 raise ValueError('Google Drive no está conectado. No se guardó el formulario.')
             # Validación anterior al guardado para reducir operaciones parciales.
@@ -2952,7 +3155,7 @@ def delivery_editor(data):
                         raise ValueError(f'{f.name}: PDF no válido.')
                     if kind=='editable' and ext not in ('dwg','doc','docx','xls','xlsx','ifc','rvt'):
                         raise ValueError(f'{f.name}: formato editable no admitido.')
-            if role=='Consulta':vals['status']='Pendiente'
+            # El servidor también vuelve a calcular el estado automáticamente.
             # Revalidación de permisos y versión vigente dentro de save_record.
             if role=='Consulta' and code not in consulta_delivery_codes(st.session_state['user_id']):
                 raise PermissionError('Ya no estás asignado a este entregable o proyecto.')
@@ -3203,7 +3406,7 @@ def priorities(data):
         days=r['Días restantes']
         if pd.notna(days) and days<0:add('🔴 Alta','Entregable atrasado',r.project_code,r.name,r.owner,r.due_date,r.code)
         elif pd.notna(days) and days<=3:add('🟡 Media','Entregable próximo',r.project_code,r.name,r.owner,r.due_date,r.code)
-        if r.status in ('Con observaciones','Observado por cliente'):add('🟡 Media','Entregable observado',r.project_code,r.name,r.owner,r.due_date,r.code)
+        if r.status in ('Observado','Observado por cliente'):add('🟡 Media','Entregable observado',r.project_code,r.name,r.owner,r.due_date,r.code)
     for _,r in p.iterrows():
         if r.status not in ('Terminado',) and r['Riesgo calculado'] in ('Alto','Crítico'):add('🔴 Alta','Proyecto en riesgo',r.code,r['name'],r.manager,r.due_date,r.code)
     for _,r in c.iterrows():
@@ -3213,7 +3416,7 @@ def priorities(data):
 def dashboard(data):
     p,t,e,c,pe=[data[k] for k in ['Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal']]
     active=p[~p.status.isin(['Terminado'])] if not p.empty else p
-    metrics=[('Proyectos activos',len(active)),('Proyectos atrasados',int((active.Situación=='🔴 Atrasado').sum()) if not active.empty else 0),('Proyectos en riesgo',int(active['Riesgo calculado'].isin(['Alto','Crítico']).sum()) if not active.empty else 0),('Tareas pendientes',int((~t.status.isin(FINISHED_TASK)&(t.progress.fillna(0)<100)).sum()) if not t.empty else 0),('Tareas atrasadas',int((t['Días atraso']>0).sum()) if not t.empty else 0),('Entregables pendientes',int((~e.status.isin(FINISHED_DELIVERY)).sum()) if not e.empty else 0),('Entregables en revisión',int(e.status.str.contains('revisión',case=False,na=False).sum()) if not e.empty else 0),('Con observaciones',int(e.status.isin(['Con observaciones','Observado por cliente']).sum()) if not e.empty else 0),('Cambios pendientes',int(c.status.isin(['Solicitado']).sum()) if not c.empty else 0),]
+    metrics=[('Proyectos activos',len(active)),('Proyectos atrasados',int((active.Situación=='🔴 Atrasado').sum()) if not active.empty else 0),('Proyectos en riesgo',int(active['Riesgo calculado'].isin(['Alto','Crítico']).sum()) if not active.empty else 0),('Tareas pendientes',int((~t.status.isin(FINISHED_TASK)&(t.progress.fillna(0)<100)).sum()) if not t.empty else 0),('Tareas atrasadas',int((t['Días atraso']>0).sum()) if not t.empty else 0),('Entregables pendientes',int((~e.status.isin(FINISHED_DELIVERY)).sum()) if not e.empty else 0),('Entregables en revisión',int(e.status.str.contains('revisión',case=False,na=False).sum()) if not e.empty else 0),('Con observaciones',int(e.status.isin(['Observado','Observado por cliente']).sum()) if not e.empty else 0),('Cambios pendientes',int(c.status.isin(['Solicitado']).sum()) if not c.empty else 0),]
     st.title('ALTIVIA  |  Panel de control')
     st.caption(f'Consultoría e ingeniería • Actualizado al {TODAY.strftime("%d/%m/%Y")} • Datos almacenados localmente')
     # Tarjetas fluidas: 5 columnas en escritorio, 2 en móvil; contraste independiente del tema.
