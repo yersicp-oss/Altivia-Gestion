@@ -52,20 +52,56 @@ def task_signal(due_date, submitted=False, today=None):
 
 
 def task_ids_with_submitted_delivery():
-    '''Tareas vinculadas a una versión que SIGUE existiendo en el historial.
+    """Compatibilidad: IDs de tareas con una versión todavía registrada."""
+    return set(task_delivery_stages())
 
-    No marca una tarea verde por el simple hecho de estar en el catálogo; si
-    se elimina una versión, el enlace histórico huérfano no cuenta.
-    '''
+
+def task_delivery_stages():
+    """Estado real de la última versión vinculada a cada tarea.
+
+    Importante: las revisiones del entregable afectan solamente a la tarea
+    relacionada con su versión VIGENTE. Una versión borrada no da color verde.
+    """
     with connection() as con:
-        records=con.execute('''SELECT DISTINCT vt.task_id
-          FROM delivery_version_tasks vt
-          JOIN deliverables d ON d.id=vt.delivery_id
-          JOIN versions v ON v.delivery_code=d.code AND v.version=vt.version
-          JOIN tasks t ON t.id=vt.task_id
-              AND t.project_code=d.project_code AND t.delivery_code=d.code
-          WHERE vt.task_id IS NOT NULL''').fetchall()
-    return {int(r[0]) for r in records}
+        records=con.execute('''SELECT vt.task_id,vt.version,v.id AS version_id,
+                d.version AS current_version,d.status AS delivery_status
+            FROM delivery_version_tasks vt
+            JOIN deliverables d ON d.id=vt.delivery_id
+            JOIN versions v ON v.delivery_code=d.code AND v.version=vt.version
+            JOIN tasks t ON t.id=vt.task_id
+                AND t.project_code=d.project_code AND t.delivery_code=d.code
+            WHERE vt.task_id IS NOT NULL
+            ORDER BY v.id,vt.delivery_id''').fetchall()
+    stages={}
+    for row in records:
+        # La última versión efectiva prevalece, no el contador histórico.
+        stages[int(row['task_id'])]={
+            'version':str(row['version']),
+            'current_version':str(row['current_version'] or ''),
+            'status':str(row['delivery_status'] or ''),
+            'version_id':int(row['version_id'])}
+    return stages
+
+
+def task_card_stage(due_date, linked_version=None, today=None):
+    """(color,etiqueta) para Admin, Consulta, Global y el contador lateral.
+
+    V01 registrada: verde. Observado vigente: rojo. V02 tras observaciones:
+    verde. Aprobación vigente: verde con etiqueta Completada.
+    """
+    if linked_version:
+        current=(linked_version.get('version')==linked_version.get('current_version'))
+        status=linked_version.get('status') if current else None
+        if status in ('Observado','Observado por cliente','Con observaciones'):
+            return 'red','Observado'
+        if status in ('Aprobado internamente','Aprobado','Entregado'):
+            return 'green','Completada'
+        serial=re.fullmatch(r'V(\d+)',str(linked_version.get('version') or ''),re.I)
+        if serial and int(serial.group(1))>1:
+            return 'green','Entregado nuevamente'
+        return 'green','Entrega registrada'
+    color=task_signal(due_date,False,today=today)
+    return color,('Fecha de término alcanzada' if color=='red' else 'En seguimiento')
 
 
 def delivery_signal(status,last_modified,now=None):
@@ -2214,7 +2250,7 @@ def task_cards(frame):
     with connection() as con:
         project_names={str(p['code']):(str(p['name'] or ''),str(p['client'] or ''))
             for p in con.execute('SELECT code,name,client FROM projects')}
-    submitted_ids=task_ids_with_submitted_delivery()
+    linked_stages=task_delivery_stages()
     page_size=10
     max_page=max(1,(len(frame)+page_size-1)//page_size)
     page=st.number_input('Página',min_value=1,max_value=max_page,value=1,step=1,key='cards_page_tasks')
@@ -2226,11 +2262,9 @@ def task_cards(frame):
         reviewers=escape(str(r.get('reviewer') or 'Sin asignar'))
         start=escape(str(r.get('start_date') or '—'))
         due=escape(str(r.get('due_date') or '—'))
-        signal=task_signal(r.get('due_date'), int(r['id']) in submitted_ids)
+        signal,signal_label=task_card_stage(r.get('due_date'),linked_stages.get(int(r['id'])))
         with st.container(border=True,key=f'gp_task_{signal}_card_{int(r["id"])}'):
-            st.caption({'yellow':'● En seguimiento',
-                        'red':'● Fecha de término alcanzada',
-                        'green':'● Entrega registrada'}[signal])
+            st.caption('● '+signal_label)
             # 1. Actividad destacada: 1.2rem = 20% más que el texto base.
             st.markdown(f'<div style="font-size:1.2rem;font-weight:750;line-height:1.35;overflow-wrap:anywhere">{activity}</div>',
                         unsafe_allow_html=True)
@@ -2617,7 +2651,14 @@ def versions_for_delivery(code,allow_edit=False):
                             con.execute('DELETE FROM versions WHERE id=? AND delivery_code=?',(vid,code))
                             remaining=con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC LIMIT 1',(code,)).fetchone()
                             if delivery['version']==version:
-                                con.execute('UPDATE deliverables SET version=? WHERE id=?',(remaining['version'] if remaining else '',did))
+                                # Al retirar la versión vigente, su decisión de revisión
+                                # ya no puede colorear otra versión como aprobada/observada.
+                                # Si subsiste alguna anterior, vuelve a seguimiento.
+                                next_active=remaining['version'] if remaining else ''
+                                con.execute('''UPDATE deliverables
+                                    SET version=?,status=?,last_modified_at=? WHERE id=?''',
+                                    (next_active,'En desarrollo' if next_active else 'Pendiente',
+                                     peru_timestamp(),did))
                         st.session_state.pop(f'version_confirm_{vid}',None)
                         st.rerun()
                     except Exception as exc:st.error('No se pudo eliminar completamente: '+str(exc))
@@ -2801,6 +2842,54 @@ def catalog_delete(catalog_id):
     return code
 
 
+
+def reset_catalog_version_counter(catalog_id):
+    """Reinicia a V01 solo cuando el entregable NO conserva versiones ni archivos.
+
+    No elimina el catálogo, tareas, ni documentos físicos en Google Drive.
+    Limpia metadatos huérfanos para impedir que versiones reutilizadas hereden
+    una tarea, observación o contador de documentos de versiones eliminadas.
+    """
+    require_admin()
+    with connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        catalog=con.execute('SELECT code FROM deliverable_catalog WHERE id=?',
+                            (int(catalog_id),)).fetchone()
+        if not catalog:
+            raise ValueError('El entregable programado ya no existe.')
+        code=catalog['code']
+        if con.execute('SELECT 1 FROM versions WHERE delivery_code=? LIMIT 1',(code,)).fetchone():
+            raise ValueError('No es posible reiniciar: aún existen versiones. Elimínalas primero.')
+        delivery=con.execute('SELECT id,version FROM deliverables WHERE code=?',(code,)).fetchone()
+        if delivery:
+            did=int(delivery['id'])
+            if str(delivery['version'] or '').strip():
+                raise ValueError('No es posible reiniciar: existe una versión vigente en el registro. Elimínala primero.')
+            # Los documentos podrían estar guardados aunque la versión no figure
+            # en versions. Bloquear por seguridad para no perder su trazabilidad.
+            for table,field in (('delivery_documents','delivery_id'),
+                                ('drive_files','delivery_id'),('delivery_files','delivery_id')):
+                if con.execute(f'SELECT 1 FROM {table} WHERE {field}=? LIMIT 1',(did,)).fetchone():
+                    raise ValueError('Hay documentos o archivos aún asociados al entregable. '
+                                     'Elimínalos desde Versiones antes de reiniciar la numeración.')
+            # Referencias que quedaron huérfanas al borrar V01/V02. Sin limpiar
+            # podrían mezclarse con una nueva V01 o afectar su numeración D01.
+            con.execute('DELETE FROM delivery_version_tasks WHERE delivery_id=?',(did,))
+            con.execute('DELETE FROM document_serials WHERE delivery_id=?',(did,))
+            con.execute('DELETE FROM legacy_document_imports WHERE delivery_id=?',(did,))
+        con.execute('DELETE FROM delivery_reviews WHERE delivery_code=?',(code,))
+        # La tabla checklist heredada por entregable se conserva: se puede
+        # administrar independientemente y no indica una versión vigente.
+        counter=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',(code,)).fetchone()
+        old=int(counter['highest']) if counter else 0
+        con.execute('DELETE FROM version_counters WHERE delivery_code=?',(code,))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Catálogo entregables',code,
+                     f'Contador de versiones reiniciado por Administrador (antes V{old:02d}); '
+                     'sin versiones activas; limpieza de metadatos históricos huérfanos'))
+    return code,old
+
+
 def restore_unlinked_task(catalog_id,task_id):
     """Recupera, bajo confirmación del Admin, tareas que versiones antiguas
     desvincularon al eliminar una entrega. No presume que tareas no vinculadas
@@ -2934,6 +3023,58 @@ def delivery_catalog_admin_ui():
                             st.success('Catálogo actualizado.');st.rerun()
                         except (ValueError,sqlite3.IntegrityError,requests.RequestException) as exc:
                             st.error(str(exc))
+            # Botón independiente de Eliminar entregable: resetea solo el
+            # contador de versiones eliminadas y jamás borra el catálogo.
+            with connection() as con:
+                highest_row=con.execute('SELECT highest FROM version_counters WHERE delivery_code=?',
+                                        (item['code'],)).fetchone()
+                has_versions=bool(con.execute('SELECT 1 FROM versions WHERE delivery_code=?',
+                                               (item['code'],)).fetchone())
+                active_delivery=con.execute('SELECT id,version FROM deliverables WHERE code=?',
+                                            (item['code'],)).fetchone()
+                active=bool(active_delivery and str(active_delivery['version'] or '').strip())
+                has_files=False
+                if active_delivery:
+                    did=int(active_delivery['id'])
+                    has_files=any(bool(con.execute(f'SELECT 1 FROM {table} WHERE delivery_id=? LIMIT 1',
+                                                (did,)).fetchone())
+                                  for table in ('delivery_documents','drive_files','delivery_files'))
+            blocked=has_versions or active or has_files
+            last_number=int(highest_row['highest']) if highest_row else 0
+            if st.button('🔄 Restablecer versiones',key=f'cat_reset_open_{item["id"]}',
+                         disabled=blocked,help='Reiniciar a V01 solo cuando no existan versiones ni archivos asociados'):
+                st.session_state[f'catalog_reset_open_{item["id"]}']=True
+            if blocked:
+                st.caption('Restablecer versiones estará disponible cuando se hayan eliminado '
+                           'todas las versiones y archivos del entregable.')
+            if st.session_state.get(f'catalog_reset_open_{item["id"]}') and not blocked:
+                with st.container(border=True):
+                    st.warning(f'¿Restablecer {item["code"]} a V01? Contador anterior: V{last_number:02d}. '
+                               'No se eliminarán la programación ni sus tareas. Se limpiarán '
+                               'metadatos locales huérfanos de versiones eliminadas, incluidas '
+                               'observaciones antiguas. Los archivos físicos de Google Drive no se modificarán.')
+                    confirm_reset=st.checkbox(f'Confirmo reiniciar la numeración de {item["code"]}',
+                                              key=f'cat_reset_confirm_{item["id"]}')
+                    yes,no=st.columns(2)
+                    with yes:
+                        if st.button('Confirmar reinicio a V01',type='primary',
+                                     key=f'cat_reset_btn_{item["id"]}',
+                                     disabled=not confirm_reset,use_container_width=True):
+                            try:
+                                backup=backup_database()
+                                code_reset,old_reset=reset_catalog_version_counter(item['id'])
+                                st.session_state.pop(f'catalog_reset_open_{item["id"]}',None)
+                                st.success(f'{code_reset}: la próxima versión será V01 '
+                                           f'(contador anterior V{old_reset:02d}). '
+                                           f'Respaldo: {os.path.basename(backup)}')
+                                st.rerun()
+                            except (ValueError,PermissionError,sqlite3.Error,OSError) as exc:
+                                st.error(f'No se pudo restablecer el contador: {exc}')
+                    with no:
+                        if st.button('Cancelar',key=f'cat_reset_cancel_{item["id"]}',
+                                     use_container_width=True):
+                            st.session_state.pop(f'catalog_reset_open_{item["id"]}',None)
+                            st.rerun()
             # Botón visible dentro de cada tarjeta. Confirmación en dos pasos.
             # Los documentos/archivos de Google Drive nunca se eliminan desde aquí.
             if item['registered']:
@@ -3686,8 +3827,8 @@ def task_badge_count(user_id,role):
         else:
             # Administrador: resumen de las tareas abiertas de toda la cartera.
             rows=con.execute('SELECT id,due_date FROM tasks').fetchall()
-    submitted=task_ids_with_submitted_delivery()
-    return sum(task_signal(r['due_date'],int(r['id']) in submitted)!='green' for r in rows)
+    stages=task_delivery_stages()
+    return sum(task_card_stage(r['due_date'],stages.get(int(r['id'])))[0]!='green' for r in rows)
 
 
 def badge_number(count):
