@@ -2830,17 +2830,10 @@ def task_review_controls(delivery_id):
             if version and task_reviewer_permission_ui(tid):
                 options=[x for x in DELIVERY_STATES if x!='Pendiente']
                 current=item.get('status') or 'En desarrollo'
-                state=st.selectbox('Cambiar estado de '+item['code'],options,
+                state=st.selectbox('Estado de '+item['code'],options,
                     index=options.index(current) if current in options else 0,
-                    key=f'task_review_status_{delivery_id}_{tid}')
-                manual=st.checkbox('Calificar avance manualmente',
-                    value=item.get('grade') is not None,
-                    key=f'task_review_grade_enable_{delivery_id}_{tid}')
+                    key=f'task_review_status_{delivery_id}_{tid}',label_visibility='collapsed')
                 grade=None
-                if manual:
-                    default=int(item['grade']) if item.get('grade') is not None else 50
-                    grade=st.number_input('Avance evaluado (%)',min_value=0,max_value=100,
-                        value=default,step=5,key=f'task_review_grade_{delivery_id}_{tid}')
                 note=''
                 if state in OBSERVATION_STATES:
                     note=st.text_area('Observaciones de '+item['code']+' *',
@@ -2961,6 +2954,9 @@ def card_browser(module, frame, allow_version_edit=True, show_heading=True):
         status_text=str(r.get('status') or 'Sin estado')
         code=str(r.get('code') or '')
         subtitle=' · '.join(str(r.get(k)) for k in ('project_code','specialty','version') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip())
+        if module=='Entregables':
+            base_name=str(r.get('name') or 'Sin nombre')
+            title=(code+' — '+base_name) if code else base_name
         if module=='Proyectos':
             card_key=f'gp_project_card_{int(r["id"])}'
         elif module=='Entregables':
@@ -2971,10 +2967,17 @@ def card_browser(module, frame, allow_version_edit=True, show_heading=True):
         with st.container(border=True,key=card_key):
             st.markdown(f'**{escape(title)}**')
             if module=='Entregables':
-                label={'yellow':'En seguimiento','red':'Sin cambios por más de 3 días',
-                       'green':'En seguimiento de revisión'}[signal]
-                st.caption('● '+label+' · Estado actual: '+status_text)
-            st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
+                due_val=r.get('due_date')
+                actual_val=r.get('actual_date')
+                date_parts=[]
+                if due_val is not None and pd.notna(due_val) and str(due_val).strip():
+                    date_parts.append('Fecha de Presentación Final: '+escape(str(due_val)))
+                if actual_val is not None and pd.notna(actual_val) and str(actual_val).strip():
+                    date_parts.append('Fecha de entregable: '+escape(str(actual_val)))
+                if date_parts:
+                    st.caption(' · '.join(date_parts))
+            elif subtitle:
+                st.caption(f'{escape(code)}  ·  {escape(subtitle)}')
             st.markdown(f'**Estado actual:** {escape(status_text)}')
             if module=='Entregables':
                 delivery_id=int(r['id'])
@@ -2984,7 +2987,10 @@ def card_browser(module, frame, allow_version_edit=True, show_heading=True):
                 with st.expander('Historial anterior del entregable',expanded=False):
                     show_delivery_reviews(code,role=st.session_state.get('role'))
             cols=st.columns(2)
-            details=[k for k in ('owner','reviewer','manager','due_date','actual_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
+            detail_keys=('owner','reviewer','manager','due_date','actual_date','priority','progress','% Avance','Riesgo calculado','client','role','email')
+            if module=='Entregables':
+                detail_keys=tuple(k for k in detail_keys if k not in ('owner','reviewer','due_date','actual_date'))
+            details=[k for k in detail_keys if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
             for idx,k in enumerate(details):
                 with cols[idx%2]:st.caption(f'{labels.get(k,k)}: {r[k]}')
             with st.expander('Ver detalles'+(' y versiones' if module=='Entregables' else '')):
