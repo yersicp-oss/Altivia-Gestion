@@ -2477,7 +2477,8 @@ def task_cards(frame):
             project_info=' · '.join(s for s in (project_name, f'Cliente: {client_name}' if client_name else '') if s)
             if project_info:
                 st.caption('🏗️ '+project_info)
-            st.markdown(f'**Estado:** {status}')
+            # El estado administrativo de la tarea se conserva en SQLite,
+            # pero en la tarjeta basta con el semáforo de seguimiento superior.
             cols=st.columns(2)
             with cols[0]:
                 st.markdown('**Responsables**')
@@ -2489,12 +2490,9 @@ def task_cards(frame):
             with dates[0]:st.caption(f'Fecha de inicio: {start}')
             with dates[1]:st.caption(f'Fecha de término: {due}')
             with st.expander('Ver detalles'):
+                # Resumen limpio: el modo de cálculo sigue operando internamente.
                 details=[('ID Proyecto','project_code'),('Entregable relacionado','delivery_code'),
-                         ('Especialidad','specialty'),('Avance (%)','progress'),
-                         ('Cálculo de avance','Modo de avance'),
-                         ('Avance automático de referencia (%)','Avance automático (%)'),
-                         ('Prioridad','priority'),('Fecha actualización','updated_at'),
-                         ('Observaciones','notes')]
+                         ('Especialidad','specialty'),('Avance (%)','progress')]
                 for label,key in details:
                     value=r.get(key)
                     if value is not None and pd.notna(value) and str(value).strip():
@@ -3719,6 +3717,19 @@ def task_editor(data):
                             continue
                         raw=row.get(key)
                         if raw is not None and not isinstance(raw,(list,dict)) and pd.isna(raw):raw=None
+                        if key in ('status','priority','updated_at','notes'):
+                            # Campos retirados de la interfaz de Tareas.
+                            # En edición conservamos los valores históricos y las
+                            # observaciones previas: ocultar no significa borrar.
+                            if key=='status':
+                                vals[key]=raw or 'No iniciado'
+                            elif key=='priority':
+                                vals[key]=raw or 'Media'
+                            elif key=='updated_at':
+                                vals[key]=today_peru().isoformat()
+                            else:
+                                vals[key]=raw or ''
+                            continue
                         if key=='delivery_code':
                             vals[key]=form_input(key,label,kind,required,opt,raw,form_key,project_code=project)
                             continue
