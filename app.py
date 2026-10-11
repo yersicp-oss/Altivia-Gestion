@@ -3261,6 +3261,39 @@ def connection_project_rows():
         return [dict(r) for r in con.execute('SELECT code,name FROM projects ORDER BY code')]
 
 
+def consulta_my_deliverables(data):
+    """Historial de Consulta separado del formulario de registro.
+
+    Mantiene el mismo visualizador de registros, revisiones, observaciones,
+    documentos y versiones, con filtro server-side por usuario y proyecto.
+    """
+    if st.session_state.get('role') != 'Consulta':
+        st.error('Esta sección es exclusiva del usuario Consulta.')
+        return
+    st.title('📂 Mis entregables')
+    user_id=st.session_state.get('user_id')
+    if not user_id:
+        st.error('La sesión no está activa.')
+        return
+    # El filtro no procede de un selector del navegador; se deriva de las
+    # tareas/documentos asignados y de los permisos vigentes en SQLite.
+    allowed=consulta_delivery_codes(user_id)
+    projects=consulta_project_codes(user_id)
+    frame=data['Entregables']
+    visible=frame[
+        frame['code'].astype(str).isin(allowed)
+        & frame['project_code'].astype(str).isin(projects)
+    ].copy()
+    if visible.empty:
+        st.info('Todavía no tienes entregables registrados en tus proyectos autorizados. '
+                'Puedes presentar una nueva versión desde «Registrar entregable» o «Enviar tarea».')
+        return
+    # Reutiliza las tarjetas originales de Registros sin duplicar su lógica.
+    # Incluye búsqueda, filtros, estado actual, observaciones, historial,
+    # visualización y descarga de versiones y revisión cuando corresponda.
+    card_browser('Entregables',visible,allow_version_edit=False,show_heading=False)
+
+
 def delivery_editor(data):
     role=st.session_state.get('role')
     st.title('📑 Registrar entregable' if role=='Consulta' else '📑 Entregables')
@@ -4122,7 +4155,7 @@ def main():
             st.rerun()
         role=st.session_state.get('role')
         pages=(['Mis documentos','Mi cuenta'] if role=='Cliente' else
-               ['Proyectos','Plan de trabajo','Entregables','Versiones','Mi cuenta']
+               ['Proyectos','Plan de trabajo','Entregables','Mis entregables','Versiones','Mi cuenta']
                if role=='Consulta' else
                ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Versiones','Mi cuenta']
                if role=='Global' else
@@ -4143,6 +4176,8 @@ def main():
         st.warning(st.session_state.pop('consulta_submission_error'))
     data=decorate()
     if page=='Mis documentos':client_portal()
+    elif page=='Mis entregables' and st.session_state.get('role')=='Consulta':
+        consulta_my_deliverables(data)
     elif page=='Dashboard' and st.session_state.get('role') in ('Administrador','Global'):dashboard(data)
     elif page in SPECS and st.session_state.get('role')!='Cliente' and (
             page!='Control de cambios' or can_edit()) and (
