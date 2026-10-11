@@ -371,10 +371,10 @@ def _refresh_task_display(con, task_ids):
                     (labels['owner'],labels['reviewer'],task_id))
 
 
-def ensure_consulta_person(con,user_id,full_name,username):
-    """Crea o vincula Personal a una cuenta Consulta por ID; idempotente."""
+def ensure_member_person(con,user_id,full_name,username):
+    """Crea o vincula Personal para Consulta o Global por ID; idempotente."""
     account=con.execute('SELECT role FROM users WHERE id=?',(int(user_id),)).fetchone()
-    if not account or account['role']!='Consulta':return None
+    if not account or account['role'] not in ('Consulta','Global'):return None
     existing=con.execute('SELECT id,name FROM people WHERE user_id=?',(int(user_id),)).fetchone()
     if existing:
         new_name=_unique_person_name(con,full_name,username,existing['id'])
@@ -465,9 +465,9 @@ def initialize_auth():
                 con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES (?,?,?,?)',
                             ('admin','Administrador principal',hash_password(password),'Administrador'))
             else:return False
-        # Incorpora también las cuentas Consulta creadas antes de esta versión.
-        for user in con.execute("SELECT id,username,full_name FROM users WHERE role='Consulta'").fetchall():
-            ensure_consulta_person(con,user['id'],user['full_name'],user['username'])
+        # Migra fichas para cuentas Consulta y Global anteriores; idempotente.
+        for user in con.execute("SELECT id,username,full_name FROM users WHERE role IN ('Consulta','Global')").fetchall():
+            ensure_member_person(con,user['id'],user['full_name'],user['username'])
         # En instalaciones antiguas podía existir una tarea antes de crear su usuario.
         # Se enlaza solo cuando el nombre coincide exactamente con una ficha y
         # no existe aún una asignación de ese tipo. No se inventan asignaciones.
@@ -481,6 +481,7 @@ def initialize_auth():
                 if person:
                     con.execute('INSERT OR IGNORE INTO task_people(task_id,person_id,assignment_role) VALUES(?,?,?)',
                                 (task['id'],person['id'],role))
+        migrate_existing_task_project_grants(con)
     return True
 
 def can_edit():
@@ -691,9 +692,9 @@ def update_user_by_admin(target_id,username,full_name,role,active,new_password='
         # Cambiar el nombre visible o el usuario no invalida la sesión existente.
         if new_password or role!=previous['role'] or bool(active)!=bool(previous['active']):
             con.execute('DELETE FROM remembered_sessions WHERE user_id=?',(target_id,))
-        if role=='Consulta':
-            ensure_consulta_person(con,target_id,full_name,username)
-        if project_ids is not None or role!='Consulta':
+        if role in ('Consulta','Global'):
+            ensure_member_person(con,target_id,full_name,username)
+        if project_ids is not None or role not in ('Consulta','Global'):
             set_consulta_project_access(con,target_id,project_ids or [])
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Usuarios',username,f'Perfil editado por Administrador ID {actor}'))
@@ -725,7 +726,7 @@ def update_own_profile(username,full_name,current_password):
         conflict=con.execute('SELECT id FROM users WHERE lower(username)=? AND id<>?',(username,actor)).fetchone()
         if conflict:raise ValueError('El nombre de usuario ya está registrado. Elige otro.')
         con.execute('UPDATE users SET username=?,full_name=? WHERE id=?',(username,full_name,actor))
-        ensure_consulta_person(con,actor,full_name,username)
+        ensure_member_person(con,actor,full_name,username)
         con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
                     ('Mi cuenta',username,'Datos personales actualizados'))
     st.session_state['username']=username
@@ -829,6 +830,46 @@ def save_document_assignments(document_id,owners,reviewers):
         con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
                     ('Checklist',str(document_id),'Asignaciones de documento actualizadas'))
 
+def grant_project_for_assigned_task(con, task_id):
+    """Autoriza el proyecto a usuarios Consulta/Global asignados a esta tarea.
+
+    Los permisos manuales previos no se reemplazan. La vinculación Global solo
+    sirve para indicar su participación: Global sigue viendo todos los proyectos.
+    Se invoca dentro de la misma transacción que guarda responsables/revisores.
+    """
+    task=con.execute('''SELECT t.code,p.id AS project_id
+        FROM tasks t JOIN projects p ON p.code=t.project_code
+        WHERE t.id=?''',(int(task_id),)).fetchone()
+    if not task:return 0
+    participants=con.execute('''SELECT DISTINCT u.id,u.username
+        FROM task_people tp JOIN people pe ON pe.id=tp.person_id
+        JOIN users u ON u.id=pe.user_id
+        WHERE tp.task_id=? AND u.role IN ('Consulta','Global') AND u.active=1''',
+        (int(task_id),)).fetchall()
+    grants=0
+    for participant in participants:
+        cur=con.execute('''INSERT OR IGNORE INTO consulta_project_access(user_id,project_id)
+            VALUES(?,?)''',(int(participant['id']),int(task['project_id'])))
+        if cur.rowcount:
+            grants+=1
+            con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                ('Usuarios',participant['username'],
+                 f'Acceso al proyecto otorgado por tarea {task["code"]}'))
+    return grants
+
+
+def migrate_existing_task_project_grants(con):
+    """Única vez: asignaciones existentes, sin restaurar permisos revocados manualmente."""
+    con.execute('''CREATE TABLE IF NOT EXISTS internal_migrations (
+        name TEXT PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+    migration='project_acl_from_task_assignments_oct_2026'
+    if con.execute('SELECT 1 FROM internal_migrations WHERE name=?',(migration,)).fetchone():
+        return
+    for task in con.execute('SELECT DISTINCT task_id FROM task_people').fetchall():
+        grant_project_for_assigned_task(con,task['task_id'])
+    con.execute('INSERT OR IGNORE INTO internal_migrations(name) VALUES(?)',(migration,))
+
+
 def set_consulta_project_access(con, user_id, project_ids):
     """Actualiza solo accesos de un usuario, validando rol e IDs en el servidor."""
     require_admin()
@@ -836,8 +877,9 @@ def set_consulta_project_access(con, user_id, project_ids):
     ids={int(i) for i in project_ids}
     account=con.execute('SELECT role FROM users WHERE id=?',(user_id,)).fetchone()
     if not account:raise ValueError('El usuario seleccionado no existe.')
-    if account['role']!='Consulta':
-        # Los roles Cliente y Administrador no usan este permiso.
+    if account['role'] not in ('Consulta','Global'):
+        # Global puede almacenar referencias de proyecto, sin limitar su vista.
+        # Administrador y Cliente no utilizan esta asociación.
         con.execute('DELETE FROM consulta_project_access WHERE user_id=?',(user_id,))
         return
     if ids:
@@ -849,7 +891,7 @@ def set_consulta_project_access(con, user_id, project_ids):
     con.executemany('INSERT INTO consulta_project_access(user_id,project_id) VALUES(?,?)',
                     [(user_id,i) for i in sorted(ids)])
     con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
-                ('Usuarios',str(user_id),f'Proyectos visibles Consulta actualizados: {len(ids)}'))
+                ('Usuarios',str(user_id),f'Proyectos vinculados actualizados: {len(ids)}'))
 
 
 def project_permission_options():
@@ -885,9 +927,9 @@ def user_management():
             name=st.text_input('Nombre completo').strip()
             role=st.selectbox('Rol',['Consulta','Global','Cliente','Administrador'])
             password=st.text_input('Contraseña inicial (mínimo 6 caracteres)',type='password')
-            initial_projects=st.multiselect('Proyectos visibles (aplica solo a Consulta)',project_ids,
+            initial_projects=st.multiselect('Proyectos vinculados (Consulta: acceso; Global: referencia)',project_ids,
                 format_func=lambda i:project_labels[i],key='new_consulta_project_grants',
-                help='Selecciona uno o varios proyectos. Si no seleccionas ninguno, Consulta no verá proyectos en ese apartado.')
+                help='Consulta necesita acceso para visualizar un proyecto. Global ve todos, aunque aquí solo se muestran los vinculados; al asignar una tarea, el acceso se añade automáticamente.')
             if st.form_submit_button('Crear usuario',type='primary'):
                 try:
                     username=normalized_username(username)
@@ -896,8 +938,8 @@ def user_management():
                     with connection() as con:
                         cursor=con.execute('INSERT INTO users(username,full_name,password_hash,role) VALUES(?,?,?,?)',
                                     (username,name,hash_password(password),role))
-                        if role=='Consulta':
-                            ensure_consulta_person(con,cursor.lastrowid,name,username)
+                        if role in ('Consulta','Global'):
+                            ensure_member_person(con,cursor.lastrowid,name,username)
                         set_consulta_project_access(con,cursor.lastrowid,initial_projects)
                     st.success('Usuario creado.');st.rerun()
                 except sqlite3.IntegrityError:st.error('El nombre de usuario ya existe.')
@@ -921,10 +963,10 @@ def user_management():
                     new_role=st.selectbox('Rol',allowed_roles,index=allowed_roles.index(str(r['role'])))
                     active=st.checkbox('Cuenta activa',value=bool(r['active']))
                     reset=st.text_input('Nueva contraseña (opcional; dejar vacío para conservar)',type='password')
-                    edited_projects=st.multiselect('Proyectos que este usuario Consulta puede visualizar',project_ids,
+                    edited_projects=st.multiselect('Proyectos vinculados a este usuario (Consulta / Global)',project_ids,
                         default=[i for i in project_ids if i in selected_projects],
                         format_func=lambda i:project_labels[i],key=f'edit_consulta_project_grants_{selected}',
-                        help='Solo aplica si el rol es Consulta. Sin proyectos asignados, el apartado Proyectos estará vacío.')
+                        help='La asignación de tareas agrega aquí automáticamente su proyecto. Para Consulta determina el acceso; Global tiene acceso general aunque no esté listado.')
                     save=st.form_submit_button('💾 Guardar cambios',type='primary')
                 if save:
                     try:
@@ -1945,6 +1987,7 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 [(record_id,int(pid),'Responsable') for pid in set(owners)] +
                 [(record_id,int(pid),'Revisor') for pid in set(reviewers)])
             con.execute('INSERT OR IGNORE INTO task_people_migration(task_id) VALUES(?)',(record_id,))
+            grant_project_for_assigned_task(con,record_id)
         if module=='Entregables':
             if registering_version or (was_update and can_edit() and selected_task is not None):
                 stored=con.execute('SELECT id FROM deliverables WHERE code=?',(values['code'],)).fetchone()
@@ -2814,8 +2857,6 @@ def delivery_editor(data):
     if action=='Editar registro actual' and rid:
         st.info('Para reemplazar documentos existentes usa «Ver detalles y versiones». Aquí puedes agregar más documentos.')
     optional_docs=bool(rid and action=='Editar registro actual')
-    how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
-        max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
     # Fuera de st.form para que las asignaciones se actualicen al elegir tarea.
     st.text_input('Nombre del entregable',value=catalog['name'],disabled=True,
                   key=f'{form_key}_delivery_name')
@@ -2861,6 +2902,11 @@ def delivery_editor(data):
         st.info('Selecciona un ID Tarea para completar automáticamente la actividad, responsables y revisores.')
         if not linked:
             st.warning('No hay tareas vinculadas disponibles. Vincula una tarea a este entregable desde Plan de trabajo.')
+    st.markdown('#### 📎 Documentos de '+version)
+    st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
+    # El número permanece fuera del formulario para mostrar nuevos campos al instante.
+    how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
+        max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
     with st.form(f'{form_key}_form'):
         vals={'project_code':project,'code':code,'name':catalog['name'],
               'specialty':catalog['specialty'] or '','version':version,'due_date':due.isoformat(),
@@ -2877,8 +2923,6 @@ def delivery_editor(data):
             if key=='status' and action=='Registrar nueva versión':old='Pendiente'
             if key in ('review_date','correction_date','approval_date') and action=='Registrar nueva versión':old=None
             vals[key]=form_input(key,label+(' *' if required else ''),kind,required,opt,old,form_key)
-        st.markdown('#### 📎 Documentos de '+version)
-        st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
         entries=[]
         for i in range(how_many):
             with st.container(border=True):
@@ -2931,7 +2975,7 @@ def delivery_editor(data):
 
 def task_editor(data):
     """Crea tareas con código automático y edita desde cada ficha de Registros."""
-    st.title('Plan de trabajo')
+    st.title('Tareas')
     admin=can_edit()
     _,fields=SPECS['Plan de trabajo']
     if admin:
@@ -2994,7 +3038,7 @@ def task_editor(data):
                         default_owners,default_reviewers=set(),set()
                     def person_label(pid):
                         person=labels[pid]
-                        account=' · Usuario Consulta' if person.get('account_role')=='Consulta' else ''
+                        account=(' · Usuario '+str(person['account_role']) if person.get('account_role') in ('Consulta','Global') else '')
                         return str(person['name'])+account
                     owner_ids=st.multiselect('Responsables * (uno o varios)',all_person_ids,
                         default=[i for i in all_person_ids if i in default_owners],
@@ -3003,7 +3047,7 @@ def task_editor(data):
                         default=[i for i in all_person_ids if i in default_reviewers],
                         format_func=person_label,key=f'task_reviewers_{rid}_{project}')
                     if not all_person_ids:
-                        st.warning('Agrega Personal o crea un usuario Consulta para asignar tareas.')
+                        st.warning('Agrega Personal o crea un usuario Consulta/Global para asignar tareas.')
                     st.caption('Los usuarios Consulta solo verán actividades donde son responsables o revisores.')
                     save,cancel=st.columns([2,1])
                     with save:
@@ -3423,6 +3467,34 @@ def setup_style():
     
     </style>''',unsafe_allow_html=True)
 
+def task_badge_count(user_id,role):
+    """Tareas con tarjeta amarilla o roja visibles para la cuenta actual."""
+    if role=='Cliente':return 0
+    with connection() as con:
+        if role in ('Consulta','Global'):
+            # El Global ve TODAS las tareas en el módulo, pero el contador indica
+            # SOLO las que tiene personalmente asignadas como responsable/revisor.
+            rows=con.execute('''SELECT DISTINCT t.id,t.due_date FROM tasks t
+                JOIN task_people tp ON tp.task_id=t.id
+                JOIN people pe ON pe.id=tp.person_id
+                JOIN users u ON u.id=pe.user_id
+                WHERE u.id=? AND u.role=? AND u.active=1''',
+                (int(user_id),role)).fetchall()
+        else:
+            # Administrador: resumen de las tareas abiertas de toda la cartera.
+            rows=con.execute('SELECT id,due_date FROM tasks').fetchall()
+    submitted=task_ids_with_submitted_delivery()
+    return sum(task_signal(r['due_date'],int(r['id']) in submitted)!='green' for r in rows)
+
+
+def badge_number(count):
+    """Dígitos dentro de un círculo para la etiqueta del menú Streamlit."""
+    if count == 0:return '⓿'
+    if 1 <= count <= 10:return '❶❷❸❹❺❻❼❽❾❿'[count-1]
+    if 11 <= count <= 20:return '⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'[count-11]
+    return f'🔴 {count}'
+
+
 def main():
     initialize();setup_style()
     if not initialize_auth():
@@ -3454,7 +3526,12 @@ def main():
                if role=='Global' else
                ['Dashboard','Proyectos','Plan de trabajo','Entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
         if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
-        page=st.radio('Navegación',pages)
+        remaining=task_badge_count(st.session_state['user_id'],role) if role!='Cliente' else 0
+        def nav_label(option):
+            if option=='Plan de trabajo':return 'Tareas  '+badge_number(remaining)
+            if option=='Entregables' and role=='Consulta':return 'Registrar entrega'
+            return option
+        page=st.radio('Navegación',pages,format_func=nav_label)
         st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
     data=decorate()
     if page=='Mis documentos':client_portal()
