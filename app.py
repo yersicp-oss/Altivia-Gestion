@@ -558,7 +558,7 @@ def require_admin():
 
 
 def can_create_deliverable():
-    return st.session_state.get('role') in ('Administrador','Consulta')
+    return st.session_state.get('role') in ('Administrador','Consulta','Global')
 
 
 def _password_fingerprint(stored_hash):
@@ -840,6 +840,31 @@ def consulta_delivery_codes(user_id):
             JOIN users u ON u.id=pe.user_id AND u.active=1 AND u.role='Consulta' ''',
             (int(user_id),int(user_id))).fetchall()
     return {str(row['code']) for row in rows}.union(str(r['code']) for r in docs)
+
+
+
+def global_delivery_codes(user_id):
+    """Entregables que Global puede PRESENTAR: tarea como Responsable activo.
+
+    Global puede LEER toda la cartera, pero esta autorización específica nunca
+    puede derivarse de su acceso general a proyectos o de ser solo Revisor.
+    """
+    with connection() as con:
+        rows=con.execute("""SELECT DISTINCT c.code
+            FROM deliverable_catalog c
+            JOIN tasks t ON t.project_code=c.project_code AND t.delivery_code=c.code
+            JOIN task_people tp ON tp.task_id=t.id AND tp.assignment_role='Responsable'
+            JOIN people pe ON pe.id=tp.person_id AND pe.user_id=?
+            JOIN users u ON u.id=pe.user_id AND u.role='Global' AND u.active=1""",
+            (int(user_id),)).fetchall()
+    return {str(row['code']) for row in rows}
+
+
+def user_delivery_submission_codes(user_id, role):
+    """Conjunto permitido para registrar una NUEVA versión, no para ver."""
+    if role=='Consulta':return consulta_delivery_codes(user_id)
+    if role=='Global':return global_delivery_codes(user_id)
+    return set()
 
 
 def consulta_document_ids(user_id):
@@ -1396,15 +1421,15 @@ def docs_for_version(delivery_id, version):
 
 def register_document(delivery_id, version, title, actor_role=None):
     role=actor_role or st.session_state.get('role')
-    if role not in ('Administrador','Consulta'):
+    if role not in ('Administrador','Consulta','Global'):
         raise PermissionError('No tienes permiso para registrar documentos.')
     title=str(title or '').strip()
     if not title:raise ValueError('Cada documento debe tener un nombre descriptivo.')
     with connection() as con:
-        if role=='Consulta':
+        if role in ('Consulta','Global'):
             row=con.execute('''SELECT d.code,d.project_code FROM deliverables d WHERE d.id=? AND d.version=?''',
                             (int(delivery_id),str(version))).fetchone()
-            if not row or row['code'] not in consulta_delivery_codes(st.session_state['user_id']):
+            if not row or row['code'] not in user_delivery_submission_codes(st.session_state['user_id'],role):
                 raise PermissionError('No puedes agregar documentos a una versión no autorizada.')
         count=con.execute('SELECT highest FROM document_serials WHERE delivery_id=? AND version=?',
                           (delivery_id,version)).fetchone()
@@ -1421,7 +1446,8 @@ def register_document(delivery_id, version, title, actor_role=None):
 
 
 def upload_document_file(upload, document_id, kind, allow_consulta=False):
-    if not can_edit() and not (allow_consulta and st.session_state.get('role')=='Consulta'):
+    role=st.session_state.get('role')
+    if not can_edit() and not (allow_consulta and role in ('Consulta','Global')):
         raise PermissionError('Solo el Administrador puede reemplazar documentos existentes.')
     if upload is None:return None
     with connection() as con:
@@ -1429,6 +1455,9 @@ def upload_document_file(upload, document_id, kind, allow_consulta=False):
              FROM delivery_documents doc JOIN deliverables d ON doc.delivery_id=d.id
              WHERE doc.id=?''',(document_id,)).fetchone()
     if not row:raise ValueError('Documento no encontrado.')
+    if not can_edit():
+        if row['code'] not in user_delivery_submission_codes(st.session_state.get('user_id'),role):
+            raise PermissionError('Ya no eres responsable de una tarea autorizada para esta entrega.')
     raw=upload.getvalue()
     ext=upload.name.rsplit('.',1)[-1].lower() if '.' in upload.name else ''
     if not raw or len(raw)>DRIVE_LIMIT:raise ValueError('Archivo vacío o mayor de 25 MB.')
@@ -1888,17 +1917,23 @@ def preview_task_code(project_code):
         return task_code_for_project(project_code,con)
 
 
-def linked_delivery_tasks(project_code,delivery_code,user_id=None):
-    """Tareas del mismo entregable; Consulta ve solo sus asignaciones."""
+def linked_delivery_tasks(project_code,delivery_code,user_id=None,actor_role='Consulta'):
+    """Tareas del entregable; Global solo presenta si es Responsable."""
     with connection() as con:
         params=[str(project_code),str(delivery_code)]
         where='t.project_code=? AND t.delivery_code=?'
         if user_id is not None:
+            if actor_role not in ('Consulta','Global'):
+                return []
             where+=""" AND EXISTS (
                 SELECT 1 FROM task_people tp JOIN people p ON p.id=tp.person_id
                 JOIN users u ON u.id=p.user_id
-                WHERE tp.task_id=t.id AND u.id=? AND u.role='Consulta' AND u.active=1)"""
-            params.append(int(user_id))
+                WHERE tp.task_id=t.id AND u.id=? AND u.role=? AND u.active=1"""
+            params.extend([int(user_id),actor_role])
+            if actor_role=='Global':
+                where+=" AND tp.assignment_role='Responsable'"
+            where+=')'
+
         rows=[dict(r) for r in con.execute(
             f"""SELECT t.id,t.code,t.activity,t.owner,t.reviewer FROM tasks t
                 WHERE {where} ORDER BY t.code""",params)]
@@ -1921,13 +1956,13 @@ def save_record(module,values,record_id=None,task_assignees=None):
     '''
     values=dict(values)
     was_update=(record_id is not None)
-    is_consulta=(st.session_state.get('role')=='Consulta')
-    consulta_delivery=(module=='Entregables' and is_consulta)
-    if not consulta_delivery:
+    role=st.session_state.get('role')
+    submission_delivery=(module=='Entregables' and role in ('Consulta','Global'))
+    if not submission_delivery:
         require_admin()
-    if consulta_delivery:
-        if str(values.get('code') or '') not in consulta_delivery_codes(st.session_state['user_id']):
-            raise PermissionError('No tienes acceso a este entregable: falta proyecto autorizado o tarea asignada.')
+    if submission_delivery:
+        if str(values.get('code') or '') not in user_delivery_submission_codes(st.session_state['user_id'],role):
+            raise PermissionError('No puedes presentar este entregable: necesitas una tarea autorizada como responsable.')
     if module=='Proyectos' and record_id is not None:
         return update_project_sync(values,record_id)
     table,fields=SPECS[module]
@@ -1988,11 +2023,11 @@ def save_record(module,values,record_id=None,task_assignees=None):
             registered=con.execute('SELECT * FROM deliverables WHERE code=?',(code,)).fetchone()
         if record_id is None and registered:
             raise ValueError('Este entregable ya tiene una versión. Actualiza la página antes de registrar otra.')
-        if consulta_delivery and record_id is not None:
+        if submission_delivery and record_id is not None:
             if not registered:raise ValueError('El entregable aún no existe.')
             expected=next_version(code,registered['version'])
             if str(values.get('version') or '')!=expected:
-                raise ValueError(f'Consulta solo puede registrar una nueva versión ({expected}); no editar versiones existentes.')
+                raise ValueError(f'Solo puedes registrar una nueva versión ({expected}); no editar versiones existentes.')
         if record_id is not None and (not registered or registered['id']!=record_id or registered['project_code']!=project):
             raise ValueError('No está permitido reasignar un entregable a otro proyecto.')
         values['code']=code
@@ -2023,17 +2058,18 @@ def save_record(module,values,record_id=None,task_assignees=None):
                 # de revisiones se almacena de modo independiente por versión.
                 for f in ('review_date','correction_date','approval_date'):
                     values[f]=registered[f]
-            elif consulta_delivery:
-                raise PermissionError('Consulta no puede editar versiones existentes.')
+            elif submission_delivery:
+                raise PermissionError('No puedes editar versiones existentes.')
         # task_id NO es un campo libre. Se valida nuevamente contra la BD.
         chosen_id=values.get('task_id')
         try:chosen_id=int(chosen_id) if chosen_id not in ('',None) else None
         except (TypeError,ValueError):raise ValueError('Selecciona un ID Tarea válido.')
-        if consulta_delivery and chosen_id is None:
+        if submission_delivery and chosen_id is None:
             raise ValueError('Selecciona una tarea vinculada a este entregable.')
         if chosen_id is not None:
             permitted=linked_delivery_tasks(project,code,
-                st.session_state['user_id'] if consulta_delivery else None)
+                st.session_state['user_id'] if submission_delivery else None,
+                actor_role=role)
             selected_task=next((t for t in permitted if int(t['id'])==chosen_id),None)
             if selected_task is None:
                 raise PermissionError('La tarea no pertenece al entregable o no estás asignado a ella.')
@@ -2061,7 +2097,7 @@ def save_record(module,values,record_id=None,task_assignees=None):
         if not values['code']:raise ValueError('El nombre es obligatorio.')
         values['name']=values['code']
     with connection() as con:
-        if consulta_delivery:
+        if submission_delivery:
             con.execute('BEGIN IMMEDIATE')
             live=con.execute('SELECT id,version,project_code FROM deliverables WHERE code=?',
                              (values['code'],)).fetchone()
@@ -3179,7 +3215,7 @@ def delivery_editor(data):
             delivery_catalog_admin_ui()
             st.divider()
     if role=='Global':
-        st.caption('Global: acceso de solo lectura a todos los entregables, sin asignación individual.')
+        st.caption('Global puede consultar toda la cartera. Para registrar una versión debes estar asignado como **Responsable** de una tarea vinculada al entregable.')
         with st.expander('📋 Entregables programados (incluye los que aún no tienen V01)'):
             rows=catalog_rows()
             if rows:
@@ -3190,26 +3226,39 @@ def delivery_editor(data):
                     'Estado': 'En desarrollo' if r['registered'] else 'Pendiente (sin versión)'
                 } for r in rows]),hide_index=True,use_container_width=True)
             else:st.info('No hay entregables programados todavía.')
-        card_browser('Entregables',data['Entregables'],allow_version_edit=False)
-        return
-    if not (admin or role=='Consulta'):
+    if not (admin or role in ('Consulta','Global')):
         st.error('Acceso restringido a Entregables.');return
-    st.subheader('Registrar entrega' if role=='Consulta' else 'Crear o editar una entrega')
-    if role=='Consulta':
+    st.subheader('Registrar entrega' if role in ('Consulta','Global') else 'Crear o editar una entrega')
+    if role in ('Consulta','Global'):
         st.info('Puedes registrar V01 y después V02, V03… para los entregables asignados. Cada versión anterior se conserva y no puede editarse desde Consulta.')
     projects=connection_project_rows()
-    if role=='Consulta':
-        allowed_projects=consulta_project_codes(st.session_state['user_id'])
-        projects=[pr for pr in projects if pr['code'] in allowed_projects]
+    if role in ('Consulta','Global'):
+        allowed_codes=user_delivery_submission_codes(st.session_state['user_id'],role)
+        if role=='Consulta':
+            allowed_projects=consulta_project_codes(st.session_state['user_id'])
+            projects=[pr for pr in projects if pr['code'] in allowed_projects]
+        else:
+            # Global ve todos en los Registros, pero el formulario solo ofrece
+            # proyectos con entregables asociados a tareas propias como Responsable.
+            with connection() as con:
+                allowed_projects={r['project_code'] for r in con.execute(
+                    'SELECT project_code FROM deliverable_catalog WHERE code IN ('+
+                    (','.join('?' for _ in allowed_codes) or "''")+')',tuple(allowed_codes))}
+            projects=[pr for pr in projects if pr['code'] in allowed_projects]
     if not projects:
-        st.warning('No hay proyectos registrados.');return
+        if role=='Global':
+            st.info('No tienes tareas como Responsable vinculadas a un entregable programado. '
+                    'Solicita al Administrador que relacione tu tarea con un ID Entregable.')
+            card_browser('Entregables',data['Entregables'],allow_version_edit=False)
+        else:
+            st.warning('No hay proyectos autorizados con entregables para presentar.')
+        return
     pn={p['code']:p['name'] for p in projects}
     project=st.selectbox('01 · ID Proyecto',list(pn),
         format_func=lambda code:f'{code} — {pn[code]}',key='new_delivery_project')
     cat=[r for r in catalog_rows() if r['project_code']==project]
-    if role=='Consulta':
-        allowed_deliveries=consulta_delivery_codes(st.session_state['user_id'])
-        cat=[r for r in cat if r['code'] in allowed_deliveries]
+    if role in ('Consulta','Global'):
+        cat=[r for r in cat if r['code'] in allowed_codes]
     with connection() as con:
         used={r['code']:dict(r) for r in con.execute('SELECT * FROM deliverables WHERE project_code=?',(project,))}
     if not cat:
@@ -3228,7 +3277,7 @@ def delivery_editor(data):
         st.caption('Estado actual: Pendiente · todavía no existe una versión presentada.')
     else:
         st.caption('Estado actual: '+str(existing.get('status') or 'En desarrollo'))
-    action='Registrar nueva versión' if (role=='Consulta' and rid) else 'Nuevo registro'
+    action='Registrar nueva versión' if (role in ('Consulta','Global') and rid) else 'Nuevo registro'
     if admin and rid:
         action=st.radio('Acción',['Editar registro actual','Registrar nueva versión'],horizontal=True,
             key=f'delivery_action_{code}')
@@ -3259,9 +3308,10 @@ def delivery_editor(data):
         delivery_date=today_peru().isoformat()
         st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),
                       disabled=True,format='DD/MM/YYYY',key=f'{form_key}_delivery_date')
-    # Solo tareas del proyecto y entregable; Consulta solo las suyas.
+    # Solo tareas del mismo entregable; Global solo las propias como Responsable.
     linked=linked_delivery_tasks(project,code,
-        st.session_state['user_id'] if role=='Consulta' else None)
+        st.session_state['user_id'] if role in ('Consulta','Global') else None,
+        actor_role=role)
     choices={int(t['id']):t for t in linked}
     saved_task=current.get('task_id') if existing else None
     current_task_id=int(saved_task) if saved_task and not pd.isna(saved_task) else None
@@ -3304,7 +3354,7 @@ def delivery_editor(data):
                 vals[key]=(current.get('status') or 'En desarrollo') if action=='Editar registro actual' else version_submitted_status(
                     current.get('status'),first_version=(rid is None))
                 continue
-            if role=='Consulta' and key in ('review_date','correction_date','approval_date'):
+            if role in ('Consulta','Global') and key in ('review_date','correction_date','approval_date'):
                 # La revisión, subsanación y aprobación se gestionan únicamente
                 # desde Administración: Consulta no debe completar estas fechas.
                 vals[key]=None
@@ -3325,12 +3375,12 @@ def delivery_editor(data):
                 entries.append((title,pdf,editable))
         if not drive_ready():st.warning('Google Drive no está autorizado; no podrás cargar archivos.')
         submitted=st.form_submit_button(
-            '💾 Registrar '+version if role=='Consulta' else ('💾 Registrar entrega' if not rid else '💾 Guardar cambios'),
+            '💾 Registrar '+version if role in ('Consulta','Global') else ('💾 Registrar entrega' if not rid else '💾 Guardar cambios'),
             type='primary')
     if submitted:
         try:
             if any(not name.strip() for name,_,_ in entries):raise ValueError('Escribe el nombre de cada documento.')
-            if role=='Consulta' and not any(pdf is not None or editable is not None for _,pdf,editable in entries):
+            if role in ('Consulta','Global') and not any(pdf is not None or editable is not None for _,pdf,editable in entries):
                 raise ValueError('Para registrar una nueva versión, adjunta por lo menos un archivo PDF o editable.')
             if any((pdf or editable) for _,pdf,editable in entries) and not drive_ready():
                 raise ValueError('Google Drive no está conectado. No se guardó el formulario.')
@@ -3346,13 +3396,13 @@ def delivery_editor(data):
                         raise ValueError(f'{f.name}: formato editable no admitido.')
             # El servidor también vuelve a calcular el estado automáticamente.
             # Revalidación de permisos y versión vigente dentro de save_record.
-            if role=='Consulta' and code not in consulta_delivery_codes(st.session_state['user_id']):
-                raise PermissionError('Ya no estás asignado a este entregable o proyecto.')
+            if role in ('Consulta','Global') and code not in user_delivery_submission_codes(st.session_state['user_id'],role):
+                raise PermissionError('Ya no tienes una tarea autorizada para presentar este entregable.')
             save_record('Entregables',vals,rid)
             with connection() as con:
                 stored=con.execute('SELECT id FROM deliverables WHERE code=?',(code,)).fetchone()
             numbers=attach_new_documents(int(stored['id']),version,entries,
-                                         consulta=(role=='Consulta'))
+                                         consulta=(role in ('Consulta','Global')))
             st.success('Entrega registrada. Documentos: '+', '.join(numbers));st.rerun()
         except (ValueError,PermissionError,sqlite3.IntegrityError,requests.RequestException) as exc:
             st.error(f'No se completó la operación: {exc}')
