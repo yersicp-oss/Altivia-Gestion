@@ -57,30 +57,36 @@ def task_ids_with_submitted_delivery():
 
 
 def task_delivery_stages():
-    """Estado real de la última versión vinculada a cada tarea.
-
-    Importante: las revisiones del entregable afectan solamente a la tarea
-    relacionada con su versión VIGENTE. Una versión borrada no da color verde.
-    """
+    """Última entrega/revisión de CADA tarea, sin heredar estado de tareas vecinas."""
     with connection() as con:
-        records=con.execute('''SELECT vt.task_id,vt.version,v.id AS version_id,
-                d.version AS current_version,d.status AS delivery_status
-            FROM delivery_version_tasks vt
-            JOIN deliverables d ON d.id=vt.delivery_id
-            JOIN versions v ON v.delivery_code=d.code AND v.version=vt.version
-            JOIN tasks t ON t.id=vt.task_id
-                AND t.project_code=d.project_code AND t.delivery_code=d.code
-            WHERE vt.task_id IS NOT NULL
-            ORDER BY v.id,vt.delivery_id''').fetchall()
-    stages={}
-    for row in records:
-        # La última versión efectiva prevalece, no el contador histórico.
-        stages[int(row['task_id'])]={
-            'version':str(row['version']),
-            'current_version':str(row['current_version'] or ''),
-            'status':str(row['delivery_status'] or ''),
-            'version_id':int(row['version_id'])}
-    return stages
+        rows=con.execute("""SELECT vi.task_id,vi.version,v.id AS version_id,
+                d.version AS current_version,d.status AS delivery_status,d.id AS delivery_id
+            FROM delivery_version_task_items vi
+            JOIN deliverables d ON d.id=vi.delivery_id
+            JOIN versions v ON v.delivery_code=d.code AND v.version=vi.version
+            JOIN tasks t ON t.id=vi.task_id AND t.project_code=d.project_code
+                AND t.delivery_code=d.code
+            ORDER BY v.id,vi.delivery_id""").fetchall()
+        latest={};submissions={}
+        for r in rows:
+            tid=int(r['task_id'])
+            submissions[tid]=submissions.get(tid,0)+1
+            latest[tid]=dict(r)
+        stages={}
+        for tid,r in latest.items():
+            ev=con.execute("""SELECT status,grade,id FROM task_review_events
+                WHERE delivery_id=? AND task_id=? AND version=?
+                ORDER BY id DESC LIMIT 1""",
+                (r['delivery_id'],tid,r['version'])).fetchone()
+            stages[tid]={
+                'version':str(r['version']),
+                'current_version':str(r['version']),
+                'status':str(ev['status'] if ev else r['delivery_status'] or ''),
+                'grade':ev['grade'] if ev else None,
+                'submission_count':submissions[tid],
+                'version_id':int(r['version_id']),
+                'delivery_id':int(r['delivery_id'])}
+        return stages
 
 
 def task_card_stage(due_date, linked_version=None, today=None):
@@ -98,8 +104,7 @@ def task_card_stage(due_date, linked_version=None, today=None):
             return 'green','Completada'
         if status=='Aprobado internamente':
             return 'green','Aprobación interna'
-        serial=re.fullmatch(r'V(\d+)',str(linked_version.get('version') or ''),re.I)
-        if serial and int(serial.group(1))>1:
+        if int(linked_version.get('submission_count') or 1)>1:
             return 'green','Entregado nuevamente'
         return 'green','Entrega registrada'
     color=task_signal(due_date,False,today=today)
@@ -121,9 +126,12 @@ def automatic_task_progress(linked_stage=None):
         return 0
     version=str(linked_stage.get('version') or '').upper()
     matched=re.fullmatch(r'V(\d+)',version)
-    number=int(matched.group(1)) if matched else 1
+    number=int(linked_stage.get('submission_count') or (int(matched.group(1)) if matched else 1))
     is_current=(version==str(linked_stage.get('current_version') or '').upper())
     status=str(linked_stage.get('status') or '').strip() if is_current else ''
+    grade=linked_stage.get('grade')
+    if grade is not None:
+        return max(0,min(100,int(grade)))
     if status in ('Aprobado','Entregado'):
         return 100
     if status in ('Aprobado internamente','Enviado al cliente'):
@@ -285,6 +293,31 @@ def initialize():
             author_name TEXT NOT NULL,
             created_at TEXT NOT NULL)''')
         con.execute('CREATE INDEX IF NOT EXISTS idx_delivery_reviews_code ON delivery_reviews(delivery_code,id DESC)')
+        # Revisión independiente por tarea: una versión puede contener varias tareas.
+        # Nunca se elimina ni altera el historial legado de entregables.
+        con.execute('''CREATE TABLE IF NOT EXISTS delivery_version_task_items (
+            delivery_id INTEGER NOT NULL REFERENCES deliverables(id) ON DELETE CASCADE,
+            version TEXT NOT NULL,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY(delivery_id,version,task_id))''')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_version_task_items_task ON delivery_version_task_items(task_id,version)')
+        con.execute('''CREATE TABLE IF NOT EXISTS document_tasks (
+            document_id INTEGER PRIMARY KEY REFERENCES delivery_documents(id) ON DELETE CASCADE,
+            task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL)''')
+        con.execute('''CREATE TABLE IF NOT EXISTS task_review_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_id INTEGER NOT NULL REFERENCES deliverables(id) ON DELETE CASCADE,
+            version TEXT NOT NULL,
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            status TEXT NOT NULL,
+            grade INTEGER,
+            observation TEXT,
+            author_id INTEGER,
+            author_name TEXT,
+            event_type TEXT NOT NULL CHECK(event_type IN ('presentacion','revision')),
+            created_at TEXT NOT NULL,
+            legacy_review_id INTEGER UNIQUE)''')
+        con.execute('CREATE INDEX IF NOT EXISTS idx_task_review_events_task ON task_review_events(task_id,id DESC)')
         # Los estados antiguos se traducen sin alterar documentos ni versiones.
         con.execute("UPDATE deliverables SET status='Observado' WHERE status='Con observaciones'")
         con.execute("UPDATE deliverables SET status='En desarrollo' WHERE status='En revisión interna'")
@@ -312,6 +345,41 @@ def initialize():
         con.execute('CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, version TEXT NOT NULL, registered_at TEXT NOT NULL, notes TEXT, UNIQUE(delivery_code,version))')
         con.execute('CREATE TABLE IF NOT EXISTS checklist (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_code TEXT NOT NULL, criterion TEXT NOT NULL, result TEXT NOT NULL DEFAULT "PENDIENTE", notes TEXT, UNIQUE(delivery_code,criterion))')
         con.execute('CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT DEFAULT CURRENT_TIMESTAMP, module TEXT, record_code TEXT, action TEXT)')
+        # Migración idempotente de vínculos históricos de una sola tarea.
+        con.execute('''INSERT OR IGNORE INTO delivery_version_task_items(delivery_id,version,task_id)
+            SELECT vt.delivery_id,vt.version,vt.task_id FROM delivery_version_tasks vt
+            JOIN versions v ON v.delivery_code=(SELECT code FROM deliverables WHERE id=vt.delivery_id)
+                AND v.version=vt.version
+            WHERE vt.task_id IS NOT NULL''')
+        historical=con.execute('''SELECT ti.delivery_id,ti.version,ti.task_id,d.status,
+            d.version AS current_version FROM delivery_version_task_items ti
+            JOIN deliverables d ON d.id=ti.delivery_id
+            JOIN versions v ON v.delivery_code=d.code AND v.version=ti.version''').fetchall()
+        for old in historical:
+            exists=con.execute('''SELECT 1 FROM task_review_events WHERE delivery_id=? AND version=?
+                AND task_id=? LIMIT 1''',(old['delivery_id'],old['version'],old['task_id'])).fetchone()
+            if not exists:
+                current=(old['version']==old['current_version'])
+                mapped=old['status'] if current else 'En desarrollo'
+                mapped={'Con observaciones':'Observado','En revisión interna':'En desarrollo'}.get(mapped,mapped)
+                con.execute('''INSERT INTO task_review_events
+                    (delivery_id,version,task_id,status,grade,observation,event_type,created_at)
+                    VALUES (?,?,?,?,NULL,NULL,'presentacion',?)''',
+                    (old['delivery_id'],old['version'],old['task_id'],mapped,peru_timestamp()))
+        # Las antiguas observaciones continúan visibles. Si eran de una versión
+        # ligada a una tarea única, se migran además al nuevo historial por tarea.
+        prior=con.execute('''SELECT r.*,d.id AS did,ti.task_id FROM delivery_reviews r
+            JOIN deliverables d ON d.code=r.delivery_code
+            JOIN delivery_version_task_items ti ON ti.delivery_id=d.id AND ti.version=r.version
+            WHERE (SELECT COUNT(*) FROM delivery_version_task_items x
+                   WHERE x.delivery_id=d.id AND x.version=r.version)=1''').fetchall()
+        for old in prior:
+            con.execute('''INSERT OR IGNORE INTO task_review_events
+                (delivery_id,version,task_id,status,grade,observation,author_id,author_name,
+                 event_type,created_at,legacy_review_id)
+                VALUES (?,?,?,?,?,?,?,?, 'revision',?,?)''',
+                (old['did'],old['version'],old['task_id'],old['status'],None,old['observation'],
+                 old['author_user_id'],old['author_name'],old['created_at'],old['id']))
         # Compatibilidad: conservar datos de instalaciones anteriores.
         con.execute('''CREATE TABLE IF NOT EXISTS delivery_files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -339,6 +407,14 @@ def initialize():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(delivery_id,version,doc_no),
             FOREIGN KEY(delivery_id) REFERENCES deliverables(id) ON DELETE CASCADE)''')
+        # En versiones antiguas, si existía una sola tarea asociada, vincular
+        # sus documentos a ella sin volver a subir los archivos en Google Drive.
+        con.execute('''INSERT OR IGNORE INTO document_tasks(document_id,task_id)
+            SELECT dd.id,vi.task_id FROM delivery_documents dd
+            JOIN delivery_version_task_items vi ON vi.delivery_id=dd.delivery_id
+                AND vi.version=dd.version
+            WHERE (SELECT COUNT(*) FROM delivery_version_task_items x
+                   WHERE x.delivery_id=dd.delivery_id AND x.version=dd.version)=1''')
         con.execute('''CREATE TABLE IF NOT EXISTS document_files (
             document_id INTEGER NOT NULL,
             kind TEXT NOT NULL CHECK(kind IN ('pdf','editable')),
@@ -1541,11 +1617,21 @@ def upload_document_file(upload, document_id, kind, allow_consulta=False):
 
 
 def attach_new_documents(delivery_id,version,entries,consulta=False):
-    """Cada entrada (título, PDF opcional, editable opcional) crea un DNN único."""
+    # Cada entrada incluye un ID de tarea opcional.
     result=[]
-    for title,pdf,editable in entries:
+    for entry in entries:
+        title,pdf,editable=entry[:3]
+        task_id=entry[3] if len(entry)>3 else None
         if not (str(title or '').strip() or pdf or editable):continue
         doc_id,number=register_document(delivery_id,version,title)
+        if task_id is not None:
+            with connection() as con:
+                permitted=con.execute('''SELECT 1 FROM delivery_version_task_items
+                    WHERE delivery_id=? AND version=? AND task_id=?''',
+                    (delivery_id,version,int(task_id))).fetchone()
+                if not permitted:raise PermissionError('El documento no puede vincularse a una tarea ajena a esta presentación.')
+                con.execute('INSERT INTO document_tasks(document_id,task_id) VALUES (?,?)',
+                            (doc_id,int(task_id)))
         result.append(number)
         for kind,item in (('pdf',pdf),('editable',editable)):
             if item:upload_document_file(item,doc_id,kind,allow_consulta=consulta)
@@ -1996,7 +2082,9 @@ def linked_delivery_tasks(project_code,delivery_code,user_id=None,actor_role='Co
                 JOIN users u ON u.id=p.user_id
                 WHERE tp.task_id=t.id AND u.id=? AND u.role=? AND u.active=1"""
             params.extend([int(user_id),actor_role])
-            if actor_role=='Global':
+            # La presentación de archivos requiere RESPONSABILIDAD, no basta
+            # con ser Revisor ni con visualizar el proyecto.
+            if actor_role in ('Consulta','Global'):
                 where+=" AND tp.assignment_role='Responsable'"
             where+=')'
 
@@ -2015,7 +2103,7 @@ def linked_delivery_tasks(project_code,delivery_code,user_id=None,actor_role='Co
     return rows
 
 
-def save_record(module,values,record_id=None,task_assignees=None,progress_override=None):
+def save_record(module,values,record_id=None,task_assignees=None,progress_override=None,delivery_task_ids=None):
     '''Guarda datos; en entregables el catálogo controla IDs y fecha final.
 
     El servidor aplica las mismas reglas aunque un usuario altere widgets locales.
@@ -2130,25 +2218,27 @@ def save_record(module,values,record_id=None,task_assignees=None,progress_overri
                     values[f]=registered[f]
             elif submission_delivery:
                 raise PermissionError('No puedes editar versiones existentes.')
-        # task_id NO es un campo libre. Se valida nuevamente contra la BD.
-        chosen_id=values.get('task_id')
-        try:chosen_id=int(chosen_id) if chosen_id not in ('',None) else None
-        except (TypeError,ValueError):raise ValueError('Selecciona un ID Tarea válido.')
-        if submission_delivery and chosen_id is None:
-            raise ValueError('Selecciona una tarea vinculada a este entregable.')
-        if chosen_id is not None:
-            permitted=linked_delivery_tasks(project,code,
-                st.session_state['user_id'] if submission_delivery else None,
-                actor_role=role)
-            selected_task=next((t for t in permitted if int(t['id'])==chosen_id),None)
-            if selected_task is None:
-                raise PermissionError('La tarea no pertenece al entregable o no estás asignado a ella.')
-            values['task_id']=chosen_id
-            values['owner']=selected_task['owners']
-            values['reviewer']=selected_task['reviewers']
-        else:
-            selected_task=None
-            values['task_id']=None
+        # Selección múltiple segura: cada tarea debe pertenecer al proyecto,
+        # entregable y grupo de responsables autorizados del actor.
+        if delivery_task_ids is None:
+            delivery_task_ids=([values['task_id']] if values.get('task_id') not in (None,'') else [])
+        try: chosen_ids=list(dict.fromkeys(int(v) for v in delivery_task_ids))
+        except (TypeError,ValueError):raise ValueError('Selecciona identificadores de tareas válidos.')
+        if submission_delivery and not chosen_ids:
+            raise ValueError('Selecciona por lo menos una tarea vinculada al entregable.')
+        permitted=linked_delivery_tasks(project,code,
+            st.session_state['user_id'] if submission_delivery else None,
+            actor_role=role)
+        task_lookup={int(t['id']):t for t in permitted}
+        if not set(chosen_ids).issubset(task_lookup):
+            raise PermissionError('Alguna tarea no pertenece a este entregable o no tienes autorización.')
+        chosen_id=chosen_ids[0] if chosen_ids else None
+        selected_task=task_lookup.get(chosen_id)
+        values['task_id']=chosen_id
+        values['owner']=', '.join(dict.fromkeys(
+            p.strip() for tid in chosen_ids for p in task_lookup[tid]['owners'].split(',') if p.strip()))
+        values['reviewer']=', '.join(dict.fromkeys(
+            p.strip() for tid in chosen_ids for p in task_lookup[tid]['reviewers'].split(',') if p.strip()))
         # Cada guardado/versión reinicia la antigüedad; la edición rápida solo el estado.
         values['last_modified_at']=peru_timestamp()
         registering_version=(record_id is None or
@@ -2236,8 +2326,30 @@ def save_record(module,values,record_id=None,task_assignees=None,progress_overri
                          selected_task['code'] if selected_task else '',
                          selected_task['activity'] if selected_task else '',
                          values.get('owner') or '',values.get('reviewer') or ''))
+            if registering_version:
+                stored=con.execute('SELECT id FROM deliverables WHERE code=?',(values['code'],)).fetchone()
+                did=int(stored['id'])
+                for tid in chosen_ids:
+                    con.execute('''INSERT OR IGNORE INTO delivery_version_task_items
+                        (delivery_id,version,task_id) VALUES (?,?,?)''',(did,values['version'],tid))
+                    previous=con.execute('''SELECT ev.status FROM task_review_events ev
+                        JOIN versions v ON v.delivery_code=? AND v.version=ev.version
+                        WHERE ev.task_id=? AND ev.delivery_id=? AND ev.version<>?
+                        ORDER BY v.id DESC,ev.id DESC LIMIT 1''',
+                        (values['code'],tid,did,values['version'])).fetchone()
+                    old_status=previous['status'] if previous else None
+                    new_status=version_submitted_status(old_status,first_version=(old_status is None))
+                    con.execute('''INSERT INTO task_review_events
+                        (delivery_id,version,task_id,status,grade,observation,author_id,author_name,
+                         event_type,created_at) VALUES (?,?,?,?,NULL,NULL,?,?, 'presentacion',?)''',
+                        (did,values['version'],tid,new_status,
+                         int(st.session_state.get('user_id') or 0),
+                         str(st.session_state.get('full_name') or ''),peru_timestamp()))
             con.execute('INSERT OR IGNORE INTO versions(delivery_code,version,registered_at,notes) VALUES (?,?,?,?)',
                 (values['code'],values['version'],date.today().isoformat(),'Versión registrada desde formulario'))
+            if registering_version and chosen_ids:
+                summary=aggregate_delivery_review_status(con,did)
+                con.execute('UPDATE deliverables SET status=? WHERE id=?',(summary,did))
             m=re.fullmatch(r'V(\d+)',str(values['version']).upper())
             if m:
                 con.execute('''INSERT INTO version_counters(delivery_code,highest) VALUES(?,?)
@@ -2360,7 +2472,7 @@ def reset_database_ui():
         try:
             path=backup_database()
             with connection() as con:
-                for table in ('task_counters','document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','task_people','task_people_migration','tasks','deliverables','deliverable_catalog','projects','people','audit'):
+                for table in ('task_review_events','document_tasks','delivery_version_task_items','task_counters','document_files','document_checklist','delivery_documents','document_serials','legacy_document_imports','drive_files','delivery_files','checklist','versions','version_counters','meetings','changes','task_people','task_people_migration','tasks','deliverables','deliverable_catalog','projects','people','audit'):
                     con.execute(f'DELETE FROM {table}')
                 if mode.startswith('Restablecimiento general'):
                     con.execute('DELETE FROM users WHERE id<>?',(st.session_state['user_id'],))
@@ -2547,6 +2659,205 @@ def reviewer_can_change_status(delivery_id, user_id=None, con=None):
     return bool(task_reviewer or doc_reviewer)
 
 
+def task_reviewer_permission(con, task_id, user_id=None):
+    # Autoriza por asignación REAL a la tarea.
+    tid=int(task_id)
+    row=con.execute('''SELECT t.id,t.code,t.activity,t.project_code,t.delivery_code,
+        d.id AS delivery_id FROM tasks t
+        JOIN deliverables d ON d.code=t.delivery_code AND d.project_code=t.project_code
+        WHERE t.id=?''',(tid,)).fetchone()
+    if not row:return None
+    role=st.session_state.get('role')
+    if role=='Administrador':return dict(row)
+    if role not in ('Consulta','Global'):return None
+    uid=int(user_id if user_id is not None else st.session_state.get('user_id') or 0)
+    valid=con.execute('SELECT 1 FROM users WHERE id=? AND role=? AND active=1',(uid,role)).fetchone()
+    if not valid:return None
+    if role=='Consulta':
+        ok=con.execute('''SELECT 1 FROM projects p
+            JOIN consulta_project_access pa ON pa.project_id=p.id
+            WHERE p.code=? AND pa.user_id=?''',(row['project_code'],uid)).fetchone()
+        if not ok:return None
+    assigned=con.execute('''SELECT 1 FROM task_people tp
+        JOIN people pe ON pe.id=tp.person_id AND pe.user_id=?
+        WHERE tp.task_id=? AND tp.assignment_role='Revisor' LIMIT 1''',(uid,tid)).fetchone()
+    doc_reviewer=con.execute('''SELECT 1 FROM document_tasks dt
+        JOIN document_people dp ON dp.document_id=dt.document_id AND dp.assignment_role='Revisor'
+        JOIN people pe ON pe.id=dp.person_id AND pe.user_id=?
+        WHERE dt.task_id=? LIMIT 1''',(uid,tid)).fetchone()
+    return dict(row) if assigned or doc_reviewer else None
+
+
+def task_review_rows(delivery_id):
+    # Incluye tareas programadas sin versión, para ver el progreso consolidado.
+    with connection() as con:
+        rows=[dict(r) for r in con.execute('''SELECT t.id,t.code,t.activity,t.owner,t.reviewer,
+            t.delivery_code FROM tasks t JOIN deliverables d
+            ON d.code=t.delivery_code AND d.project_code=t.project_code
+            WHERE d.id=? ORDER BY t.code''',(int(delivery_id),))]
+        for item in rows:
+            latest=con.execute('''SELECT vi.version FROM delivery_version_task_items vi
+                JOIN deliverables d ON d.id=vi.delivery_id
+                JOIN versions v ON v.delivery_code=d.code AND v.version=vi.version
+                WHERE vi.delivery_id=? AND vi.task_id=? ORDER BY v.id DESC LIMIT 1''',
+                (int(delivery_id),item['id'])).fetchone()
+            item['version']=str(latest['version']) if latest else None
+            if latest:
+                event=con.execute('''SELECT status,grade,observation,author_name,created_at
+                    FROM task_review_events WHERE delivery_id=? AND task_id=? AND version=?
+                    ORDER BY id DESC LIMIT 1''',
+                    (int(delivery_id),item['id'],latest['version'])).fetchone()
+                item.update(dict(event) if event else {'status':'En desarrollo','grade':None})
+            else:item.update({'status':'Pendiente','grade':None})
+    return rows
+
+
+def aggregate_delivery_review_status(con,delivery_id):
+    # No aprobar un entregable si alguna tarea del catálogo sigue abierta.
+    task_ids=[int(r[0]) for r in con.execute('''SELECT t.id FROM tasks t
+        JOIN deliverables d ON d.code=t.delivery_code AND d.project_code=t.project_code
+        WHERE d.id=?''',(int(delivery_id),))]
+    if not task_ids:return 'En desarrollo'
+    states=[]
+    for tid in task_ids:
+        row=con.execute('''SELECT ev.status FROM task_review_events ev
+            JOIN versions v ON v.version=ev.version
+            JOIN deliverables d ON d.id=ev.delivery_id AND d.code=v.delivery_code
+            JOIN delivery_version_task_items vi ON vi.delivery_id=ev.delivery_id
+                 AND vi.version=ev.version AND vi.task_id=ev.task_id
+            WHERE ev.delivery_id=? AND ev.task_id=?
+            ORDER BY v.id DESC,ev.id DESC LIMIT 1''',(int(delivery_id),tid)).fetchone()
+        states.append(str(row['status']) if row else 'Pendiente')
+    if 'Observado por cliente' in states:return 'Observado por cliente'
+    if 'Observado' in states:return 'Observado'
+    if all(x=='Entregado' for x in states):return 'Entregado'
+    if all(x in ('Aprobado','Entregado') for x in states):return 'Aprobado'
+    if all(x in ('Aprobado internamente','Enviado al cliente','Aprobado','Entregado') for x in states):
+        return 'Enviado al cliente' if all(x in ('Enviado al cliente','Aprobado','Entregado') for x in states) else 'Aprobado internamente'
+    if 'Corregido' in states:return 'Corregido'
+    if 'En corrección' in states:return 'En corrección'
+    return 'En desarrollo'
+
+
+def update_task_review(task_id,new_status,grade=None,observation=''):
+    # Registra evaluación por tarea y versión, con control de permisos.
+    if new_status not in DELIVERY_STATES or new_status=='Pendiente':
+        raise ValueError('Selecciona un estado válido.')
+    note=str(observation or '').strip()
+    if new_status in OBSERVATION_STATES and not note:
+        raise ValueError('Escribe las observaciones de esta tarea antes de guardar.')
+    if grade is not None:
+        try:grade=int(grade)
+        except (TypeError,ValueError):raise ValueError('Porcentaje de avance inválido.')
+        if not 0<=grade<=100:raise ValueError('El avance debe estar entre 0 y 100 %.')
+        if grade==100 and new_status not in ('Aprobado','Entregado'):
+            raise ValueError('El 100 % solo corresponde a una tarea aprobada o entregada.')
+        if new_status in ('Aprobado','Entregado') and grade!=100:
+            raise ValueError('Una tarea aprobada o entregada debe tener 100 % de avance.')
+    with connection() as con:
+        con.execute('BEGIN IMMEDIATE')
+        task=task_reviewer_permission(con,task_id)
+        if not task:raise PermissionError('Solo el Administrador o el revisor asignado puede evaluar esta tarea.')
+        did=task['delivery_id'];tid=int(task_id)
+        latest=con.execute('''SELECT vi.version FROM delivery_version_task_items vi
+            JOIN deliverables d ON d.id=vi.delivery_id
+            JOIN versions v ON v.delivery_code=d.code AND v.version=vi.version
+            WHERE vi.delivery_id=? AND vi.task_id=? ORDER BY v.id DESC LIMIT 1''',
+            (did,tid)).fetchone()
+        if not latest:raise ValueError('La tarea todavía no tiene una versión presentada.')
+        author=int(st.session_state.get('user_id') or 0)
+        con.execute('''INSERT INTO task_review_events(delivery_id,version,task_id,status,grade,
+            observation,author_id,author_name,event_type,created_at)
+            VALUES(?,?,?,?,?,?,?,?, 'revision',?)''',
+            (did,latest['version'],tid,new_status,grade,note or None,author,
+             str(st.session_state.get('full_name') or st.session_state.get('username') or 'Revisor'),
+             peru_timestamp()))
+        total=aggregate_delivery_review_status(con,did)
+        con.execute('UPDATE deliverables SET status=?,last_modified_at=? WHERE id=?',
+                    (total,peru_timestamp(),did))
+        con.execute('INSERT INTO audit(module,record_code,action) VALUES (?,?,?)',
+                    ('Evaluación de tarea',task['code'],
+                     f'{latest["version"]}: {new_status} · Avance '+(f'{grade} %' if grade is not None else 'automático')))
+    return True
+
+
+def show_task_review_history(task_id,limit=20):
+    with connection() as con:
+        rows=[dict(r) for r in con.execute('''SELECT ev.version,ev.status,ev.grade,ev.observation,
+            ev.author_name,ev.created_at,ev.event_type
+            FROM task_review_events ev JOIN deliverables d ON d.id=ev.delivery_id
+            JOIN versions v ON v.delivery_code=d.code AND v.version=ev.version
+            WHERE ev.task_id=? ORDER BY ev.id DESC LIMIT ?''',(int(task_id),int(limit)))]
+    comments=[r for r in rows if r['observation']]
+    if comments:
+        newest=comments[0]
+        st.warning('📝 Observaciones de '+escape(str(newest['version']))+' · '+
+            escape(str(newest['author_name'] or 'Revisor'))+'\n\n'+
+            escape(str(newest['observation'])).replace('\n','  \n'))
+    if rows:
+        with st.expander('🕘 Historial de evaluación de esta tarea'):
+            for r in rows:
+                st.markdown('**'+escape(r['version'])+' · '+escape(r['status'])+'**'+
+                    (' · '+str(r['grade'])+' %' if r['grade'] is not None else '')+
+                    ' · '+escape(str(r['author_name'] or 'Sistema')))
+                if r['observation']:st.write(r['observation'])
+                st.caption(str(r['created_at'])[:16])
+
+
+def task_review_controls(delivery_id):
+    rows=task_review_rows(delivery_id)
+    if not rows:
+        st.caption('Aún no hay tareas relacionadas con este entregable.');return
+    st.markdown('**Evaluación por tarea**')
+    progress_stages=task_delivery_stages()
+    with connection() as con:
+        overrides={int(r['id']):r['progress_override'] for r in con.execute('''SELECT id,progress_override
+            FROM tasks WHERE delivery_code=(SELECT code FROM deliverables WHERE id=?)''',
+            (int(delivery_id),))}
+    for item in rows:
+        tid=int(item['id']);version=item.get('version')
+        stage=progress_stages.get(tid)
+        automatic=automatic_task_progress(stage)
+        override=overrides.get(tid)
+        shown_progress=effective_task_progress(automatic,override)
+        with st.container(border=True):
+            st.markdown('**'+escape(item['code'])+' — '+escape(item['activity'])+'**')
+            st.caption('Versión: '+(version or 'Sin presentación')+
+                       ' · Estado: '+str(item.get('status') or 'Pendiente')+
+                       ' · Avance: '+str(shown_progress)+' %')
+            if override is not None:
+                st.caption('Avance fijado manualmente por Administrador. Esta cifra prevalece sobre la evaluación del revisor.')
+            if version and task_reviewer_permission_ui(tid):
+                options=[x for x in DELIVERY_STATES if x!='Pendiente']
+                current=item.get('status') or 'En desarrollo'
+                state=st.selectbox('Cambiar estado de '+item['code'],options,
+                    index=options.index(current) if current in options else 0,
+                    key=f'task_review_status_{delivery_id}_{tid}')
+                manual=st.checkbox('Calificar avance manualmente',
+                    value=item.get('grade') is not None,
+                    key=f'task_review_grade_enable_{delivery_id}_{tid}')
+                grade=None
+                if manual:
+                    default=int(item['grade']) if item.get('grade') is not None else 50
+                    grade=st.number_input('Avance evaluado (%)',min_value=0,max_value=100,
+                        value=default,step=5,key=f'task_review_grade_{delivery_id}_{tid}')
+                note=''
+                if state in OBSERVATION_STATES:
+                    note=st.text_area('Observaciones de '+item['code']+' *',
+                        key=f'task_review_note_{delivery_id}_{tid}',height=100)
+                if st.button('💾 Guardar evaluación',key=f'task_review_save_{delivery_id}_{tid}',
+                             use_container_width=True):
+                    try:
+                        update_task_review(tid,state,grade,note)
+                        st.success('Evaluación guardada');st.rerun()
+                    except (ValueError,PermissionError,sqlite3.Error) as exc:st.error(str(exc))
+            if version:show_task_review_history(tid)
+
+
+def task_reviewer_permission_ui(task_id):
+    with connection() as con:return bool(task_reviewer_permission(con,int(task_id)))
+
+
 def delivery_review_history(delivery_code,limit=25,for_client=False):
     with connection() as con:
         query='''SELECT r.*,u.username FROM delivery_reviews r
@@ -2667,29 +2978,11 @@ def card_browser(module, frame, allow_version_edit=True, show_heading=True):
             st.markdown(f'**Estado actual:** {escape(status_text)}')
             if module=='Entregables':
                 delivery_id=int(r['id'])
-                if reviewer_can_change_status(delivery_id):
-                    st.caption('Revisión habilitada: Administrador o revisor asignado')
-                    options=[x for x in DELIVERY_STATES if x!='Pendiente']
-                    selected_state=st.selectbox('Cambiar estado',options,
-                        index=options.index(status_text) if status_text in options else 0,
-                        key=f'quick_delivery_state_value_{delivery_id}')
-                    observation=''
-                    if selected_state in OBSERVATION_STATES:
-                        observation=st.text_area(
-                            'Observaciones internas *' if selected_state=='Observado' else 'Observaciones del cliente *',
-                            placeholder='Describe qué debe corregirse; quedará disponible para los participantes autorizados.',
-                            key=f'quick_delivery_note_{delivery_id}_{selected_state}',height=105)
-                    if st.button('💾 Guardar estado',key=f'quick_delivery_save_{delivery_id}',
-                                 use_container_width=True):
-                        try:
-                            changed=update_delivery_status(delivery_id,selected_state,observation)
-                            if changed:
-                                st.toast('Estado y observaciones guardados',icon='✅')
-                                st.rerun()
-                            else:st.info('El entregable ya tiene ese estado.')
-                        except (ValueError,PermissionError,sqlite3.Error) as exc:
-                            st.error(f'No se pudo actualizar el estado: {exc}')
-                show_delivery_reviews(code,role=st.session_state.get('role'))
+                task_review_controls(delivery_id)
+                # Las antiguas observaciones por entregable permanecen accesibles
+                # para registros migrados anteriores al control por tarea.
+                with st.expander('Historial anterior del entregable',expanded=False):
+                    show_delivery_reviews(code,role=st.session_state.get('role'))
             cols=st.columns(2)
             details=[k for k in ('owner','reviewer','manager','due_date','actual_date','priority','progress','% Avance','Riesgo calculado','client','role','email') if k in r and pd.notna(r.get(k)) and str(r.get(k)).strip()]
             for idx,k in enumerate(details):
@@ -2744,22 +3037,39 @@ def versions_for_delivery(code,allow_edit=False):
         version=ver['version'];vid=ver['id']
         docs=docs_for_version(did,version)
         with connection() as con:
-            version_task=con.execute('''SELECT task_code,activity,owners,reviewers
-                FROM delivery_version_tasks WHERE delivery_id=? AND version=?''',
-                (did,version)).fetchone()
+            version_tasks=[dict(t) for t in con.execute("""SELECT t.code,t.activity,
+                t.owner,t.reviewer,t.id FROM delivery_version_task_items vi
+                JOIN tasks t ON t.id=vi.task_id
+                WHERE vi.delivery_id=? AND vi.version=? ORDER BY t.code""",(did,version))]
+            doc_tasks={int(r['document_id']):dict(r) for r in con.execute("""SELECT dt.document_id,t.code,t.activity
+                FROM document_tasks dt JOIN tasks t ON t.id=dt.task_id
+                JOIN delivery_documents dd ON dd.id=dt.document_id
+                WHERE dd.delivery_id=? AND dd.version=?""",(did,version))}
         with st.container(border=True):
             st.markdown(f'**{escape(version)}** · {escape(str(ver["registered_at"]))}' +
                 (' · **Vigente**' if version==delivery['version'] else ''))
             st.caption((ver['notes'] or 'Sin descripción') if is_admin else f'{len(docs)} documento(s)')
-            if version_task and version_task['task_code']:
-                with st.expander('Tarea vinculada a esta versión'):
-                    st.markdown('**ID Tarea:** '+escape(str(version_task['task_code'])))
-                    st.markdown('**Actividad:** '+escape(str(version_task['activity'] or '—')))
-                    st.markdown('**Responsables:** '+escape(str(version_task['owners'] or '—')))
-                    st.markdown('**Revisores:** '+escape(str(version_task['reviewers'] or '—')))
+            if version_tasks:
+                with st.expander('Tareas incluidas en esta versión'):
+                    for task in version_tasks:
+                        st.markdown('**'+escape(task['code'])+' · '+escape(task['activity'])+'**')
+                        st.caption('Responsables: '+str(task['owner'] or '—')+
+                                   ' · Revisores: '+str(task['reviewer'] or '—'))
+                        with connection() as con:
+                            review=con.execute('''SELECT status,grade,observation,author_name,created_at
+                                FROM task_review_events WHERE delivery_id=? AND version=? AND task_id=?
+                                ORDER BY id DESC LIMIT 1''',(did,version,int(task['id']))).fetchone()
+                        if review:
+                            st.caption('Evaluación: '+str(review['status'])+
+                                (f" · {review['grade']} %" if review['grade'] is not None else ' · Avance automático'))
+                            if review['observation']:
+                                st.markdown('**Observación:** '+escape(str(review['observation'])))
             for d in docs:
                 with st.container(border=True):
                     st.markdown(f'**📄 {escape(d["doc_no"])} — {escape(d["title"])}**')
+                    if int(d['id']) in doc_tasks:
+                        st.caption('Tarea: '+escape(doc_tasks[int(d['id'])]['code'])+' · '+
+                                   escape(doc_tasks[int(d['id'])]['activity']))
                     document_preview_ui(d,allow_download=True,
                         allow_editable=(is_admin or version==latest_version),
                         prefix=f'version_{vid}')
@@ -2857,6 +3167,8 @@ def versions_for_delivery(code,allow_edit=False):
                             ids.update(r['file_id'] for r in con.execute('SELECT file_id FROM drive_files WHERE delivery_id=? AND version=?',(did,version)))
                         for fileid in ids:drive_delete_document(fileid)
                         with connection() as con:
+                            con.execute('DELETE FROM task_review_events WHERE delivery_id=? AND version=?',(did,version))
+                            con.execute('DELETE FROM delivery_version_task_items WHERE delivery_id=? AND version=?',(did,version))
                             con.execute('DELETE FROM delivery_documents WHERE delivery_id=? AND version=?',(did,version))
                             con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=?',(did,version))
                             con.execute('DELETE FROM delivery_files WHERE delivery_id=? AND version=?',(did,version))
@@ -3085,6 +3397,8 @@ def reset_catalog_version_counter(catalog_id):
             # Referencias que quedaron huérfanas al borrar V01/V02. Sin limpiar
             # podrían mezclarse con una nueva V01 o afectar su numeración D01.
             con.execute('DELETE FROM delivery_version_tasks WHERE delivery_id=?',(did,))
+            con.execute('DELETE FROM delivery_version_task_items WHERE delivery_id=?',(did,))
+            con.execute('DELETE FROM task_review_events WHERE delivery_id=?',(did,))
             con.execute('DELETE FROM document_serials WHERE delivery_id=?',(did,))
             con.execute('DELETE FROM legacy_document_imports WHERE delivery_id=?',(did,))
         con.execute('DELETE FROM delivery_reviews WHERE delivery_code=?',(code,))
@@ -3493,39 +3807,34 @@ def delivery_editor(data):
         delivery_date=today_peru().isoformat()
         st.date_input('Fecha de entregable',value=date.fromisoformat(delivery_date),
                       disabled=True,format='DD/MM/YYYY',key=f'{form_key}_delivery_date')
-    # Solo tareas del mismo entregable; Global solo las propias como Responsable.
+    # Una misma versión puede representar varias tareas; las tareas se validan
+    # nuevamente del lado servidor al guardar y al asociar cada documento.
     linked=linked_delivery_tasks(project,code,
         st.session_state['user_id'] if role in ('Consulta','Global') else None,
         actor_role=role)
     choices={int(t['id']):t for t in linked}
     saved_task=current.get('task_id') if existing else None
     current_task_id=int(saved_task) if saved_task and not pd.isna(saved_task) else None
-    default_task=current_task_id if current_task_id in choices else None
-    options=[None]+list(choices)
+    default_tasks=[current_task_id] if current_task_id in choices else []
     if quick_task:
         if int(quick_task['id']) not in choices:
             clear_consulta_task_submission()
             st.error('Ya no puedes presentar documentos vinculados a esta tarea.');return
-        options=[int(quick_task['id'])]
-        default_task=int(quick_task['id'])
-    task_id=st.selectbox('ID Tarea vinculada al entregable',options,
-        index=options.index(default_task) if default_task in options else 0,
-        format_func=lambda tid:choices[tid]['code'] if tid is not None else '— Seleccionar tarea —',
-        key=f'{form_key}_linked_task',disabled=bool(quick_task),
-        help='Solo muestra tareas asignadas a este entregable y al proyecto seleccionado.')
-    chosen=choices.get(task_id)
-    if chosen:
-        st.markdown('**Actividad:** '+escape(str(chosen['activity'] or 'Sin actividad')))
+        default_tasks=[int(quick_task['id'])]
+    selected_task_ids=st.multiselect('ID Tareas vinculadas al entregable',list(choices),
+        default=default_tasks,format_func=lambda tid:f"{choices[tid]['code']} — {choices[tid]['activity']}",
+        key=f'{form_key}_task_ids',
+        help='Selecciona una o varias tareas del mismo entregable. Solo puedes presentar tareas autorizadas.')
+    if selected_task_ids:
+        st.caption('Tareas incluidas: '+', '.join(choices[tid]['code'] for tid in selected_task_ids))
         if role!='Consulta':
-            cols=st.columns(2)
-            with cols[0]:st.text_area('Responsables (automático)',value=chosen['owners'] or 'Sin asignar',
-                                     disabled=True,key=f'{form_key}_owners_auto_{task_id}',height=75)
-            with cols[1]:st.text_area('Revisores (automático)',value=chosen['reviewers'] or 'Sin asignar',
-                                     disabled=True,key=f'{form_key}_reviewers_auto_{task_id}',height=75)
+            with st.expander('Equipo vinculado a las tareas seleccionadas'):
+                for tid in selected_task_ids:
+                    t=choices[tid]
+                    st.markdown(f"**{escape(t['code'])} · {escape(t['activity'])}**")
+                    st.caption(f"Responsables: {t['owners'] or 'Sin asignar'} · Revisores: {t['reviewers'] or 'Sin asignar'}")
     else:
-        st.info('Selecciona un ID Tarea para completar automáticamente la actividad, responsables y revisores.')
-        if not linked:
-            st.warning('No hay tareas vinculadas disponibles. Vincula una tarea a este entregable desde Plan de trabajo.')
+        st.info('Selecciona al menos una tarea para registrar esta presentación.')
     st.markdown('#### 📎 Documentos de '+version)
     if role!='Consulta':
         st.caption('Cada documento se guarda como D01, D02… con su PDF y editable opcional en Google Drive.')
@@ -3533,13 +3842,15 @@ def delivery_editor(data):
     # El número permanece fuera del formulario para mostrar nuevos campos al instante.
     how_many=st.number_input('Cantidad de documentos nuevos',min_value=0 if optional_docs else 1,
         max_value=10,value=0 if optional_docs else 1,key=f'document_count_{form_key}')
+    if len(selected_task_ids)>how_many and not optional_docs:
+        st.warning(f'Seleccionaste {len(selected_task_ids)} tareas. Sube al menos un documento por tarea; aumenta la cantidad de documentos.')
     with st.form(f'{form_key}_form'):
         vals={'project_code':project,'code':code,'name':catalog['name'],
               'specialty':catalog['specialty'] or '','version':version,'due_date':due.isoformat(),
               'actual_date':delivery_date,'file_path':current.get('file_path') or '',
-              'task_id':task_id,
-              'owner':chosen['owners'] if chosen else current.get('owner') or '',
-              'reviewer':chosen['reviewers'] if chosen else current.get('reviewer') or ''}
+              'task_id':selected_task_ids[0] if selected_task_ids else None,
+              'owner':current.get('owner') or '',
+              'reviewer':current.get('reviewer') or ''}
         for key,label,kind,required,opt in SPECS['Entregables'][1]:
             if key in ('project_code','code','name','specialty','version','due_date','actual_date','file_path','owner','reviewer'):continue
             if key=='status':
@@ -3573,20 +3884,27 @@ def delivery_editor(data):
                 pdf=st.file_uploader('PDF para visualizar',type=['pdf'],key=f'{form_key}_pdf_{i}')
                 editable=st.file_uploader('Editable (DWG, Word, Excel, IFC, RVT, ETABS, SAP2000 y SAFE)',
                     type=EDITABLE_EXTENSIONS,key=f'{form_key}_editable_{i}')
-                entries.append((title,pdf,editable))
+                doc_task=None
+                if len(selected_task_ids)==1:
+                    doc_task=selected_task_ids[0]
+                elif len(selected_task_ids)>1:
+                    doc_task=st.selectbox('Tarea correspondiente a este documento *',selected_task_ids,
+                        format_func=lambda tid:f"{choices[tid]['code']} — {choices[tid]['activity']}",
+                        key=f'{form_key}_doc_task_{i}')
+                entries.append((title,pdf,editable,doc_task))
         if not drive_ready():st.warning('Google Drive no está autorizado; no podrás cargar archivos.')
         submitted=st.form_submit_button(
             '💾 Registrar '+version if role in ('Consulta','Global') else ('💾 Registrar entrega' if not rid else '💾 Guardar cambios'),
             type='primary')
     if submitted:
         try:
-            if any(not name.strip() for name,_,_ in entries):raise ValueError('Escribe el nombre de cada documento.')
-            if role in ('Consulta','Global') and not any(pdf is not None or editable is not None for _,pdf,editable in entries):
+            if any(not name.strip() for name,*_ in entries):raise ValueError('Escribe el nombre de cada documento.')
+            if role in ('Consulta','Global') and not any(pdf is not None or editable is not None for _,pdf,editable,_ in entries):
                 raise ValueError('Para registrar una nueva versión, adjunta por lo menos un archivo PDF o editable.')
-            if any((pdf or editable) for _,pdf,editable in entries) and not drive_ready():
+            if any((pdf or editable) for _,pdf,editable,_ in entries) and not drive_ready():
                 raise ValueError('Google Drive no está conectado. No se guardó el formulario.')
             # Validación anterior al guardado para reducir operaciones parciales.
-            for _,pdf,editable in entries:
+            for _,pdf,editable,_ in entries:
                 for kind,f in (('pdf',pdf),('editable',editable)):
                     if f is None:continue
                     raw=f.getvalue();ext=f.name.rsplit('.',1)[-1].lower() if '.' in f.name else ''
@@ -3595,11 +3913,17 @@ def delivery_editor(data):
                         raise ValueError(f'{f.name}: PDF no válido.')
                     if kind=='editable' and ext not in EDITABLE_EXTENSIONS:
                         raise ValueError(f'{f.name}: formato editable no admitido.')
+            if role in ('Consulta','Global'):
+                covered={dt for _,pdf,editable,dt in entries if (pdf or editable) and dt is not None}
+                if not set(selected_task_ids).issubset(covered):
+                    raise ValueError('Adjunta al menos un documento para cada tarea incluida en la presentación.')
             # El servidor también vuelve a calcular el estado automáticamente.
             # Revalidación de permisos y versión vigente dentro de save_record.
             if role in ('Consulta','Global') and code not in user_delivery_submission_codes(st.session_state['user_id'],role):
                 raise PermissionError('Ya no tienes una tarea autorizada para presentar este entregable.')
-            save_record('Entregables',vals,rid)
+            if not selected_task_ids:
+                raise ValueError('Selecciona al menos una tarea vinculada.')
+            save_record('Entregables',vals,rid,delivery_task_ids=selected_task_ids)
             with connection() as con:
                 stored=con.execute('SELECT id FROM deliverables WHERE code=?',(code,)).fetchone()
             numbers=attach_new_documents(int(stored['id']),version,entries,
