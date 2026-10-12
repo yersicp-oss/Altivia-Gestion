@@ -4632,24 +4632,32 @@ def setup_style():
         box-shadow:0 -6px 22px rgba(5,33,63,.13)!important;
       }
       [class*="st-key-altivia_mobile_nav"] [data-testid="stHorizontalBlock"]{
-        gap:4px!important;align-items:center!important
+        display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;
+        align-items:stretch!important;justify-content:space-between!important;gap:6px!important;
       }
       [class*="st-key-altivia_mobile_nav"] [data-testid="column"]{
-        min-width:0!important;flex:1 1 0!important;width:25%!important
+        min-width:0!important;flex:1 1 0!important;width:0!important;max-width:none!important;
       }
+      [class*="st-key-altivia_mobile_nav"] [data-testid="column"] > div{width:100%!important}
+      [class*="st-key-altivia_mobile_nav"] .stButton{width:100%!important}
       [class*="st-key-altivia_mobile_nav"] :is(.stButton button,[data-testid="stPopover"] button){
-        min-height:48px!important;padding:6px 2px!important;
-        border-radius:10px!important;font-size:.72rem!important;
+        display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;
+        min-height:58px!important;padding:6px 4px!important;
+        border-radius:12px!important;font-size:.70rem!important;
         width:100%!important;border:1px solid transparent!important;
         background:transparent!important;color:#e9f1fc!important;
-        line-height:1.25!important;white-space:normal!important;
+        line-height:1.15!important;white-space:normal!important;gap:4px!important;
+        text-align:center!important;
+      }
+      [class*="st-key-altivia_mobile_nav"] :is(.stButton button,[data-testid="stPopover"] button) p{
+        text-align:center!important;line-height:1.15!important;margin:0 auto!important;
       }
       [class*="st-key-altivia_mobile_nav"] [class*="st-key-altivia_mobile_active_"] .stButton button{
         background:rgba(61,121,180,.16)!important;
         border-color:rgba(80,140,190,.29)!important;font-weight:750!important;
       }
       [data-testid="stAppViewContainer"] .main .block-container{
-        padding-bottom:calc(115px + env(safe-area-inset-bottom))!important;
+        padding-bottom:calc(88px + env(safe-area-inset-bottom))!important;
       }
     }
     @media(max-width:900px){
