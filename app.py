@@ -4544,6 +4544,22 @@ def setup_style():
       background:#305f8b!important;border-left:3px solid #95c7f1!important;
       color:#fff!important;font-weight:730!important
     }
+    /* Alinear SIEMPRE a la izquierda botones, iconos emoji y textos del menú.
+       Aplica a elementos activos, normales y en pantallas pequeñas. */
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] button{
+      display:flex!important;flex-direction:row!important;
+      justify-content:flex-start!important;align-items:center!important;
+      text-align:left!important;gap:6px!important;
+      padding-left:12px!important;padding-right:8px!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] button [data-testid="stMarkdownContainer"]{
+      display:block!important;width:100%!important;flex:1 1 auto!important;
+      text-align:left!important;margin:0!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] button [data-testid="stMarkdownContainer"] :is(p,span,strong,small){
+      text-align:left!important;margin-left:0!important;margin-right:0!important;
+      justify-content:flex-start!important;
+    }
     [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_logout"] .stButton>button{
       background:transparent!important;color:#ffd6d6!important;
       border:1px solid rgba(250,190,190,.21)!important;
@@ -4554,9 +4570,6 @@ def setup_style():
     }
     .altivia-sidebar-footer{color:#aac5e2;font-size:.72rem;
       padding:5px 9px 13px;opacity:.85}
-    [class*="st-key-altivia_mobile_header"]{display:none!important}
-    .altivia-mobile-header{display:none}
-    [class*="st-key-altivia_mobile_nav"]{display:none!important}
     /* Los KPI usan colores explícitos, sin depender del tema claro/oscuro del móvil. */
     .altivia-kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:14px 0 20px}
     .altivia-kpi-card{background:#eff4fa;color:#142c49!important;border:1px solid #d4e0eb;
@@ -4615,49 +4628,11 @@ def setup_style():
       padding:10px 12px!important;
     }
     .block-container{padding-top:1.5rem}
-    /* En teléfonos: barra de accesos rápidos, conservando el menú lateral de Streamlit. */
+    /* Móvil: navegación únicamente en el menú lateral nativo de Streamlit.
+       Sin barra inferior fija ni relleno extra para ella. */
     @media(max-width:767px){
-      [class*="st-key-altivia_mobile_header"]{display:block!important}
-      .altivia-mobile-header{display:flex;align-items:center;justify-content:space-between;
-        border:1px solid rgba(90,140,187,.18);border-radius:12px;
-        padding:9px 12px;margin-bottom:13px;background:rgba(72,126,178,.07)}
-      .altivia-mobile-title{font-size:.9rem;font-weight:800;color:inherit}
-      .altivia-mobile-role{font-size:.73rem;opacity:.7}
-      [class*="st-key-altivia_mobile_nav"]{
-        display:block!important;position:fixed!important;bottom:0!important;
-        left:0!important;right:0!important;z-index:990!important;
-        background:#102b4b!important;color:#e9f1fc!important;
-        padding:9px 8px calc(9px + env(safe-area-inset-bottom))!important;
-        border-top:1px solid rgba(101,143,180,.35)!important;
-        box-shadow:0 -6px 22px rgba(5,33,63,.13)!important;
-      }
-      [class*="st-key-altivia_mobile_nav"] [data-testid="stHorizontalBlock"]{
-        display:flex!important;flex-direction:row!important;flex-wrap:nowrap!important;
-        align-items:stretch!important;justify-content:space-between!important;gap:6px!important;
-      }
-      [class*="st-key-altivia_mobile_nav"] [data-testid="column"]{
-        min-width:0!important;flex:1 1 0!important;width:0!important;max-width:none!important;
-      }
-      [class*="st-key-altivia_mobile_nav"] [data-testid="column"] > div{width:100%!important}
-      [class*="st-key-altivia_mobile_nav"] .stButton{width:100%!important}
-      [class*="st-key-altivia_mobile_nav"] :is(.stButton button,[data-testid="stPopover"] button){
-        display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;
-        min-height:58px!important;padding:6px 4px!important;
-        border-radius:12px!important;font-size:.70rem!important;
-        width:100%!important;border:1px solid transparent!important;
-        background:transparent!important;color:#e9f1fc!important;
-        line-height:1.15!important;white-space:normal!important;gap:4px!important;
-        text-align:center!important;
-      }
-      [class*="st-key-altivia_mobile_nav"] :is(.stButton button,[data-testid="stPopover"] button) p{
-        text-align:center!important;line-height:1.15!important;margin:0 auto!important;
-      }
-      [class*="st-key-altivia_mobile_nav"] [class*="st-key-altivia_mobile_active_"] .stButton button{
-        background:rgba(61,121,180,.16)!important;
-        border-color:rgba(80,140,190,.29)!important;font-weight:750!important;
-      }
-      [data-testid="stAppViewContainer"] .main .block-container{
-        padding-bottom:calc(88px + env(safe-area-inset-bottom))!important;
+      [data-testid="stSidebar"] [data-testid="stSidebarUserContent"]{
+        padding-top:1rem!important;
       }
     }
     @media(max-width:900px){
@@ -4793,42 +4768,6 @@ def render_sidebar_navigation(role,pages,remaining):
                     unsafe_allow_html=True)
 
 
-def mobile_primary_pages(role):
-    if role=='Consulta':return ['Proyectos','Plan de trabajo','Entregables']
-    if role=='Global':return ['Proyectos','Plan de trabajo','Entregables']
-    if role=='Administrador':return ['Dashboard','Proyectos','Plan de trabajo']
-    return ['Mis documentos','Mi cuenta']
-
-
-def render_mobile_navigation(role,pages,remaining):
-    current=st.session_state['altivia_navigation']
-    with st.container(key='altivia_mobile_header'):
-        st.markdown('<div class="altivia-mobile-header"><span class="altivia-mobile-title">GP ALTIVIA</span>'
-                    '<span class="altivia-mobile-role">'+escape(role)+'</span></div>',unsafe_allow_html=True)
-    tabs=[p for p in mobile_primary_pages(role) if p in pages]
-    with st.container(key='altivia_mobile_nav'):
-        cols=st.columns(4,gap='small')
-        for idx in range(3):
-            with cols[idx]:
-                if idx<len(tabs):
-                    page=tabs[idx]
-                    slug=re.sub(r'[^A-Za-z0-9]+','_',page).strip('_').lower()
-                    with st.container(key=('altivia_mobile_active_' if current==page else 'altivia_mobile_inactive_')+slug):
-                        st.button(navigation_title(page,role,remaining,compact=True),
-                            use_container_width=True,key='altivia_mob_tab_'+slug,
-                            on_click=navigate_altivia,args=(page,))
-        with cols[3]:
-            with st.popover('☰ Más',use_container_width=True):
-                st.caption('Navegación')
-                for page in pages:
-                    if page in tabs:continue
-                    slug=re.sub(r'[^A-Za-z0-9]+','_',page).strip('_').lower()
-                    st.button(navigation_title(page,role,remaining),key='altivia_mob_more_'+slug,
-                        use_container_width=True,on_click=navigate_altivia,args=(page,))
-                st.divider()
-                if st.button('↪ Cerrar sesión',key='altivia_mobile_logout',use_container_width=True):
-                    end_login_session();st.rerun()
-
 def main():
     initialize();setup_style()
     if not initialize_auth():
@@ -4852,7 +4791,6 @@ def main():
     remaining=task_badge_count(st.session_state['user_id'],role) if role!='Cliente' else 0
     with st.sidebar:
         render_sidebar_navigation(role,pages,remaining)
-    render_mobile_navigation(role,pages,remaining)
     page=st.session_state['altivia_navigation']
     if page=='Plan de trabajo' and st.session_state.get('consulta_submission_error'):
         st.warning(st.session_state.pop('consulta_submission_error'))
