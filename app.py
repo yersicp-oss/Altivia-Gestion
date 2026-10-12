@@ -19,7 +19,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title='ALTIVIA | Gestión de Proyectos', page_icon='🏗️', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='GP Altivia | Gestión de Proyectos', page_icon='🏗️', layout='wide', initial_sidebar_state='auto')
 ROOT=os.path.dirname(os.path.abspath(__file__))
 DB=os.environ.get('ALTIVIA_DB',os.path.join(ROOT,'altivia.db'))
 TODAY=date.today()
@@ -4503,16 +4503,60 @@ def export_xlsx(data):
 
 def setup_style():
     st.markdown('''<style>
-    [data-testid="stSidebar"]{background:#102b48}
-    [data-testid="stSidebar"] :is(p,span,label,h1,h2,h3){color:#f2f6fb!important}
-    /* Sidebar: botón de salida con contraste alto en todos los temas. */
-    [data-testid="stSidebar"] button[kind="secondary"],
-    [data-testid="stSidebar"] .stButton > button{
-      background:#eaf2fb!important;color:#102b48!important;
-      border:1px solid #acc7e3!important;border-radius:9px!important;
+    /* Navegación GP ALTIVIA: escritorio y el menú nativo de móvil. */
+    [data-testid="stSidebar"]{
+      background:linear-gradient(180deg,#102b4b 0%,#0c2540 100%)!important;
+      border-right:1px solid rgba(177,207,236,.16);
     }
-    [data-testid="stSidebar"] .stButton > button :is(p,span,div){color:#102b48!important}
-    [data-testid="stSidebar"] .stButton > button:hover{background:#cde3f8!important;color:#102b48!important}
+    [data-testid="stSidebar"] :is(p,span,label,h1,h2,h3){color:#e9f1fc!important}
+    [data-testid="stSidebar"] [data-testid="stSidebarUserContent"]{padding-top:1.45rem}
+    .altivia-brand{display:flex;align-items:center;gap:11px;margin:5px 0 22px}
+    .altivia-brand-icon{width:46px;height:46px;border-radius:13px;
+      display:flex;align-items:center;justify-content:center;font-size:23px;
+      background:#27527c;color:white;box-shadow:0 2px 13px rgba(0,0,0,.15)}
+    .altivia-brand-title{color:#fff;font-size:1.15rem;font-weight:780;letter-spacing:.015em;line-height:1.2}
+    .altivia-brand-sub{font-size:.72rem;color:#aac5e2;margin-top:4px;line-height:1.4}
+    .altivia-user-card{display:flex;align-items:center;gap:11px;
+      border:1px solid rgba(177,207,236,.14);background:rgba(131,176,214,.09);
+      border-radius:12px;padding:11px;margin-bottom:20px}
+    .altivia-avatar{width:40px;height:40px;flex:0 0 40px;background:#41678c;
+      border-radius:50%;display:flex;align-items:center;justify-content:center;
+      font-weight:800;color:#fff;font-size:.85rem}
+    .altivia-user-name{color:#fff;font-size:.86rem;line-height:1.35;font-weight:670;
+      overflow-wrap:anywhere}
+    .altivia-user-role{font-size:.73rem;color:#aac5e2;margin-top:3px}
+    .altivia-nav-section{font-size:.68rem;color:#97b6d5!important;
+      font-weight:750;letter-spacing:.1em;margin:19px 0 7px 9px}
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] .stButton>button{
+      background:transparent!important;color:#e4effb!important;
+      border:1px solid transparent!important;border-radius:10px!important;
+      text-align:left!important;justify-content:flex-start!important;
+      min-height:39px!important;padding:8px 10px!important;font-size:.87rem!important;
+      white-space:normal!important;line-height:1.3!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] .stButton>button :is(p,span){
+      color:inherit!important;text-align:left!important
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] .stButton>button:hover{
+      background:rgba(173,207,239,.14)!important;border-color:rgba(173,207,239,.14)!important
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_active_"] .stButton>button{
+      background:#305f8b!important;border-left:3px solid #95c7f1!important;
+      color:#fff!important;font-weight:730!important
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_logout"] .stButton>button{
+      background:transparent!important;color:#ffd6d6!important;
+      border:1px solid rgba(250,190,190,.21)!important;
+      border-radius:10px!important;min-height:40px!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_logout"] .stButton>button:hover{
+      background:rgba(220,94,94,.17)!important;
+    }
+    .altivia-sidebar-footer{color:#aac5e2;font-size:.72rem;
+      padding:5px 9px 13px;opacity:.85}
+    [class*="st-key-altivia_mobile_header"]{display:none!important}
+    .altivia-mobile-header{display:none}
+    [class*="st-key-altivia_mobile_nav"]{display:none!important}
     /* Los KPI usan colores explícitos, sin depender del tema claro/oscuro del móvil. */
     .altivia-kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:14px 0 20px}
     .altivia-kpi-card{background:#eff4fa;color:#142c49!important;border:1px solid #d4e0eb;
@@ -4571,6 +4615,43 @@ def setup_style():
       padding:10px 12px!important;
     }
     .block-container{padding-top:1.5rem}
+    /* En teléfonos: barra de accesos rápidos, conservando el menú lateral de Streamlit. */
+    @media(max-width:767px){
+      [class*="st-key-altivia_mobile_header"]{display:block!important}
+      .altivia-mobile-header{display:flex;align-items:center;justify-content:space-between;
+        border:1px solid rgba(90,140,187,.18);border-radius:12px;
+        padding:9px 12px;margin-bottom:13px;background:rgba(72,126,178,.07)}
+      .altivia-mobile-title{font-size:.9rem;font-weight:800;color:inherit}
+      .altivia-mobile-role{font-size:.73rem;opacity:.7}
+      [class*="st-key-altivia_mobile_nav"]{
+        display:block!important;position:fixed!important;bottom:0!important;
+        left:0!important;right:0!important;z-index:990!important;
+        background:#102b4b!important;color:#e9f1fc!important;
+        padding:9px 8px calc(9px + env(safe-area-inset-bottom))!important;
+        border-top:1px solid rgba(101,143,180,.35)!important;
+        box-shadow:0 -6px 22px rgba(5,33,63,.13)!important;
+      }
+      [class*="st-key-altivia_mobile_nav"] [data-testid="stHorizontalBlock"]{
+        gap:4px!important;align-items:center!important
+      }
+      [class*="st-key-altivia_mobile_nav"] [data-testid="column"]{
+        min-width:0!important;flex:1 1 0!important;width:25%!important
+      }
+      [class*="st-key-altivia_mobile_nav"] :is(.stButton button,[data-testid="stPopover"] button){
+        min-height:48px!important;padding:6px 2px!important;
+        border-radius:10px!important;font-size:.72rem!important;
+        width:100%!important;border:1px solid transparent!important;
+        background:transparent!important;color:#e9f1fc!important;
+        line-height:1.25!important;white-space:normal!important;
+      }
+      [class*="st-key-altivia_mobile_nav"] [class*="st-key-altivia_mobile_active_"] .stButton button{
+        background:rgba(61,121,180,.16)!important;
+        border-color:rgba(80,140,190,.29)!important;font-weight:750!important;
+      }
+      [data-testid="stAppViewContainer"] .main .block-container{
+        padding-bottom:calc(115px + env(safe-area-inset-bottom))!important;
+      }
+    }
     @media(max-width:900px){
       .altivia-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
       .altivia-kpi-card{padding:11px;min-height:84px}
@@ -4610,6 +4691,136 @@ def badge_number(count):
     return f'🔴 {count}'
 
 
+
+
+# Única lista autorizada por rol, compartida por escritorio y Android.
+def role_pages(role):
+    if role=='Cliente':
+        return ['Mis documentos','Mi cuenta']
+    if role=='Consulta':
+        return ['Proyectos','Plan de trabajo','Entregables','Mis entregables','Versiones','Mi cuenta']
+    if role=='Global':
+        return ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Versiones','Mi cuenta']
+    if role=='Administrador':
+        return ['Dashboard','Proyectos','Plan de trabajo','Entregables','Registro de entregables',
+                'Control de cambios','Personal','Checklist','Versiones','Mi cuenta',
+                'Administrar usuarios','Exportación y respaldo']
+    return []
+
+
+# Las etiquetas no alteran los nombres internos usados por los permisos ni las vistas.
+_NAV_ICONS={
+    'Dashboard':'📊','Proyectos':'📁','Plan de trabajo':'☑️','Entregables':'📤',
+    'Mis entregables':'📄','Registro de entregables':'📚','Control de cambios':'🔀',
+    'Personal':'👥','Checklist':'✅','Versiones':'🕘','Mi cuenta':'👤',
+    'Administrar usuarios':'🔐','Exportación y respaldo':'💾','Mis documentos':'📂'
+}
+
+
+def navigation_title(page,role,remaining=0,compact=False):
+    label=page
+    if page=='Plan de trabajo':
+        label='Tareas'
+    elif page=='Entregables' and role=='Consulta':
+        label='Registrar entregable'
+    if compact and page=='Entregables':label='Enviar' if role=='Consulta' else 'Entregables'
+    if compact and page=='Plan de trabajo':label='Tareas'
+    count=' '+badge_number(remaining) if page=='Plan de trabajo' else ''
+    return _NAV_ICONS.get(page,'•')+' '+label+count
+
+
+def sidebar_groups(role):
+    if role=='Cliente':
+        return [('DOCUMENTOS',['Mis documentos']),('CUENTA',['Mi cuenta'])]
+    if role=='Consulta':
+        return [('GESTIÓN',['Proyectos','Plan de trabajo']),
+                ('DOCUMENTOS',['Entregables','Mis entregables','Versiones']),
+                ('CUENTA',['Mi cuenta'])]
+    if role=='Global':
+        return [('GESTIÓN',['Dashboard','Proyectos','Plan de trabajo','Personal']),
+                ('DOCUMENTOS',['Entregables','Versiones']),('CUENTA',['Mi cuenta'])]
+    return [('GESTIÓN',['Dashboard','Proyectos','Plan de trabajo','Personal','Control de cambios']),
+            ('DOCUMENTOS',['Entregables','Registro de entregables','Checklist','Versiones']),
+            ('ADMINISTRACIÓN',['Administrar usuarios','Exportación y respaldo']),
+            ('CUENTA',['Mi cuenta'])]
+
+
+def navigate_altivia(page):
+    # Valida el destino también en las acciones de navegación, no solo en el menú.
+    if page not in role_pages(st.session_state.get('role')):
+        return
+    if st.session_state.get('altivia_navigation')!=page:
+        clear_consulta_task_submission()
+    st.session_state['altivia_navigation']=page
+
+
+def render_sidebar_navigation(role,pages,remaining):
+    display_name=str(st.session_state.get('full_name') or st.session_state.get('username') or 'Usuario')
+    initials=''.join(part[0].upper() for part in display_name.split()[:2]) or 'GP'
+    st.markdown('''<div class="altivia-brand">
+      <div class="altivia-brand-icon">🏗️</div>
+      <div><div class="altivia-brand-title">GP ALTIVIA</div>
+      <div class="altivia-brand-sub">Gestión de proyectos</div></div>
+      </div>''',unsafe_allow_html=True)
+    st.markdown('<div class="altivia-user-card"><div class="altivia-avatar">'+escape(initials)+
+                '</div><div><div class="altivia-user-name">'+escape(display_name)+
+                '</div><div class="altivia-user-role">'+escape(role)+'</div></div></div>',
+                unsafe_allow_html=True)
+    for category,items in sidebar_groups(role):
+        items=[name for name in items if name in pages]
+        if not items:continue
+        st.markdown('<div class="altivia-nav-section">'+escape(category)+'</div>',unsafe_allow_html=True)
+        for page in items:
+            slug=re.sub(r'[^A-Za-z0-9]+','_',page).strip('_').lower()
+            selected=st.session_state['altivia_navigation']==page
+            with st.container(key=('altivia_sidebar_nav_active_' if selected else 'altivia_sidebar_nav_')+slug):
+                st.button(navigation_title(page,role,remaining),use_container_width=True,
+                    key='altivia_sidebar_button_'+slug,on_click=navigate_altivia,args=(page,))
+    st.divider()
+    with st.container(key='altivia_sidebar_logout'):
+        if st.button('↪ Cerrar sesión',use_container_width=True,key='altivia_logout_sidebar'):
+            end_login_session();st.rerun()
+    if role=='Administrador':
+        st.markdown('<div class="altivia-sidebar-footer">🔒 Almacenamiento SQLite local</div>',
+                    unsafe_allow_html=True)
+
+
+def mobile_primary_pages(role):
+    if role=='Consulta':return ['Proyectos','Plan de trabajo','Entregables']
+    if role=='Global':return ['Proyectos','Plan de trabajo','Entregables']
+    if role=='Administrador':return ['Dashboard','Proyectos','Plan de trabajo']
+    return ['Mis documentos','Mi cuenta']
+
+
+def render_mobile_navigation(role,pages,remaining):
+    current=st.session_state['altivia_navigation']
+    with st.container(key='altivia_mobile_header'):
+        st.markdown('<div class="altivia-mobile-header"><span class="altivia-mobile-title">GP ALTIVIA</span>'
+                    '<span class="altivia-mobile-role">'+escape(role)+'</span></div>',unsafe_allow_html=True)
+    tabs=[p for p in mobile_primary_pages(role) if p in pages]
+    with st.container(key='altivia_mobile_nav'):
+        cols=st.columns(4,gap='small')
+        for idx in range(3):
+            with cols[idx]:
+                if idx<len(tabs):
+                    page=tabs[idx]
+                    slug=re.sub(r'[^A-Za-z0-9]+','_',page).strip('_').lower()
+                    with st.container(key=('altivia_mobile_active_' if current==page else 'altivia_mobile_inactive_')+slug):
+                        st.button(navigation_title(page,role,remaining,compact=True),
+                            use_container_width=True,key='altivia_mob_tab_'+slug,
+                            on_click=navigate_altivia,args=(page,))
+        with cols[3]:
+            with st.popover('☰ Más',use_container_width=True):
+                st.caption('Navegación')
+                for page in pages:
+                    if page in tabs:continue
+                    slug=re.sub(r'[^A-Za-z0-9]+','_',page).strip('_').lower()
+                    st.button(navigation_title(page,role,remaining),key='altivia_mob_more_'+slug,
+                        use_container_width=True,on_click=navigate_altivia,args=(page,))
+                st.divider()
+                if st.button('↪ Cerrar sesión',key='altivia_mobile_logout',use_container_width=True):
+                    end_login_session();st.rerun()
+
 def main():
     initialize();setup_style()
     if not initialize_auth():
@@ -4625,33 +4836,16 @@ def main():
             st.session_state['role']=current['role'];st.session_state['username']=current['username'];st.session_state['full_name']=current['full_name']
     if not st.session_state.get('user_id'):
         login_page();return
+    role=st.session_state.get('role')
+    pages=role_pages(role)
+    if st.session_state.get('altivia_navigation') not in pages:
+        st.session_state['altivia_navigation']=pages[0]
+        clear_consulta_task_submission()
+    remaining=task_badge_count(st.session_state['user_id'],role) if role!='Cliente' else 0
     with st.sidebar:
-        st.markdown('# ALTIVIA')
-        st.markdown('**GESTOR DE PROYECTOS**')
-        st.caption('Ingeniería · Consultoría · Planos')
-        st.caption(f"{st.session_state['full_name']} · {st.session_state['role']}")
-        if st.button('Cerrar sesión'):
-            end_login_session()
-            st.rerun()
-        role=st.session_state.get('role')
-        pages=(['Mis documentos','Mi cuenta'] if role=='Cliente' else
-               ['Proyectos','Plan de trabajo','Entregables','Mis entregables','Versiones','Mi cuenta']
-               if role=='Consulta' else
-               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Personal','Versiones','Mi cuenta']
-               if role=='Global' else
-               ['Dashboard','Proyectos','Plan de trabajo','Entregables','Registro de entregables','Control de cambios','Personal','Checklist','Versiones','Mi cuenta'])
-        if can_edit():pages+=['Administrar usuarios','Exportación y respaldo']
-        remaining=task_badge_count(st.session_state['user_id'],role) if role!='Cliente' else 0
-        def nav_label(option):
-            if option=='Plan de trabajo':return 'Tareas  '+badge_number(remaining)
-            if option=='Entregables' and role=='Consulta':return 'Registrar entregable'
-            return option
-        if st.session_state.get('altivia_navigation') not in pages:
-            st.session_state['altivia_navigation']=pages[0]
-            clear_consulta_task_submission()
-        page=st.radio('Navegación',pages,format_func=nav_label,
-            key='altivia_navigation',on_change=clear_consulta_task_submission)
-        st.divider();st.caption('🔒 Datos en SQLite local (altivia.db)')
+        render_sidebar_navigation(role,pages,remaining)
+    render_mobile_navigation(role,pages,remaining)
+    page=st.session_state['altivia_navigation']
     if page=='Plan de trabajo' and st.session_state.get('consulta_submission_error'):
         st.warning(st.session_state.pop('consulta_submission_error'))
     data=decorate()
