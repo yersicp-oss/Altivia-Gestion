@@ -4527,38 +4527,55 @@ def setup_style():
     .altivia-user-role{font-size:.73rem;color:#aac5e2;margin-top:3px}
     .altivia-nav-section{font-size:.68rem;color:#97b6d5!important;
       font-weight:750;letter-spacing:.1em;margin:19px 0 7px 9px}
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] .stButton>button{
-      background:transparent!important;color:#e4effb!important;
-      border:1px solid transparent!important;border-radius:10px!important;
-      text-align:left!important;justify-content:flex-start!important;
-      min-height:39px!important;padding:8px 10px!important;font-size:.87rem!important;
-      white-space:normal!important;line-height:1.3!important;
-    }
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] .stButton>button :is(p,span){
-      color:inherit!important;text-align:left!important
-    }
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] .stButton>button:hover{
-      background:rgba(173,207,239,.14)!important;border-color:rgba(173,207,239,.14)!important
-    }
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_active_"] .stButton>button{
-      background:#305f8b!important;border-left:3px solid #95c7f1!important;
-      color:#fff!important;font-weight:730!important
-    }
-    /* Alinear SIEMPRE a la izquierda botones, iconos emoji y textos del menú.
-       Aplica a elementos activos, normales y en pantallas pequeñas. */
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] button{
-      display:flex!important;flex-direction:row!important;
-      justify-content:flex-start!important;align-items:center!important;
-      text-align:left!important;gap:6px!important;
-      padding-left:12px!important;padding-right:8px!important;
-    }
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] button [data-testid="stMarkdownContainer"]{
-      display:block!important;width:100%!important;flex:1 1 auto!important;
-      text-align:left!important;margin:0!important;
-    }
-    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_"] button [data-testid="stMarkdownContainer"] :is(p,span,strong,small){
-      text-align:left!important;margin-left:0!important;margin-right:0!important;
+    /* Todos los enlaces del menú: activos e inactivos. Alineación al borde izquierdo. */
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav"] :is(.stButton, [data-testid="stButton"]) > button,
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav"] button {
+      display:flex!important;
+      flex-flow:row nowrap!important;
+      align-items:center!important;
       justify-content:flex-start!important;
+      text-align:left!important;
+      width:100%!important;
+      min-height:39px!important;
+      padding:8px 11px!important;
+      background:transparent!important;
+      color:#e4effb!important;
+      border:1px solid transparent!important;
+      border-radius:10px!important;
+      font-size:.87rem!important;
+      line-height:1.3!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav"] button > div,
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav"] button [data-testid="stMarkdownContainer"] {
+      display:flex!important;
+      flex-direction:row!important;
+      justify-content:flex-start!important;
+      align-items:center!important;
+      text-align:left!important;
+      flex:1 1 auto!important;
+      width:100%!important;
+      min-width:0!important;
+      margin:0!important;
+      padding:0!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav"] button :is(p,span,strong,small) {
+      text-align:left!important;
+      justify-content:flex-start!important;
+      margin:0!important;
+      padding:0!important;
+      white-space:normal!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav"] button:hover {
+      background:rgba(173,207,239,.14)!important;
+      border-color:rgba(173,207,239,.14)!important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_active_"] button,
+    [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_nav_active_"] .stButton > button {
+      background:#305f8b!important;
+      border-left:3px solid #95c7f1!important;
+      color:#fff!important;
+      font-weight:730!important;
+      padding-left:9px!important;
     }
     [data-testid="stSidebar"] [class*="st-key-altivia_sidebar_logout"] .stButton>button{
       background:transparent!important;color:#ffd6d6!important;
