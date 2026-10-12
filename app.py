@@ -3028,12 +3028,15 @@ def card_browser(module, frame, allow_version_edit=True, show_heading=True):
             for idx,k in enumerate(details):
                 with cols[idx%2]:st.caption(f'{labels.get(k,k)}: {r[k]}')
             with st.expander('Ver detalles'+(' y versiones' if module=='Entregables' else '')):
-                for k,label,_,_,_ in fields:
-                    v=r.get(k)
-                    if k not in details and k not in ('code','name','activity','description','status','file_path','drawing_code') and v is not None and pd.notna(v) and str(v).strip():
-                        st.markdown(f'**{label}:** {escape(str(v))}')
                 if module=='Entregables':
+                    # Muestra solo el bloque compacto de versiones; el resumen
+                    # con fechas y datos históricos no debe repetirse aquí.
                     versions_for_delivery(code,allow_edit=allow_version_edit and can_edit())
+                else:
+                    for k,label,_,_,_ in fields:
+                        v=r.get(k)
+                        if k not in details and k not in ('code','name','activity','description','status','file_path','drawing_code') and v is not None and pd.notna(v) and str(v).strip():
+                            st.markdown(f'**{label}:** {escape(str(v))}')
             if module=='Proyectos' and can_edit():
                 rid=int(r['id'])
                 with st.expander('✏️ Editar información del proyecto',expanded=False):
@@ -3077,10 +3080,6 @@ def versions_for_delivery(code,allow_edit=False):
         version=ver['version'];vid=ver['id']
         docs=docs_for_version(did,version)
         with connection() as con:
-            version_tasks=[dict(t) for t in con.execute("""SELECT t.code,t.activity,
-                t.owner,t.reviewer,t.id FROM delivery_version_task_items vi
-                JOIN tasks t ON t.id=vi.task_id
-                WHERE vi.delivery_id=? AND vi.version=? ORDER BY t.code""",(did,version))]
             doc_tasks={int(r['document_id']):dict(r) for r in con.execute("""SELECT dt.document_id,t.code,t.activity
                 FROM document_tasks dt JOIN tasks t ON t.id=dt.task_id
                 JOIN delivery_documents dd ON dd.id=dt.document_id
@@ -3088,144 +3087,141 @@ def versions_for_delivery(code,allow_edit=False):
         with st.container(border=True):
             st.markdown(f'**{escape(version)}** · {escape(str(ver["registered_at"]))}' +
                 (' · **Vigente**' if version==delivery['version'] else ''))
-            st.caption((ver['notes'] or 'Sin descripción') if is_admin else f'{len(docs)} documento(s)')
-            if version_tasks:
-                with st.expander('Tareas incluidas en esta versión'):
-                    for task in version_tasks:
-                        st.markdown('**'+escape(task['code'])+' · '+escape(task['activity'])+'**')
-                        st.caption('Responsables: '+str(task['owner'] or '—')+
-                                   ' · Revisores: '+str(task['reviewer'] or '—'))
-                        with connection() as con:
-                            review=con.execute('''SELECT status,grade,observation,author_name,created_at
-                                FROM task_review_events WHERE delivery_id=? AND version=? AND task_id=?
-                                ORDER BY id DESC LIMIT 1''',(did,version,int(task['id']))).fetchone()
-                        if review:
-                            st.caption('Evaluación: '+str(review['status'])+
-                                (f" · {review['grade']} %" if review['grade'] is not None else ' · Avance automático'))
-                            if review['observation']:
-                                st.markdown('**Observación:** '+escape(str(review['observation'])))
-            for d in docs:
-                with st.container(border=True):
-                    st.markdown(f'**📄 {escape(d["doc_no"])} — {escape(d["title"])}**')
-                    if int(d['id']) in doc_tasks:
-                        st.caption('Tarea: '+escape(doc_tasks[int(d['id'])]['code'])+' · '+
-                                   escape(doc_tasks[int(d['id'])]['activity']))
-                    document_preview_ui(d,allow_download=True,
-                        allow_editable=(is_admin or version==latest_version),
-                        prefix=f'version_{vid}')
-                    if is_admin:
-                        with st.expander(f'👥 Asignaciones del documento {d["doc_no"]} (Checklist)'):
-                            customized,(owners,reviewers)=document_assignments(d['id'])
-                            st.caption('Por defecto se heredan responsables y revisores de las tareas del entregable. '
-                                       'Al guardar una lista personalizada, el Checklist solo será visible para estas personas, '
-                                       'si además tienen acceso al proyecto.')
-                            roster=people_for_assignment()
-                            labels={int(p['id']):p['name'] for p in roster}
-                            with st.form(f'doc_assign_{d["id"]}'):
-                                selected_owners=st.multiselect('Responsables del documento',list(labels),
-                                    default=[i for i in labels if i in owners],
-                                    format_func=lambda i:labels[i],key=f'doc_assign_o_{d["id"]}')
-                                selected_reviewers=st.multiselect('Revisores del documento',list(labels),
-                                    default=[i for i in labels if i in reviewers],
-                                    format_func=lambda i:labels[i],key=f'doc_assign_r_{d["id"]}')
-                                if st.form_submit_button('💾 Guardar asignaciones'):
-                                    try:
-                                        save_document_assignments(d['id'],selected_owners,selected_reviewers)
-                                        st.success('Asignaciones de documento actualizadas');st.rerun()
-                                    except Exception as exc:st.error(str(exc))
-                            if customized and st.button('↩ Volver a heredar asignaciones de las tareas',
-                                                        key=f'doc_assign_reset_{d["id"]}'):
-                                with connection() as con:
-                                    con.execute('DELETE FROM document_assignment_mode WHERE document_id=?',(d['id'],))
-                                    con.execute('DELETE FROM document_people WHERE document_id=?',(d['id'],))
-                                st.rerun()
-                        with st.expander(f'✏️ Administrar {d["doc_no"]}',expanded=False):
-                            with st.form(f'doc_edit_{d["id"]}'):
-                                title=st.text_input('Nombre descriptivo',value=d['title'])
-                                pdf=st.file_uploader('Reemplazar PDF',type=['pdf'],key=f'doc_pdf_{d["id"]}')
-                                editable=st.file_uploader('Reemplazar editable (incluye EDB, SDB y FDB)',type=EDITABLE_EXTENSIONS,key=f'doc_edit_{d["id"]}')
-                                st.caption('Máximo 25 MB por archivo editable guardado en Google Drive.')
-                                if st.form_submit_button('💾 Guardar documento'):
-                                    try:
-                                        if not title.strip():raise ValueError('Indica el nombre del documento.')
-                                        if (pdf or editable) and not drive_ready():raise ValueError('Conecta Google Drive primero.')
-                                        if pdf:upload_document_file(pdf,d['id'],'pdf')
-                                        if editable:upload_document_file(editable,d['id'],'editable')
-                                        with connection() as con:
-                                            con.execute('UPDATE delivery_documents SET title=? WHERE id=?',(title.strip(),d['id']))
-                                            con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
-                                                ('Documentos',code,f'{version}/{d["doc_no"]} editado'))
-                                        st.success('Documento actualizado');st.rerun()
-                                    except Exception as exc:st.error(str(exc))
-                            if st.button('🗑 Eliminar documento '+d['doc_no'],key=f'doc_rm_{d["id"]}'):
-                                st.session_state[f'doc_confirm_{d["id"]}']=True
-                            if st.session_state.get(f'doc_confirm_{d["id"]}'):
-                                st.warning('Se retirará el documento y su checklist de ALTIVIA. Los archivos físicos permanecerán en Google Drive como respaldo.')
-                                if st.button('Confirmar eliminación de '+d['doc_no'],key=f'doc_delete_yes_{d["id"]}'):
+            st.caption(f'{len(docs)} documento(s)')
+            # Botón desplegable sin anidar un expander extra. Los archivos,
+            # descargas y controles administrativos aparecen solo al abrirlo.
+            open_key=f'gp_version_documents_open_{did}_{vid}'
+            opened=bool(st.session_state.get(open_key,False))
+            label='▾ Ocultar documentos' if opened else '▸ Ver documentos'
+            if st.button(label,key=f'gp_version_documents_toggle_{did}_{vid}',
+                         use_container_width=True):
+                st.session_state[open_key]=not opened
+                st.rerun()
+            if opened:
+                if is_admin and ver['notes']:
+                    st.caption('Descripción: '+str(ver['notes']))
+                for d in docs:
+                    with st.container(border=True):
+                        st.markdown(f'**📄 {escape(d["doc_no"])} — {escape(d["title"])}**')
+                        if int(d['id']) in doc_tasks:
+                            st.caption('Tarea: '+escape(doc_tasks[int(d['id'])]['code'])+' · '+
+                                       escape(doc_tasks[int(d['id'])]['activity']))
+                        document_preview_ui(d,allow_download=True,
+                            allow_editable=(is_admin or version==latest_version),
+                            prefix=f'version_{vid}')
+                        if is_admin:
+                            with st.expander(f'👥 Asignaciones del documento {d["doc_no"]} (Checklist)'):
+                                customized,(owners,reviewers)=document_assignments(d['id'])
+                                st.caption('Por defecto se heredan responsables y revisores de las tareas del entregable. '
+                                           'Al guardar una lista personalizada, el Checklist solo será visible para estas personas, '
+                                           'si además tienen acceso al proyecto.')
+                                roster=people_for_assignment()
+                                labels={int(p['id']):p['name'] for p in roster}
+                                with st.form(f'doc_assign_{d["id"]}'):
+                                    selected_owners=st.multiselect('Responsables del documento',list(labels),
+                                        default=[i for i in labels if i in owners],
+                                        format_func=lambda i:labels[i],key=f'doc_assign_o_{d["id"]}')
+                                    selected_reviewers=st.multiselect('Revisores del documento',list(labels),
+                                        default=[i for i in labels if i in reviewers],
+                                        format_func=lambda i:labels[i],key=f'doc_assign_r_{d["id"]}')
+                                    if st.form_submit_button('💾 Guardar asignaciones'):
+                                        try:
+                                            save_document_assignments(d['id'],selected_owners,selected_reviewers)
+                                            st.success('Asignaciones de documento actualizadas');st.rerun()
+                                        except Exception as exc:st.error(str(exc))
+                                if customized and st.button('↩ Volver a heredar asignaciones de las tareas',
+                                                            key=f'doc_assign_reset_{d["id"]}'):
                                     with connection() as con:
-                                        con.execute('DELETE FROM delivery_documents WHERE id=?',(d['id'],))
-                                        con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
-                                            ('Documentos',code,'Retirado '+version+'/'+d['doc_no']+' (archivos en Drive conservados)'))
-                                    st.session_state.pop(f'doc_confirm_{d["id"]}',None)
+                                        con.execute('DELETE FROM document_assignment_mode WHERE document_id=?',(d['id'],))
+                                        con.execute('DELETE FROM document_people WHERE document_id=?',(d['id'],))
                                     st.rerun()
-            if not docs:st.caption('Esta versión aún no tiene documentos.')
-            if not is_admin:continue
-            with st.expander('➕ Agregar documentos a '+version):
-                how_many=st.number_input('Cantidad de documentos nuevos',min_value=1,max_value=10,value=1,
-                    key=f'add_doc_count_{vid}')
-                with st.form(f'add_doc_form_{vid}'):
-                    entries=[]
-                    for i in range(how_many):
-                        st.markdown(f'**Documento adicional {i+1}**')
-                        title=st.text_input('Nombre',key=f'add_doc_name_{vid}_{i}')
-                        pdf=st.file_uploader('PDF',type=['pdf'],key=f'add_doc_pdf_{vid}_{i}')
-                        ed=st.file_uploader('Editable',type=EDITABLE_EXTENSIONS,key=f'add_doc_edit_{vid}_{i}')
-                        entries.append((title,pdf,ed))
-                    submitted=st.form_submit_button('💾 Añadir documentos')
-                if submitted:
-                    try:
-                        if any(not title.strip() for title,_,_ in entries):raise ValueError('Asigna un nombre a cada documento.')
-                        if any((p or e) for _,p,e in entries) and not drive_ready():raise ValueError('Conecta Google Drive.')
-                        numbers=attach_new_documents(did,version,entries)
-                        st.success('Añadidos: '+', '.join(numbers));st.rerun()
-                    except Exception as exc:st.error('No se completó la carga: '+str(exc))
-            with st.expander('✏️ Editar descripción de la versión'):
-                with st.form(f'version_note_{vid}'):
-                    note=st.text_area('Descripción de revisión',value=ver['notes'] or '')
-                    if st.form_submit_button('Guardar descripción'):
-                        with connection() as con:
-                            con.execute('UPDATE versions SET notes=? WHERE id=?',(note,vid))
-                        st.rerun()
-            if st.button('🗑 Eliminar versión '+version,key=f'version_delete_{vid}'):
-                st.session_state[f'version_confirm_{vid}']=True
-            if st.session_state.get(f'version_confirm_{vid}'):
-                st.error('Se eliminará toda la versión y sus documentos. Los archivos vinculados se eliminarán también de Google Drive.')
-                if st.button('Confirmar eliminación de versión '+version,key=f'version_yes_{vid}'):
-                    try:
-                        ids={f['file_id'] for d in docs for f in d['files'].values()}
-                        with connection() as con:
-                            ids.update(r['file_id'] for r in con.execute('SELECT file_id FROM drive_files WHERE delivery_id=? AND version=?',(did,version)))
-                        for fileid in ids:drive_delete_document(fileid)
-                        with connection() as con:
-                            con.execute('DELETE FROM task_review_events WHERE delivery_id=? AND version=?',(did,version))
-                            con.execute('DELETE FROM delivery_version_task_items WHERE delivery_id=? AND version=?',(did,version))
-                            con.execute('DELETE FROM delivery_documents WHERE delivery_id=? AND version=?',(did,version))
-                            con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=?',(did,version))
-                            con.execute('DELETE FROM delivery_files WHERE delivery_id=? AND version=?',(did,version))
-                            con.execute('DELETE FROM versions WHERE id=? AND delivery_code=?',(vid,code))
-                            remaining=con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC LIMIT 1',(code,)).fetchone()
-                            if delivery['version']==version:
-                                # Al retirar la versión vigente, su decisión de revisión
-                                # ya no puede colorear otra versión como aprobada/observada.
-                                # Si subsiste alguna anterior, vuelve a seguimiento.
-                                next_active=remaining['version'] if remaining else ''
-                                con.execute('''UPDATE deliverables
-                                    SET version=?,status=?,last_modified_at=? WHERE id=?''',
-                                    (next_active,'En desarrollo' if next_active else 'Pendiente',
-                                     peru_timestamp(),did))
-                        st.session_state.pop(f'version_confirm_{vid}',None)
-                        st.rerun()
-                    except Exception as exc:st.error('No se pudo eliminar completamente: '+str(exc))
+                            with st.expander(f'✏️ Administrar {d["doc_no"]}',expanded=False):
+                                with st.form(f'doc_edit_{d["id"]}'):
+                                    title=st.text_input('Nombre descriptivo',value=d['title'])
+                                    pdf=st.file_uploader('Reemplazar PDF',type=['pdf'],key=f'doc_pdf_{d["id"]}')
+                                    editable=st.file_uploader('Reemplazar editable (incluye EDB, SDB y FDB)',type=EDITABLE_EXTENSIONS,key=f'doc_edit_{d["id"]}')
+                                    st.caption('Máximo 25 MB por archivo editable guardado en Google Drive.')
+                                    if st.form_submit_button('💾 Guardar documento'):
+                                        try:
+                                            if not title.strip():raise ValueError('Indica el nombre del documento.')
+                                            if (pdf or editable) and not drive_ready():raise ValueError('Conecta Google Drive primero.')
+                                            if pdf:upload_document_file(pdf,d['id'],'pdf')
+                                            if editable:upload_document_file(editable,d['id'],'editable')
+                                            with connection() as con:
+                                                con.execute('UPDATE delivery_documents SET title=? WHERE id=?',(title.strip(),d['id']))
+                                                con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                                                    ('Documentos',code,f'{version}/{d["doc_no"]} editado'))
+                                            st.success('Documento actualizado');st.rerun()
+                                        except Exception as exc:st.error(str(exc))
+                                if st.button('🗑 Eliminar documento '+d['doc_no'],key=f'doc_rm_{d["id"]}'):
+                                    st.session_state[f'doc_confirm_{d["id"]}']=True
+                                if st.session_state.get(f'doc_confirm_{d["id"]}'):
+                                    st.warning('Se retirará el documento y su checklist de ALTIVIA. Los archivos físicos permanecerán en Google Drive como respaldo.')
+                                    if st.button('Confirmar eliminación de '+d['doc_no'],key=f'doc_delete_yes_{d["id"]}'):
+                                        with connection() as con:
+                                            con.execute('DELETE FROM delivery_documents WHERE id=?',(d['id'],))
+                                            con.execute('INSERT INTO audit(module,record_code,action) VALUES(?,?,?)',
+                                                ('Documentos',code,'Retirado '+version+'/'+d['doc_no']+' (archivos en Drive conservados)'))
+                                        st.session_state.pop(f'doc_confirm_{d["id"]}',None)
+                                        st.rerun()
+                if not docs:st.caption('Esta versión aún no tiene documentos.')
+                if not is_admin:continue
+                with st.expander('➕ Agregar documentos a '+version):
+                    how_many=st.number_input('Cantidad de documentos nuevos',min_value=1,max_value=10,value=1,
+                        key=f'add_doc_count_{vid}')
+                    with st.form(f'add_doc_form_{vid}'):
+                        entries=[]
+                        for i in range(how_many):
+                            st.markdown(f'**Documento adicional {i+1}**')
+                            title=st.text_input('Nombre',key=f'add_doc_name_{vid}_{i}')
+                            pdf=st.file_uploader('PDF',type=['pdf'],key=f'add_doc_pdf_{vid}_{i}')
+                            ed=st.file_uploader('Editable',type=EDITABLE_EXTENSIONS,key=f'add_doc_edit_{vid}_{i}')
+                            entries.append((title,pdf,ed))
+                        submitted=st.form_submit_button('💾 Añadir documentos')
+                    if submitted:
+                        try:
+                            if any(not title.strip() for title,_,_ in entries):raise ValueError('Asigna un nombre a cada documento.')
+                            if any((p or e) for _,p,e in entries) and not drive_ready():raise ValueError('Conecta Google Drive.')
+                            numbers=attach_new_documents(did,version,entries)
+                            st.success('Añadidos: '+', '.join(numbers));st.rerun()
+                        except Exception as exc:st.error('No se completó la carga: '+str(exc))
+                with st.expander('✏️ Editar descripción de la versión'):
+                    with st.form(f'version_note_{vid}'):
+                        note=st.text_area('Descripción de revisión',value=ver['notes'] or '')
+                        if st.form_submit_button('Guardar descripción'):
+                            with connection() as con:
+                                con.execute('UPDATE versions SET notes=? WHERE id=?',(note,vid))
+                            st.rerun()
+                if st.button('🗑 Eliminar versión '+version,key=f'version_delete_{vid}'):
+                    st.session_state[f'version_confirm_{vid}']=True
+                if st.session_state.get(f'version_confirm_{vid}'):
+                    st.error('Se eliminará toda la versión y sus documentos. Los archivos vinculados se eliminarán también de Google Drive.')
+                    if st.button('Confirmar eliminación de versión '+version,key=f'version_yes_{vid}'):
+                        try:
+                            ids={f['file_id'] for d in docs for f in d['files'].values()}
+                            with connection() as con:
+                                ids.update(r['file_id'] for r in con.execute('SELECT file_id FROM drive_files WHERE delivery_id=? AND version=?',(did,version)))
+                            for fileid in ids:drive_delete_document(fileid)
+                            with connection() as con:
+                                con.execute('DELETE FROM task_review_events WHERE delivery_id=? AND version=?',(did,version))
+                                con.execute('DELETE FROM delivery_version_task_items WHERE delivery_id=? AND version=?',(did,version))
+                                con.execute('DELETE FROM delivery_documents WHERE delivery_id=? AND version=?',(did,version))
+                                con.execute('DELETE FROM drive_files WHERE delivery_id=? AND version=?',(did,version))
+                                con.execute('DELETE FROM delivery_files WHERE delivery_id=? AND version=?',(did,version))
+                                con.execute('DELETE FROM versions WHERE id=? AND delivery_code=?',(vid,code))
+                                remaining=con.execute('SELECT version FROM versions WHERE delivery_code=? ORDER BY id DESC LIMIT 1',(code,)).fetchone()
+                                if delivery['version']==version:
+                                    # Al retirar la versión vigente, su decisión de revisión
+                                    # ya no puede colorear otra versión como aprobada/observada.
+                                    # Si subsiste alguna anterior, vuelve a seguimiento.
+                                    next_active=remaining['version'] if remaining else ''
+                                    con.execute('''UPDATE deliverables
+                                        SET version=?,status=?,last_modified_at=? WHERE id=?''',
+                                        (next_active,'En desarrollo' if next_active else 'Pendiente',
+                                         peru_timestamp(),did))
+                            st.session_state.pop(f'version_confirm_{vid}',None)
+                            st.rerun()
+                        except Exception as exc:st.error('No se pudo eliminar completamente: '+str(exc))
 
 def drive_delete_document(file_id):
     """Borrado remoto solo para archivos previamente vinculados al entregable."""
